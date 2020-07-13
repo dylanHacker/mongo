@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,16 +27,18 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/shard_metadata_util.h"
 
-#include "mongo/client/dbclientinterface.h"
+#include <memory>
+
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/unique_message.h"
 #include "mongo/s/catalog/type_chunk.h"
@@ -43,8 +46,6 @@
 #include "mongo/s/catalog/type_shard_database.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace shardmetadatautil {
@@ -88,24 +89,17 @@ std::string RefreshState::toString() const {
                          << lastRefreshedCollectionVersion.toString();
 }
 
-Status setPersistedRefreshFlags(OperationContext* opCtx, const NamespaceString& nss) {
-    // Set 'refreshing' to true.
-    BSONObj update = BSON(ShardCollectionType::refreshing() << true);
-    return updateShardCollectionsEntry(
-        opCtx, BSON(ShardCollectionType::ns() << nss.ns()), update, BSONObj(), false /*upsert*/);
-}
-
 Status unsetPersistedRefreshFlags(OperationContext* opCtx,
                                   const NamespaceString& nss,
                                   const ChunkVersion& refreshedVersion) {
     // Set 'refreshing' to false and update the last refreshed collection version.
     BSONObjBuilder updateBuilder;
-    updateBuilder.append(ShardCollectionType::refreshing(), false);
-    updateBuilder.appendTimestamp(ShardCollectionType::lastRefreshedCollectionVersion(),
+    updateBuilder.append(ShardCollectionType::kRefreshingFieldName, false);
+    updateBuilder.appendTimestamp(ShardCollectionType::kLastRefreshedCollectionVersionFieldName,
                                   refreshedVersion.toLong());
 
     return updateShardCollectionsEntry(opCtx,
-                                       BSON(ShardCollectionType::ns() << nss.ns()),
+                                       BSON(ShardCollectionType::kNssFieldName << nss.ns()),
                                        updateBuilder.obj(),
                                        BSONObj(),
                                        false /*upsert*/);
@@ -120,14 +114,14 @@ StatusWith<RefreshState> getPersistedRefreshFlags(OperationContext* opCtx,
     ShardCollectionType entry = statusWithCollectionEntry.getValue();
 
     // Ensure the results have not been incorrectly set somehow.
-    if (entry.hasRefreshing()) {
+    if (entry.getRefreshing()) {
         // If 'refreshing' is present and false, a refresh must have occurred (otherwise the field
         // would never have been added to the document) and there should always be a refresh
         // version.
-        invariant(entry.getRefreshing() ? true : entry.hasLastRefreshedCollectionVersion());
+        invariant(*entry.getRefreshing() ? true : !!entry.getLastRefreshedCollectionVersion());
     } else {
         // If 'refreshing' is not present, no refresh version should exist.
-        invariant(!entry.hasLastRefreshedCollectionVersion());
+        invariant(!entry.getLastRefreshedCollectionVersion());
     }
 
     return RefreshState{entry.getEpoch(),
@@ -135,25 +129,25 @@ StatusWith<RefreshState> getPersistedRefreshFlags(OperationContext* opCtx,
                         // refresh has started, but no chunks have ever yet been applied, around
                         // which these flags are set. So default to refreshing true because the
                         // chunk metadata is being updated and is not yet ready to be read.
-                        entry.hasRefreshing() ? entry.getRefreshing() : true,
-                        entry.hasLastRefreshedCollectionVersion()
-                            ? entry.getLastRefreshedCollectionVersion()
+                        entry.getRefreshing() ? *entry.getRefreshing() : true,
+                        entry.getLastRefreshedCollectionVersion()
+                            ? *entry.getLastRefreshedCollectionVersion()
                             : ChunkVersion(0, 0, entry.getEpoch())};
 }
 
 StatusWith<ShardCollectionType> readShardCollectionsEntry(OperationContext* opCtx,
                                                           const NamespaceString& nss) {
 
-    Query fullQuery(BSON(ShardCollectionType::ns() << nss.ns()));
+    Query fullQuery(BSON(ShardCollectionType::kNssFieldName << nss.ns()));
 
     try {
         DBDirectClient client(opCtx);
         std::unique_ptr<DBClientCursor> cursor =
-            client.query(ShardCollectionType::ConfigNS.ns(), fullQuery, 1);
+            client.query(NamespaceString::kShardConfigCollectionsNamespace, fullQuery, 1);
         if (!cursor) {
             return Status(ErrorCodes::OperationFailed,
                           str::stream() << "Failed to establish a cursor for reading "
-                                        << ShardCollectionType::ConfigNS.ns()
+                                        << NamespaceString::kShardConfigCollectionsNamespace.ns()
                                         << " from local storage");
         }
 
@@ -164,12 +158,7 @@ StatusWith<ShardCollectionType> readShardCollectionsEntry(OperationContext* opCt
         }
 
         BSONObj document = cursor->nextSafe();
-        auto statusWithCollectionEntry = ShardCollectionType::fromBSON(document);
-        if (!statusWithCollectionEntry.isOK()) {
-            return statusWithCollectionEntry.getStatus();
-        }
-
-        return statusWithCollectionEntry.getValue();
+        return ShardCollectionType::fromBSON(document);
     } catch (const DBException& ex) {
         return ex.toStatus(str::stream() << "Failed to read the '" << nss.ns()
                                          << "' entry locally from config.collections");
@@ -182,11 +171,11 @@ StatusWith<ShardDatabaseType> readShardDatabasesEntry(OperationContext* opCtx, S
     try {
         DBDirectClient client(opCtx);
         std::unique_ptr<DBClientCursor> cursor =
-            client.query(ShardDatabaseType::ConfigNS.ns(), fullQuery, 1);
+            client.query(NamespaceString::kShardConfigDatabasesNamespace, fullQuery, 1);
         if (!cursor) {
             return Status(ErrorCodes::OperationFailed,
                           str::stream() << "Failed to establish a cursor for reading "
-                                        << ShardDatabaseType::ConfigNS.ns()
+                                        << NamespaceString::kShardConfigDatabasesNamespace.ns()
                                         << " from local storage");
         }
 
@@ -218,8 +207,7 @@ Status updateShardCollectionsEntry(OperationContext* opCtx,
     if (upsert) {
         // If upserting, this should be an update from the config server that does not have shard
         // refresh / migration inc signal information.
-        invariant(!update.hasField(ShardCollectionType::refreshing()));
-        invariant(!update.hasField(ShardCollectionType::lastRefreshedCollectionVersion()));
+        invariant(!update.hasField(ShardCollectionType::kLastRefreshedCollectionVersionFieldName));
         invariant(inc.isEmpty());
     }
 
@@ -236,7 +224,7 @@ Status updateShardCollectionsEntry(OperationContext* opCtx,
         }
 
         auto commandResponse = client.runCommand([&] {
-            write_ops::Update updateOp(NamespaceString{ShardCollectionType::ConfigNS});
+            write_ops::Update updateOp(NamespaceString::kShardConfigCollectionsNamespace);
             updateOp.setUpdates({[&] {
                 write_ops::UpdateOpEntry entry;
                 entry.setQ(query);
@@ -279,7 +267,7 @@ Status updateShardDatabasesEntry(OperationContext* opCtx,
         }
 
         auto commandResponse = client.runCommand([&] {
-            write_ops::Update updateOp(NamespaceString{ShardDatabaseType::ConfigNS});
+            write_ops::Update updateOp(NamespaceString::kShardConfigDatabasesNamespace);
             updateOp.setUpdates({[&] {
                 write_ops::UpdateOpEntry entry;
                 entry.setQ(query);
@@ -312,7 +300,7 @@ StatusWith<std::vector<ChunkType>> readShardChunks(OperationContext* opCtx,
         const std::string chunkMetadataNs = ChunkType::ShardNSPrefix + nss.ns();
 
         std::unique_ptr<DBClientCursor> cursor =
-            client.query(chunkMetadataNs, fullQuery, limit.get_value_or(0));
+            client.query(NamespaceString(chunkMetadataNs), fullQuery, limit.get_value_or(0));
         uassert(ErrorCodes::OperationFailed,
                 str::stream() << "Failed to establish a cursor for reading " << chunkMetadataNs
                               << " from local storage",
@@ -374,7 +362,7 @@ Status updateShardChunks(OperationContext* opCtx,
          *
          */
         for (auto& chunk : chunks) {
-            invariant(chunk.getVersion().hasEqualEpoch(currEpoch));
+            invariant(chunk.getVersion().epoch() == currEpoch);
 
             // Delete any overlapping chunk ranges. Overlapping chunks will have a min value
             // ("_id") between (chunk.min, chunk.max].
@@ -415,11 +403,10 @@ Status dropChunksAndDeleteCollectionsEntry(OperationContext* opCtx, const Namesp
         DBDirectClient client(opCtx);
 
         auto deleteCommandResponse = client.runCommand([&] {
-            write_ops::Delete deleteOp(
-                NamespaceString{NamespaceString::kShardConfigCollectionsCollectionName});
+            write_ops::Delete deleteOp(NamespaceString::kShardConfigCollectionsNamespace);
             deleteOp.setDeletes({[&] {
                 write_ops::DeleteOpEntry entry;
-                entry.setQ(BSON(ShardCollectionType::ns << nss.ns()));
+                entry.setQ(BSON(ShardCollectionType::kNssFieldName << nss.ns()));
                 entry.setMulti(true);
                 return entry;
             }()});
@@ -438,11 +425,35 @@ Status dropChunksAndDeleteCollectionsEntry(OperationContext* opCtx, const Namesp
             }
         }
 
-        LOG(1) << "Successfully cleared persisted chunk metadata for collection '" << nss << "'.";
+        LOGV2_DEBUG(
+            22090,
+            1,
+            "Successfully cleared persisted chunk metadata and collection entry for collection "
+            "{namespace}",
+            "Successfully cleared persisted chunk metadata and collection entry",
+            "namespace"_attr = nss);
         return Status::OK();
     } catch (const DBException& ex) {
         return ex.toStatus();
     }
+}
+
+void dropChunks(OperationContext* opCtx, const NamespaceString& nss) {
+    DBDirectClient client(opCtx);
+
+    // Drop the config.chunks collection associated with namespace 'nss'.
+    BSONObj result;
+    if (!client.dropCollection(ChunkType::ShardNSPrefix + nss.ns(), kLocalWriteConcern, &result)) {
+        auto status = getStatusFromCommandResult(result);
+        if (status != ErrorCodes::NamespaceNotFound) {
+            uassertStatusOK(status);
+        }
+    }
+
+    LOGV2_DEBUG(22091,
+                1,
+                "Successfully cleared persisted chunk metadata for collection",
+                "namespace"_attr = nss);
 }
 
 Status deleteDatabasesEntry(OperationContext* opCtx, StringData dbName) {
@@ -450,8 +461,7 @@ Status deleteDatabasesEntry(OperationContext* opCtx, StringData dbName) {
         DBDirectClient client(opCtx);
 
         auto deleteCommandResponse = client.runCommand([&] {
-            write_ops::Delete deleteOp(
-                NamespaceString{NamespaceString::kShardConfigDatabasesCollectionName});
+            write_ops::Delete deleteOp(NamespaceString::kShardConfigDatabasesNamespace);
             deleteOp.setDeletes({[&] {
                 write_ops::DeleteOpEntry entry;
                 entry.setQ(BSON(ShardDatabaseType::name << dbName.toString()));
@@ -463,7 +473,11 @@ Status deleteDatabasesEntry(OperationContext* opCtx, StringData dbName) {
         uassertStatusOK(
             getStatusFromWriteCommandResponse(deleteCommandResponse->getCommandReply()));
 
-        LOG(1) << "Successfully cleared persisted metadata for db '" << dbName.toString() << "'.";
+        LOGV2_DEBUG(22092,
+                    1,
+                    "Successfully cleared persisted metadata for db {db}",
+                    "Successfully cleared persisted metadata for db",
+                    "db"_attr = dbName);
         return Status::OK();
     } catch (const DBException& ex) {
         return ex.toStatus();

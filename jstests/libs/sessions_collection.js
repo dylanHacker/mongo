@@ -4,7 +4,7 @@
  * Validates that the sessions collection exists if we expect it to,
  * and has a TTL index on the lastUse field, if we expect it to.
  */
-function validateSessionsCollection(conn, collectionExists, indexExists) {
+function validateSessionsCollection(conn, collectionExists, indexExists, timeout) {
     var config = conn.getDB("config");
 
     var info = config.getCollectionInfos({name: "system.sessions"});
@@ -18,9 +18,11 @@ function validateSessionsCollection(conn, collectionExists, indexExists) {
         if (entry["name"] == "lsidTTLIndex") {
             found = true;
 
-            assert.eq(entry["ns"], "config.system.sessions");
             assert.eq(entry["key"], {"lastUse": 1});
             assert(entry.hasOwnProperty("expireAfterSeconds"));
+            if (timeout) {
+                assert.eq(entry["expireAfterSeconds"], timeout * 60);
+            }
         }
     }
 

@@ -1,30 +1,30 @@
-// processinfo.h
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -34,8 +34,8 @@
 #include <string>
 
 #include "mongo/db/jsobj.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/platform/process_id.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/mutex.h"
 
 namespace mongo {
@@ -84,9 +84,16 @@ public:
     }
 
     /**
-     * Get the total amount of system memory in MB
+     * Get the size of total memory available to the process in MB
      */
     static unsigned long long getMemSizeMB() {
+        return sysInfo().memLimit / (1024 * 1024);
+    }
+
+    /**
+     * Get the total memory available on the machine in MB
+     */
+    static unsigned long long getSystemMemSizeMB() {
         return sysInfo().memSize / (1024 * 1024);
     }
 
@@ -127,13 +134,6 @@ public:
     }
 
     /**
-     * Determine if file zeroing is necessary for newly allocated data files.
-     */
-    static bool isDataFileZeroingNeeded() {
-        return sysInfo().fileZeroNeeded;
-    }
-
-    /**
      * Determine if we need to workaround slow msync performance on Illumos/Solaris
      */
     static bool preferMsyncOverFSync() {
@@ -157,12 +157,6 @@ public:
     static bool blockCheckSupported();
 
     static bool blockInMemory(const void* start);
-
-    /**
-     * Returns a positive floating point number between 0.0 and 1.0 that
-     * reflects the maximum percentage of RAM the filesystem cache is allowed to grow.
-     */
-    static double getMaxSystemFileCachePercentage();
 
     /**
      * Returns a positive floating point number between 0.0 and 1.0 to inform MMapV1 how much it
@@ -202,16 +196,12 @@ private:
         std::string osVersion;
         unsigned addrSize;
         unsigned long long memSize;
+        unsigned long long memLimit;
         unsigned numCores;
         unsigned long long pageSize;
         std::string cpuArch;
         bool hasNuma;
         BSONObj _extraStats;
-
-        // This is an OS specific value, which determines whether files should be zero-filled
-        // at allocation time in order to avoid Microsoft KB 2731284.
-        //
-        bool fileZeroNeeded;
 
         // On non-Solaris (ie, Linux, Darwin, *BSD) kernels, prefer msync.
         // Illumos kernels do O(N) scans in memory of the page table during msync which
@@ -223,10 +213,10 @@ private:
         SystemInfo()
             : addrSize(0),
               memSize(0),
+              memLimit(0),
               numCores(0),
               pageSize(0),
               hasNuma(false),
-              fileZeroNeeded(false),
               preferMsyncOverFSync(true) {
             // populate SystemInfo during construction
             collectSystemInfo();
@@ -255,4 +245,4 @@ private:
 };
 
 bool writePidFile(const std::string& path);
-}
+}  // namespace mongo

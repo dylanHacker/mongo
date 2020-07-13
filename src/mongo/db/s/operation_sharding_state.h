@@ -1,36 +1,36 @@
-/*
-*    Copyright (C) 2015 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
 #include <boost/optional.hpp>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/database_version_gen.h"
@@ -50,15 +50,24 @@ class OperationContext;
  * Note: This only supports storing the version for a single namespace.
  */
 class OperationShardingState {
-    MONGO_DISALLOW_COPYING(OperationShardingState);
+    OperationShardingState(const OperationShardingState&) = delete;
+    OperationShardingState& operator=(const OperationShardingState&) = delete;
 
 public:
     OperationShardingState();
+    ~OperationShardingState();
 
     /**
      * Retrieves a reference to the shard version decorating the OperationContext, 'opCtx'.
      */
     static OperationShardingState& get(OperationContext* opCtx);
+
+    /**
+     * Returns true if the the current operation was sent by the caller with shard version
+     * information attached, meaning that it must perform shard version checking and orphan
+     * filtering.
+     */
+    static bool isOperationVersioned(OperationContext* opCtx);
 
     /**
      * Requests on a sharded collection that are broadcast without a shardVersion should not cause
@@ -87,22 +96,29 @@ public:
      * This initialization may only be performed once for the lifetime of the object, which
      * coincides with the lifetime of the client's request.
      */
-    void initializeClientRoutingVersions(NamespaceString nss, const BSONObj& cmdObj);
+    void initializeClientRoutingVersionsFromCommand(NamespaceString nss, const BSONObj& cmdObj);
 
     /**
-     * Returns whether or not there is a shard version associated with this operation.
+     * Stores the given shardVersion and databaseVersion for the given namespace. Note: The shard
+     * version for the given namespace stored in the OperationShardingState can be overwritten if it
+     * has not been checked yet.
      */
-    bool hasShardVersion() const;
+    void initializeClientRoutingVersions(NamespaceString nss,
+                                         const boost::optional<ChunkVersion>& shardVersion,
+                                         const boost::optional<DatabaseVersion>& dbVersion);
+
+    /**
+     * Returns whether or not there is a shard version for the namespace associated with this
+     * operation.
+     */
+    bool hasShardVersion(const NamespaceString& nss) const;
 
     /**
      * Returns the shard version (i.e. maximum chunk version) of a namespace being used by the
      * operation. Documents in chunks which did not belong on this shard at this shard version
      * will be filtered out.
-     *
-     * Returns ChunkVersion::UNSHARDED() if this operation has no shard version information
-     * for the requested namespace.
      */
-    ChunkVersion getShardVersion(const NamespaceString& nss) const;
+    boost::optional<ChunkVersion> getShardVersion(const NamespaceString& nss);
 
     /**
      * Returns true if the client sent a databaseVersion for any namespace.
@@ -114,12 +130,6 @@ public:
      * version sent by the client (if any), else returns boost::none.
      */
     boost::optional<DatabaseVersion> getDbVersion(const StringData dbName) const;
-
-    /**
-     * Makes the OperationShardingState behave as if an UNSHARDED shardVersion was sent for every
-     * possible namespace.
-     */
-    void setGlobalUnshardedShardVersion();
 
     /**
      * This call is a no op if there isn't a currently active migration critical section. Otherwise
@@ -154,18 +164,34 @@ public:
      */
     void setMovePrimaryCriticalSectionSignal(std::shared_ptr<Notification<void>> critSecSignal);
 
+    /**
+     * Stores the failed status in _shardingOperationFailedStatus.
+     *
+     * This method may only be called once when a rerouting exception occurs. The caller
+     * must process the status at exit.
+     */
+    void setShardingOperationFailedStatus(const Status& status);
+
+    /**
+     * Returns the failed status stored in _shardingOperationFailedStatus if any, and reset the
+     * status to none.
+     *
+     * This method may only be called when the caller wants to process the status.
+     */
+    boost::optional<Status> resetShardingOperationFailedStatus();
+
 private:
     // Specifies whether the request is allowed to create database/collection implicitly
     bool _allowImplicitCollectionCreation{true};
-
-    // Should be set to true if all collections accessed are expected to be unsharded.
-    bool _globalUnshardedShardVersion = false;
 
     // The OperationShardingState class supports storing shardVersions for multiple namespaces (and
     // databaseVersions for multiple databases), even though client code has not been written yet to
     // *send* multiple shardVersions or databaseVersions.
     StringMap<ChunkVersion> _shardVersions;
     StringMap<DatabaseVersion> _databaseVersions;
+
+    // Stores shards that have undergone a version check.
+    StringDataSet _shardVersionsChecked;
 
     // This value will only be non-null if version check during the operation execution failed due
     // to stale version and there was a migration for that namespace, which was in critical section.
@@ -175,6 +201,10 @@ private:
     // to stale version and there was a movePrimary for that namespace, which was in critical
     // section.
     std::shared_ptr<Notification<void>> _movePrimaryCriticalSectionSignal;
+
+    // This value can only be set when a rerouting exception occurs during a write operation, and
+    // must be handled before this object gets destructed.
+    boost::optional<Status> _shardingOperationFailedStatus;
 };
 
 }  // namespace mongo

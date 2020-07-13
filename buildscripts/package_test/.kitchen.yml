@@ -49,17 +49,28 @@ platforms:
       image_id: ami-71b7750b
     transport:
       username: admin
+  - name: debian10
+    driver:
+      image_id: ami-02ad06066b040a84b
+    transport:
+      username: admin
   - name: rhel62
     driver:
-      # Use rhel 6.3 because chef-solo fails on rhel 6.2
-      image_id: ami-a35a33ca
+      # Use rhel 6.5 chef fails on previous versions.
+      image_id: ami-5b697332
     transport:
       username: root
+      instance_type: t2.small
   - name: rhel70
     driver:
       image_id: ami-60a1e808
     transport:
       username: root
+  - name: rhel80
+    driver:
+      image_id: ami-0c322300a1dd5dc79
+    transport:
+      username: ec2-user
   - name: suse11
     driver:
       image_id: ami-7f2e6015
@@ -67,7 +78,12 @@ platforms:
       username: ec2-user
   - name: suse12
     driver:
-      image_id: ami-aeb532c6
+      image_id: ami-043eebeabcc4e3d35
+    transport:
+      username: ec2-user
+  - name: suse15
+    driver:
+      image_id: ami-06ea7729e394412c8
     transport:
       username: ec2-user
   - name: ubuntu1204
@@ -83,6 +99,16 @@ platforms:
   - name: ubuntu1604
     driver:
       image_id: ami-64140d0e
+    transport:
+      username: ubuntu
+  - name: ubuntu1804
+    driver:
+      image_id: ami-7ad76705
+    transport:
+      username: ubuntu
+  - name: ubuntu2004
+    driver:
+      image_id: ami-068663a3c619dd892
     transport:
       username: ubuntu
 

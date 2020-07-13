@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,6 +29,7 @@
 
 #include "mongo/db/update/modifier_table.h"
 
+#include <memory>
 #include <string>
 #include <utility>
 
@@ -47,7 +49,6 @@
 #include "mongo/db/update/rename_node.h"
 #include "mongo/db/update/set_node.h"
 #include "mongo/db/update/unset_node.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -137,37 +138,37 @@ ModifierType getType(StringData typeStr) {
 std::unique_ptr<UpdateLeafNode> makeUpdateLeafNode(ModifierType modType) {
     switch (modType) {
         case MOD_ADD_TO_SET:
-            return stdx::make_unique<AddToSetNode>();
+            return std::make_unique<AddToSetNode>();
         case MOD_BIT:
-            return stdx::make_unique<BitNode>();
+            return std::make_unique<BitNode>();
         case MOD_CONFLICT_PLACEHOLDER:
-            return stdx::make_unique<ConflictPlaceholderNode>();
+            return std::make_unique<ConflictPlaceholderNode>();
         case MOD_CURRENTDATE:
-            return stdx::make_unique<CurrentDateNode>();
+            return std::make_unique<CurrentDateNode>();
         case MOD_INC:
-            return stdx::make_unique<ArithmeticNode>(ArithmeticNode::ArithmeticOp::kAdd);
+            return std::make_unique<ArithmeticNode>(ArithmeticNode::ArithmeticOp::kAdd);
         case MOD_MAX:
-            return stdx::make_unique<CompareNode>(CompareNode::CompareMode::kMax);
+            return std::make_unique<CompareNode>(CompareNode::CompareMode::kMax);
         case MOD_MIN:
-            return stdx::make_unique<CompareNode>(CompareNode::CompareMode::kMin);
+            return std::make_unique<CompareNode>(CompareNode::CompareMode::kMin);
         case MOD_MUL:
-            return stdx::make_unique<ArithmeticNode>(ArithmeticNode::ArithmeticOp::kMultiply);
+            return std::make_unique<ArithmeticNode>(ArithmeticNode::ArithmeticOp::kMultiply);
         case MOD_POP:
-            return stdx::make_unique<PopNode>();
+            return std::make_unique<PopNode>();
         case MOD_PULL:
-            return stdx::make_unique<PullNode>();
+            return std::make_unique<PullNode>();
         case MOD_PULL_ALL:
-            return stdx::make_unique<PullAllNode>();
+            return std::make_unique<PullAllNode>();
         case MOD_PUSH:
-            return stdx::make_unique<PushNode>();
+            return std::make_unique<PushNode>();
         case MOD_RENAME:
-            return stdx::make_unique<RenameNode>();
+            return std::make_unique<RenameNode>();
         case MOD_SET:
-            return stdx::make_unique<SetNode>();
+            return std::make_unique<SetNode>();
         case MOD_SET_ON_INSERT:
-            return stdx::make_unique<SetNode>(UpdateNode::Context::kInsertOnly);
+            return std::make_unique<SetNode>(UpdateNode::Context::kInsertOnly);
         case MOD_UNSET:
-            return stdx::make_unique<UnsetNode>();
+            return std::make_unique<UnsetNode>();
         default:
             return nullptr;
     }

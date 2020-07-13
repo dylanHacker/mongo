@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 /**
@@ -101,10 +102,11 @@ std::string do_replace(MSIHANDLE hInstall,
 
     if (pos == std::string::npos) {
         LogMessage(hInstall,
-                   INSTALLMESSAGE_WARNING,
+                   INSTALLMESSAGE_INFO,
                    "Failed to find '%s' in '%s'",
                    original.c_str(),
                    source.c_str());
+        return source;
     }
 
     return source.replace(pos, original.length(), replacement);
@@ -191,6 +193,15 @@ std::string toUtf8String(MSIHANDLE hInstall, const std::wstring& wide) {
         goto Exit;                                                                      \
     }
 
+#define CHECKGLE_AND_LOG_NOFAIL_EXIT(...)                                            \
+                                                                                     \
+    {                                                                                \
+        LONG _gle = GetLastError();                                                  \
+        LogMessage(hInstall, INSTALLMESSAGE_INFO, "Received GetLastError %x", _gle); \
+        LogMessage(hInstall, INSTALLMESSAGE_INFO, __VA_ARGS__);                      \
+        goto Exit;                                                                   \
+    }
+
 #define CHECKUINT_AND_LOG(x)                                                                   \
                                                                                                \
     {                                                                                          \
@@ -269,7 +280,7 @@ extern "C" UINT __stdcall UpdateMongoYAML(MSIHANDLE hInstall) {
 
         long gle = GetFileAttributesW(YamlFile.c_str());
         if (gle == INVALID_FILE_ATTRIBUTES) {
-            CHECKGLE_AND_LOG("Failed to find yaml file");
+            CHECKGLE_AND_LOG_NOFAIL_EXIT("Failed to find yaml file");
         }
 
         HANDLE hFile = CreateFileW(YamlFile.c_str(),
@@ -283,7 +294,7 @@ extern "C" UINT __stdcall UpdateMongoYAML(MSIHANDLE hInstall) {
             CHECKGLE_AND_LOG("Failed to open yaml file");
         }
 
-        const auto handleGuard = mongo::MakeGuard([&] { CloseHandle(hFile); });
+        const auto handleGuard = mongo::makeGuard([&] { CloseHandle(hFile); });
 
         LARGE_INTEGER fileSize;
         if (GetFileSizeEx(hFile, &fileSize) == 0) {
@@ -320,6 +331,9 @@ extern "C" UINT __stdcall UpdateMongoYAML(MSIHANDLE hInstall) {
         DWORD written;
         if (!WriteFile(hFile, str.c_str(), str.length(), &written, NULL)) {
             CHECKGLE_AND_LOG("Failed to write yaml file");
+        }
+        if (!SetEndOfFile(hFile)) {
+            CHECKGLE_AND_LOG("Failed to truncate yaml file");
         }
     } catch (const std::exception& e) {
         CHECKHR_AND_LOG(E_FAIL, "Caught C++ exception %s", e.what());

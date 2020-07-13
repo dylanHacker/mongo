@@ -106,14 +106,17 @@ function MongoBridge(options) {
             },
         });
 
-        controlConn = new Mongo(hostName + ':' + this.port);
+        assert.soonNoExcept(() => {
+            controlConn = new Mongo(hostName + ':' + this.port);
+            return true;
+        }, 'failed to make control connection to the mongobridge on port ' + this.port);
     };
 
     /**
      * Terminates the mongobridge process.
      */
     this.stop = function stop() {
-        _stopMongoProgram(this.port);
+        return _stopMongoProgram(this.port);
     };
 
     // Throws an error if 'obj' is not a MongoBridge instance.
@@ -298,3 +301,8 @@ function MongoBridge(options) {
         },
     });
 }
+
+// The number of ports that ReplSetTest and ShardingTest should stagger the port number of the
+// mongobridge process and its corresponding mongod/mongos process by. The resulting port number of
+// the mongod/mongos process is MongoBridge#port + MongoBridge.kBridgeOffset.
+MongoBridge.kBridgeOffset = 10;

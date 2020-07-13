@@ -1,29 +1,30 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -35,14 +36,14 @@
 #include "mongo/db/field_parser.h"
 #include "mongo/db/repl/bson_extract_optime.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
-using std::unique_ptr;
 using std::string;
+using std::unique_ptr;
 
-using mongoutils::str::stream;
+using str::stream;
 
 const BSONField<long long> BatchedCommandResponse::n("n", 0);
 const BSONField<long long> BatchedCommandResponse::nModified("nModified", 0);
@@ -52,6 +53,7 @@ const BSONField<OID> BatchedCommandResponse::electionId("electionId");
 const BSONField<std::vector<WriteErrorDetail*>> BatchedCommandResponse::writeErrors("writeErrors");
 const BSONField<WriteConcernErrorDetail*> BatchedCommandResponse::writeConcernError(
     "writeConcernError");
+const BSONField<std::vector<std::string>> BatchedCommandResponse::errorLabels("errorLabels");
 
 BatchedCommandResponse::BatchedCommandResponse() {
     clear();
@@ -64,7 +66,7 @@ BatchedCommandResponse::~BatchedCommandResponse() {
 
 bool BatchedCommandResponse::isValid(std::string* errMsg) const {
     std::string dummy;
-    if (errMsg == NULL) {
+    if (errMsg == nullptr) {
         errMsg = &dummy;
     }
 
@@ -81,7 +83,7 @@ BSONObj BatchedCommandResponse::toBSON() const {
     BSONObjBuilder builder;
 
     invariant(_isStatusSet);
-    CommandHelpers::appendCommandStatus(builder, _status);
+    uassertStatusOK(_status);
 
     if (_isNModifiedSet)
         builder.appendNumber(nModified(), _nModified);
@@ -110,8 +112,8 @@ BSONObj BatchedCommandResponse::toBSON() const {
         builder.appendOID(electionId(), const_cast<OID*>(&_electionId));
 
     if (_writeErrorDetails.get()) {
-        auto errorMessage =
-            [ errorCount = size_t(0), errorSize = size_t(0) ](StringData rawMessage) mutable {
+        auto errorMessage = [errorCount = size_t(0),
+                             errorSize = size_t(0)](StringData rawMessage) mutable {
             // Start truncating error messages once both of these limits are exceeded.
             constexpr size_t kErrorSizeTruncationMin = 1024 * 1024;
             constexpr size_t kErrorCountTruncationMin = 2;
@@ -193,7 +195,7 @@ bool BatchedCommandResponse::parseBSON(const BSONObj& source, string* errMsg) {
         _nModified = intNModified;
     }
 
-    std::vector<BatchedUpsertDetail*>* tempUpsertDetails = NULL;
+    std::vector<BatchedUpsertDetail*>* tempUpsertDetails = nullptr;
     fieldState = FieldParser::extract(source, upsertDetails, &tempUpsertDetails, errMsg);
     if (fieldState == FieldParser::FIELD_INVALID)
         return false;
@@ -221,17 +223,22 @@ bool BatchedCommandResponse::parseBSON(const BSONObj& source, string* errMsg) {
         return false;
     _isElectionIdSet = fieldState == FieldParser::FIELD_SET;
 
-    std::vector<WriteErrorDetail*>* tempErrDetails = NULL;
+    std::vector<WriteErrorDetail*>* tempErrDetails = nullptr;
     fieldState = FieldParser::extract(source, writeErrors, &tempErrDetails, errMsg);
     if (fieldState == FieldParser::FIELD_INVALID)
         return false;
     _writeErrorDetails.reset(tempErrDetails);
-
-    WriteConcernErrorDetail* wcError = NULL;
+    WriteConcernErrorDetail* wcError = nullptr;
     fieldState = FieldParser::extract(source, writeConcernError, &wcError, errMsg);
     if (fieldState == FieldParser::FIELD_INVALID)
         return false;
     _wcErrDetails.reset(wcError);
+
+    std::vector<std::string> tempErrorLabels;
+    fieldState = FieldParser::extract(source, errorLabels, &tempErrorLabels, errMsg);
+    if (fieldState == FieldParser::FIELD_INVALID)
+        return false;
+    _errorLabels = std::move(tempErrorLabels);
 
     return true;
 }
@@ -340,14 +347,14 @@ void BatchedCommandResponse::setUpsertDetails(
 }
 
 void BatchedCommandResponse::addToUpsertDetails(BatchedUpsertDetail* upsertDetails) {
-    if (_upsertDetails.get() == NULL) {
+    if (_upsertDetails.get() == nullptr) {
         _upsertDetails.reset(new std::vector<BatchedUpsertDetail*>);
     }
     _upsertDetails->push_back(upsertDetails);
 }
 
 void BatchedCommandResponse::unsetUpsertDetails() {
-    if (_upsertDetails.get() != NULL) {
+    if (_upsertDetails.get() != nullptr) {
         for (std::vector<BatchedUpsertDetail*>::iterator it = _upsertDetails->begin();
              it != _upsertDetails->end();
              ++it) {
@@ -358,7 +365,7 @@ void BatchedCommandResponse::unsetUpsertDetails() {
 }
 
 bool BatchedCommandResponse::isUpsertDetailsSet() const {
-    return _upsertDetails.get() != NULL;
+    return _upsertDetails.get() != nullptr;
 }
 
 size_t BatchedCommandResponse::sizeUpsertDetails() const {
@@ -413,26 +420,15 @@ OID BatchedCommandResponse::getElectionId() const {
     return _electionId;
 }
 
-void BatchedCommandResponse::setErrDetails(const std::vector<WriteErrorDetail*>& errDetails) {
-    unsetErrDetails();
-    for (std::vector<WriteErrorDetail*>::const_iterator it = errDetails.begin();
-         it != errDetails.end();
-         ++it) {
-        unique_ptr<WriteErrorDetail> tempBatchErrorDetail(new WriteErrorDetail);
-        (*it)->cloneTo(tempBatchErrorDetail.get());
-        addToErrDetails(tempBatchErrorDetail.release());
-    }
-}
-
 void BatchedCommandResponse::addToErrDetails(WriteErrorDetail* errDetails) {
-    if (_writeErrorDetails.get() == NULL) {
+    if (_writeErrorDetails.get() == nullptr) {
         _writeErrorDetails.reset(new std::vector<WriteErrorDetail*>);
     }
     _writeErrorDetails->push_back(errDetails);
 }
 
 void BatchedCommandResponse::unsetErrDetails() {
-    if (_writeErrorDetails.get() != NULL) {
+    if (_writeErrorDetails.get() != nullptr) {
         for (std::vector<WriteErrorDetail*>::iterator it = _writeErrorDetails->begin();
              it != _writeErrorDetails->end();
              ++it) {
@@ -443,7 +439,7 @@ void BatchedCommandResponse::unsetErrDetails() {
 }
 
 bool BatchedCommandResponse::isErrDetailsSet() const {
-    return _writeErrorDetails.get() != NULL;
+    return _writeErrorDetails.get() != nullptr;
 }
 
 size_t BatchedCommandResponse::sizeErrDetails() const {
@@ -492,6 +488,14 @@ Status BatchedCommandResponse::toStatus() const {
     }
 
     return Status::OK();
+}
+
+bool BatchedCommandResponse::isErrorLabelsSet() const {
+    return !_errorLabels.empty();
+}
+
+const std::vector<std::string>& BatchedCommandResponse::getErrorLabels() const {
+    return _errorLabels;
 }
 
 }  // namespace mongo

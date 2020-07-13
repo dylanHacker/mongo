@@ -1,5 +1,6 @@
-// @tags: [requires_fastcount]
+// @tags: [requires_fastcount, operations_longer_than_stepdown_interval_in_txns]
 
+(function() {
 t = db.geo3;
 t.drop();
 
@@ -16,16 +17,14 @@ assert.eq(t.count(), n - 1);
 
 t.ensureIndex({loc: "2d"});
 
-fast = db.runCommand({geoNear: t.getName(), near: [50, 50], num: 10});
+// Test the "query" parameter in $geoNear.
 
-// test filter
-
-filtered1 = db.runCommand({geoNear: t.getName(), near: [50, 50], num: 10, query: {a: 2}});
-assert.eq(10, filtered1.results.length, "B1");
-filtered1.results.forEach(function(z) {
-    assert.eq(2, z.obj.a, "B2: " + tojson(z));
-});
-// printjson( filtered1.stats );
+let res = t.aggregate([
+               {$geoNear: {near: [50, 50], distanceField: "dist", query: {a: 2}}},
+               {$limit: 10},
+           ]).toArray();
+assert.eq(10, res.length, tojson(res));
+res.forEach(doc => assert.eq(2, doc.a, tojson(doc)));
 
 function avgA(q, len) {
     if (!len)
@@ -51,14 +50,12 @@ testFiltering("just loc");
 assert.commandWorked(t.dropIndex({loc: "2d"}));
 assert.commandWorked(t.ensureIndex({loc: "2d", a: 1}));
 
-filtered2 = db.runCommand({geoNear: t.getName(), near: [50, 50], num: 10, query: {a: 2}});
-assert.eq(10, filtered2.results.length, "B3");
-filtered2.results.forEach(function(z) {
-    assert.eq(2, z.obj.a, "B4: " + tojson(z));
-});
-
-assert.eq(filtered1.stats.avgDistance, filtered2.stats.avgDistance, "C1");
-assert.gt(filtered1.stats.objectsLoaded, filtered2.stats.objectsLoaded, "C3");
+res = t.aggregate([
+           {$geoNear: {near: [50, 50], distanceField: "dist", query: {a: 2}}},
+           {$limit: 10},
+       ]).toArray();
+assert.eq(10, res.length, "B3");
+res.forEach(doc => assert.eq(2, doc.a, tojson(doc)));
 
 testFiltering("loc and a");
 
@@ -79,3 +76,4 @@ assert.eq(20, t.find(q).limit(20).size(), "D4");
 // SERVER-14039 Wrong limit after skip with $nearSphere, 2d index
 assert.eq(10, t.find(q).skip(10).limit(10).itcount(), "D5");
 assert.eq(10, t.find(q).skip(10).limit(10).size(), "D6");
+}());

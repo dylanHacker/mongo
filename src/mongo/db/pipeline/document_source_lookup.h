@@ -1,35 +1,37 @@
 /**
- * Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
 #include <boost/optional.hpp>
 
+#include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_sequential_document_cache.h"
@@ -37,7 +39,6 @@
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/lookup_set_cache.h"
-#include "mongo/db/pipeline/value_comparator.h"
 
 namespace mongo {
 
@@ -45,47 +46,47 @@ namespace mongo {
  * Queries separate collection for equality matches with documents in the pipeline collection.
  * Adds matching documents to a new array field in the input document.
  */
-class DocumentSourceLookUp final : public DocumentSource, public SplittableDocumentSource {
+class DocumentSourceLookUp final : public DocumentSource {
 public:
-    static constexpr size_t kMaxSubPipelineDepth = 20;
+    static constexpr StringData kStageName = "$lookup"_sd;
 
-    class LiteParsed final : public LiteParsedDocumentSource {
-    public:
-        static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
-                                                 const BSONElement& spec);
+    struct LetVariable {
+        LetVariable(std::string name, boost::intrusive_ptr<Expression> expression, Variables::Id id)
+            : name(std::move(name)), expression(std::move(expression)), id(id) {}
 
-        LiteParsed(NamespaceString fromNss,
-                   stdx::unordered_set<NamespaceString> foreignNssSet,
-                   boost::optional<LiteParsedPipeline> liteParsedPipeline)
-            : _fromNss{std::move(fromNss)},
-              _foreignNssSet(std::move(foreignNssSet)),
-              _liteParsedPipeline(std::move(liteParsedPipeline)) {}
-
-        stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final {
-            return {_foreignNssSet};
-        }
-
-        PrivilegeVector requiredPrivileges(bool isMongos) const final {
-            PrivilegeVector requiredPrivileges;
-            Privilege::addPrivilegeToPrivilegeVector(
-                &requiredPrivileges,
-                Privilege(ResourcePattern::forExactNamespace(_fromNss), ActionType::find));
-
-            if (_liteParsedPipeline) {
-                Privilege::addPrivilegesToPrivilegeVector(
-                    &requiredPrivileges, _liteParsedPipeline->requiredPrivileges(isMongos));
-            }
-
-            return requiredPrivileges;
-        }
-
-    private:
-        const NamespaceString _fromNss;
-        const stdx::unordered_set<NamespaceString> _foreignNssSet;
-        const boost::optional<LiteParsedPipeline> _liteParsedPipeline;
+        std::string name;
+        boost::intrusive_ptr<Expression> expression;
+        Variables::Id id;
     };
 
-    GetNextResult getNext() final;
+    class LiteParsed final : public LiteParsedDocumentSourceNestedPipelines {
+    public:
+        static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
+                                                 const BSONElement& spec);
+
+        LiteParsed(std::string parseTimeName,
+                   NamespaceString foreignNss,
+                   boost::optional<LiteParsedPipeline> pipeline)
+            : LiteParsedDocumentSourceNestedPipelines(
+                  std::move(parseTimeName), std::move(foreignNss), std::move(pipeline)) {}
+
+        /**
+         * Lookup from a sharded collection may not be allowed.
+         */
+        bool allowShardedForeignCollection(NamespaceString nss) const override final {
+            const bool foreignShardedAllowed =
+                getTestCommandsEnabled() && internalQueryAllowShardedLookup.load();
+            if (foreignShardedAllowed) {
+                return true;
+            }
+            auto involvedNss = getInvolvedNamespaces();
+            return (involvedNss.find(nss) == involvedNss.end());
+        }
+
+        PrivilegeVector requiredPrivileges(bool isMongos,
+                                           bool bypassDocumentValidation) const override final;
+    };
+
     const char* getSourceName() const final;
     void serializeToArray(
         std::vector<Value>& array,
@@ -96,57 +97,35 @@ public:
      */
     GetModPathsReturn getModifiedPaths() const final;
 
-    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
-        const bool mayUseDisk = wasConstructedWithPipelineSyntax() &&
-            std::any_of(_parsedIntrospectionPipeline->getSources().begin(),
-                        _parsedIntrospectionPipeline->getSources().end(),
-                        [](const auto& source) {
-                            return source->constraints().diskRequirement ==
-                                DiskUseRequirement::kWritesTmpData;
-                        });
+    /**
+     * Reports the StageConstraints of this $lookup instance. A $lookup constructed with pipeline
+     * syntax will inherit certain constraints from the stages in its pipeline.
+     */
+    StageConstraints constraints(Pipeline::SplitState) const final;
 
-        StageConstraints constraints(StreamType::kStreaming,
-                                     PositionRequirement::kNone,
-                                     HostTypeRequirement::kPrimaryShard,
-                                     mayUseDisk ? DiskUseRequirement::kWritesTmpData
-                                                : DiskUseRequirement::kNoDiskUse,
-                                     FacetRequirement::kAllowed,
-                                     TransactionRequirement::kAllowed);
+    DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
-        constraints.canSwapWithMatch = true;
-        return constraints;
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
+        // {shardsStage, mergingStage, sortPattern}
+        return DistributedPlanLogic{nullptr, this, boost::none};
     }
 
-    GetDepsReturn getDependencies(DepsTracker* deps) const final;
-
-    BSONObjSet getOutputSorts() final {
-        return DocumentSource::truncateSortSet(pSource->getOutputSorts(), {_as.fullPath()});
-    }
-
-    boost::intrusive_ptr<DocumentSource> getShardSource() final {
-        return nullptr;
-    }
-
-    std::list<boost::intrusive_ptr<DocumentSource>> getMergeSources() final {
-        return {this};
-    }
-
-    void addInvolvedCollections(std::vector<NamespaceString>* collections) const final {
-        collections->push_back(_fromNs);
-    }
+    void addInvolvedCollections(stdx::unordered_set<NamespaceString>* collectionNames) const final;
 
     void detachFromOperationContext() final;
 
     void reattachToOperationContext(OperationContext* opCtx) final;
 
+    bool usedDisk() final;
+
     static boost::intrusive_ptr<DocumentSource> createFromBson(
-        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     static boost::intrusive_ptr<DocumentSource> createFromBsonWithCacheSize(
         BSONElement elem,
-        const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
         size_t maxCacheSizeBytes) {
-        auto dsLookup = createFromBson(elem, pExpCtx);
+        auto dsLookup = createFromBson(elem, expCtx);
         static_cast<DocumentSourceLookUp*>(dsLookup.get())->reInitializeCache(maxCacheSizeBytes);
         return dsLookup;
     }
@@ -175,6 +154,33 @@ public:
         return !static_cast<bool>(_localField);
     }
 
+    boost::optional<FieldPath> getForeignField() const {
+        return _foreignField;
+    }
+
+    boost::optional<FieldPath> getLocalField() const {
+        return _localField;
+    }
+
+    const std::vector<LetVariable>& getLetVariables() const {
+        return _letVariables;
+    }
+
+    /**
+     * Returns a non-executable pipeline which can be useful for introspection. In this pipeline,
+     * all view definitions are resolved. This pipeline is present in both the sub-pipeline version
+     * of $lookup and the simpler 'localField/foreignField' version, but because it is not tied to
+     * any document to look up it is missing variable definitions for the former type and the $match
+     * stage which will be added to enforce the join criteria for the latter.
+     */
+    const auto& getResolvedIntrospectionPipeline() const {
+        return *_resolvedIntrospectionPipeline;
+    }
+
+    auto& getResolvedIntrospectionPipeline() {
+        return *_resolvedIntrospectionPipeline;
+    }
+
     const Variables& getVariables_forTest() {
         return _variables;
     }
@@ -188,6 +194,7 @@ public:
     }
 
 protected:
+    GetNextResult doGetNext() final;
     void doDispose() final;
 
     /**
@@ -198,22 +205,13 @@ protected:
                                                      Pipeline::SourceContainer* container) final;
 
 private:
-    struct LetVariable {
-        LetVariable(std::string name, boost::intrusive_ptr<Expression> expression, Variables::Id id)
-            : name(std::move(name)), expression(std::move(expression)), id(id) {}
-
-        std::string name;
-        boost::intrusive_ptr<Expression> expression;
-        Variables::Id id;
-    };
-
     /**
      * Target constructor. Handles common-field initialization for the syntax-specific delegating
      * constructors.
      */
     DocumentSourceLookUp(NamespaceString fromNs,
                          std::string as,
-                         const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+                         const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     /**
      * Constructor used for a $lookup stage specified using the {from: ..., localField: ...,
@@ -223,7 +221,7 @@ private:
                          std::string as,
                          std::string localField,
                          std::string foreignField,
-                         const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+                         const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     /**
      * Constructor used for a $lookup stage specified using the {from: ..., pipeline: [...], as:
@@ -233,7 +231,7 @@ private:
                          std::string as,
                          std::vector<BSONObj> pipeline,
                          BSONObj letVariables,
-                         const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+                         const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     /**
      * Should not be called; use serializeToArray instead.
@@ -245,14 +243,6 @@ private:
     GetNextResult unwindResult();
 
     /**
-     * Copies 'vars' and 'vps' to the Variables and VariablesParseState objects in 'expCtx'. These
-     * copies provide access to 'let' defined variables in sub-pipeline execution.
-     */
-    static void copyVariablesToExpCtx(const Variables& vars,
-                                      const VariablesParseState& vps,
-                                      ExpressionContext* expCtx);
-
-    /**
      * Resolves let defined variables against 'localDoc' and stores the results in 'variables'.
      */
     void resolveLetVariables(const Document& localDoc, Variables* variables);
@@ -261,19 +251,13 @@ private:
      * Builds a parsed pipeline for introspection (e.g. constraints, dependencies). Any sub-$lookup
      * pipelines will be built recursively.
      */
-    void initializeIntrospectionPipeline();
+    void initializeResolvedIntrospectionPipeline();
 
     /**
      * Builds the $lookup pipeline and resolves any variables using the passed 'inputDoc', adding a
      * cursor and/or cache source as appropriate.
      */
     std::unique_ptr<Pipeline, PipelineDeleter> buildPipeline(const Document& inputDoc);
-
-    /**
-     * The pipeline supplied via the $lookup 'pipeline' argument. This may differ from pipeline that
-     * is executed in that it will not include optimizations or resolved views.
-     */
-    std::string getUserPipelineDefinition();
 
     /**
      * Reinitialize the cache with a new max size. May only be called if this DSLookup was created
@@ -286,6 +270,7 @@ private:
         _cache.emplace(maxCacheSizeBytes);
     }
 
+    bool _usedDisk = false;
     NamespaceString _fromNs;
     NamespaceString _resolvedNs;
     FieldPath _as;
@@ -319,7 +304,7 @@ private:
     std::vector<BSONObj> _userPipeline;
     // A pipeline parsed from _resolvedPipeline at creation time, intended to support introspective
     // functions. If sub-$lookup stages are present, their pipelines are constructed recursively.
-    std::unique_ptr<Pipeline, PipelineDeleter> _parsedIntrospectionPipeline;
+    std::unique_ptr<Pipeline, PipelineDeleter> _resolvedIntrospectionPipeline;
 
     std::vector<LetVariable> _letVariables;
 

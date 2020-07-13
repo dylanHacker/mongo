@@ -1,23 +1,24 @@
-/*
- *    Copyright (C) 2014 MongoDB Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -36,14 +37,14 @@
 #include "mongo/client/scram_client_cache.h"
 #include "mongo/platform/random.h"
 #include "mongo/util/base64.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/password_digest.h"
+#include "mongo/util/str.h"
 #include "mongo/util/text.h"
 
 namespace mongo {
 
-using std::unique_ptr;
 using std::string;
+using std::unique_ptr;
 
 StatusWith<bool> SaslSCRAMClientConversation::step(StringData inputData, std::string* outputData) {
     _step++;
@@ -56,9 +57,9 @@ StatusWith<bool> SaslSCRAMClientConversation::step(StringData inputData, std::st
         case 3:
             return _thirdStep(inputData, outputData);
         default:
-            return StatusWith<bool>(
-                ErrorCodes::AuthenticationFailed,
-                mongoutils::str::stream() << "Invalid SCRAM authentication step: " << _step);
+            return StatusWith<bool>(ErrorCodes::AuthenticationFailed,
+                                    str::stream()
+                                        << "Invalid SCRAM authentication step: " << _step);
     }
 }
 
@@ -81,24 +82,17 @@ StatusWith<bool> SaslSCRAMClientConversation::_firstStep(std::string* outputData
     }
 
     // Create text-based nonce as base64 encoding of a binary blob of length multiple of 3
-    const int nonceLenQWords = 3;
+    static constexpr size_t nonceLenQWords = 3;
     uint64_t binaryNonce[nonceLenQWords];
 
-    unique_ptr<SecureRandom> sr(SecureRandom::create());
+    SecureRandom().fill(binaryNonce, sizeof(binaryNonce));
 
-    binaryNonce[0] = sr->nextInt64();
-    binaryNonce[1] = sr->nextInt64();
-    binaryNonce[2] = sr->nextInt64();
-
-    auto swUser =
-        saslPrep(_saslClientSession->getParameter(SaslClientSession::parameterUser).toString());
-    if (!swUser.isOK()) {
-        return swUser.getStatus();
-    }
-    auto user = swUser.getValue();
+    std::string user =
+        _saslClientSession->getParameter(SaslClientSession::parameterUser).toString();
 
     encodeSCRAMUsername(user);
-    _clientNonce = base64::encode(reinterpret_cast<char*>(binaryNonce), sizeof(binaryNonce));
+    _clientNonce =
+        base64::encode(StringData(reinterpret_cast<char*>(binaryNonce), sizeof(binaryNonce)));
 
     // Append client-first-message-bare to authMessage
     _authMessage = "n=" + user + ",r=" + _clientNonce;
@@ -129,8 +123,7 @@ StatusWith<bool> SaslSCRAMClientConversation::_secondStep(StringData inputData,
         return Status(ErrorCodes::BadValue,
                       str::stream()
                           << "Incorrect number of arguments for first SCRAM server message, got "
-                          << input.size()
-                          << " expected at least 3");
+                          << input.size() << " expected at least 3");
     }
 
     if (!str::startsWith(input[0], "r=") || input[0].size() < 3) {
@@ -154,7 +147,7 @@ StatusWith<bool> SaslSCRAMClientConversation::_secondStep(StringData inputData,
                       str::stream() << "Incorrect SCRAM iteration count: " << input[2]);
     }
     size_t iterationCount;
-    Status status = parseNumberFromStringWithBase(input[2].substr(2), 10, &iterationCount);
+    Status status = NumberParser().base(10)(input[2].substr(2), &iterationCount);
     if (!status.isOK()) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "Failed to parse SCRAM iteration count: " << input[2]);

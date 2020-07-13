@@ -1,32 +1,33 @@
 /**
- * Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -40,10 +41,10 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/is_mongos.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/processinfo.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -98,8 +99,7 @@ Status ClientMetadata::parseClientMetadataDocument(const BSONObj& doc) {
     if (static_cast<uint32_t>(doc.objsize()) > maxLength) {
         return Status(ErrorCodes::ClientMetadataDocumentTooLarge,
                       str::stream() << "The client metadata document must be less then or equal to "
-                                    << maxLength
-                                    << "bytes");
+                                    << maxLength << "bytes");
     }
 
     // Get a copy so that we can take a stable reference to the app name inside
@@ -134,9 +134,10 @@ Status ClientMetadata::parseClientMetadataDocument(const BSONObj& doc) {
         } else if (name == kDriver) {
             if (!e.isABSONObj()) {
                 return Status(ErrorCodes::TypeMismatch,
-                              str::stream() << "The '" << kDriver << "' field is required to be a "
-                                                                     "BSON document in the client "
-                                                                     "metadata document");
+                              str::stream() << "The '" << kDriver
+                                            << "' field is required to be a "
+                                               "BSON document in the client "
+                                               "metadata document");
             }
 
             Status s = validateDriverDocument(e.Obj());
@@ -195,10 +196,10 @@ StatusWith<StringData> ClientMetadata::parseApplicationDocument(const BSONObj& d
         if (name == kName) {
 
             if (e.type() != String) {
-                return {
-                    ErrorCodes::TypeMismatch,
-                    str::stream() << "The '" << kApplication << "." << kName
-                                  << "' field must be a string in the client metadata document"};
+                return {ErrorCodes::TypeMismatch,
+                        str::stream()
+                            << "The '" << kApplication << "." << kName
+                            << "' field must be a string in the client metadata document"};
             }
 
             StringData value = e.checkAndGetStringData();
@@ -229,18 +230,18 @@ Status ClientMetadata::validateDriverDocument(const BSONObj& doc) {
 
         if (name == kName) {
             if (e.type() != String) {
-                return Status(
-                    ErrorCodes::TypeMismatch,
-                    str::stream() << "The '" << kDriver << "." << kName
+                return Status(ErrorCodes::TypeMismatch,
+                              str::stream()
+                                  << "The '" << kDriver << "." << kName
                                   << "' field must be a string in the client metadata document");
             }
 
             foundName = true;
         } else if (name == kVersion) {
             if (e.type() != String) {
-                return Status(
-                    ErrorCodes::TypeMismatch,
-                    str::stream() << "The '" << kDriver << "." << kVersion
+                return Status(ErrorCodes::TypeMismatch,
+                              str::stream()
+                                  << "The '" << kDriver << "." << kVersion
                                   << "' field must be a string in the client metadata document");
             }
 
@@ -273,9 +274,9 @@ Status ClientMetadata::validateOperatingSystemDocument(const BSONObj& doc) {
 
         if (name == kType) {
             if (e.type() != String) {
-                return Status(
-                    ErrorCodes::TypeMismatch,
-                    str::stream() << "The '" << kOperatingSystem << "." << kType
+                return Status(ErrorCodes::TypeMismatch,
+                              str::stream()
+                                  << "The '" << kOperatingSystem << "." << kType
                                   << "' field must be a string in the client metadata document");
             }
 
@@ -286,8 +287,7 @@ Status ClientMetadata::validateOperatingSystemDocument(const BSONObj& doc) {
     if (foundType == false) {
         return Status(ErrorCodes::ClientMetadataMissingField,
                       str::stream() << "Missing required field '" << kOperatingSystem << "."
-                                    << kType
-                                    << "' in the client metadata document");
+                                    << kType << "' in the client metadata document");
     }
 
     return Status::OK();
@@ -435,8 +435,12 @@ const BSONObj& ClientMetadata::getDocument() const {
 
 void ClientMetadata::logClientMetadata(Client* client) const {
     invariant(!getDocument().isEmpty());
-    log() << "received client metadata from " << client->getRemote().toString() << " "
-          << client->desc() << ": " << getDocument();
+    LOGV2(51800,
+          "received client metadata from {remote} {client}: {doc}",
+          "client metadata",
+          "remote"_attr = client->getRemote(),
+          "client"_attr = client->desc(),
+          "doc"_attr = getDocument());
 }
 
 StringData ClientMetadata::fieldName() {

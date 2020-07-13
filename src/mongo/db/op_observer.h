@@ -1,23 +1,24 @@
 /**
- *    Copyright 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,13 +31,12 @@
 
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/commit_quorum_options.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/rollback.h"
-#include "mongo/db/s/collection_sharding_state.h"
 
 namespace mongo {
 
@@ -51,36 +51,20 @@ class OpTime;
  * Holds document update information used in logging.
  */
 struct OplogUpdateEntryArgs {
-    enum class StoreDocOption { None, PreImage, PostImage };
+    CollectionUpdateArgs updateArgs;
 
-    // Name of the collection in which document is being updated.
     NamespaceString nss;
+    CollectionUUID uuid;
 
-    OptionalCollectionUUID uuid;
-
-    StmtId stmtId = kUninitializedStmtId;
-
-    // The document before modifiers were applied.
-    boost::optional<BSONObj> preImageDoc;
-
-    // Fully updated document with damages (update modifiers) applied.
-    BSONObj updatedDoc;
-
-    // Document containing update modifiers -- e.g. $set and $unset
-    BSONObj update;
-
-    // Document containing the _id field of the doc being updated.
-    BSONObj criteria;
-
-    // True if this update comes from a chunk migration.
-    bool fromMigrate = false;
-
-    StoreDocOption storeDocOption = StoreDocOption::None;
+    OplogUpdateEntryArgs(CollectionUpdateArgs updateArgs, NamespaceString nss, CollectionUUID uuid)
+        : updateArgs(std::move(updateArgs)), nss(std::move(nss)), uuid(std::move(uuid)) {}
 };
 
-struct TTLCollModInfo {
-    Seconds expireAfterSeconds;
-    Seconds oldExpireAfterSeconds;
+struct IndexCollModInfo {
+    boost::optional<Seconds> expireAfterSeconds;
+    boost::optional<Seconds> oldExpireAfterSeconds;
+    boost::optional<bool> hidden;
+    boost::optional<bool> oldHidden;
     std::string indexName;
 };
 
@@ -95,12 +79,48 @@ struct TTLCollModInfo {
  */
 class OpObserver {
 public:
+    enum class CollectionDropType {
+        // The collection is being dropped immediately, in one step.
+        kOnePhase,
+
+        // The collection is being dropped in two phases, by renaming to a drop pending collection
+        // which is registered to be reaped later.
+        kTwoPhase,
+    };
+
     virtual ~OpObserver() = default;
+
     virtual void onCreateIndex(OperationContext* opCtx,
                                const NamespaceString& nss,
-                               OptionalCollectionUUID uuid,
+                               CollectionUUID uuid,
                                BSONObj indexDoc,
                                bool fromMigrate) = 0;
+
+    virtual void onStartIndexBuild(OperationContext* opCtx,
+                                   const NamespaceString& nss,
+                                   CollectionUUID collUUID,
+                                   const UUID& indexBuildUUID,
+                                   const std::vector<BSONObj>& indexes,
+                                   bool fromMigrate) = 0;
+
+    virtual void onStartIndexBuildSinglePhase(OperationContext* opCtx,
+                                              const NamespaceString& nss) = 0;
+
+    virtual void onCommitIndexBuild(OperationContext* opCtx,
+                                    const NamespaceString& nss,
+                                    CollectionUUID collUUID,
+                                    const UUID& indexBuildUUID,
+                                    const std::vector<BSONObj>& indexes,
+                                    bool fromMigrate) = 0;
+
+    virtual void onAbortIndexBuild(OperationContext* opCtx,
+                                   const NamespaceString& nss,
+                                   CollectionUUID collUUID,
+                                   const UUID& indexBuildUUID,
+                                   const std::vector<BSONObj>& indexes,
+                                   const Status& cause,
+                                   bool fromMigrate) = 0;
+
     virtual void onInserts(OperationContext* opCtx,
                            const NamespaceString& nss,
                            OptionalCollectionUUID uuid,
@@ -118,6 +138,10 @@ public:
      * "fromMigrate" indicates whether the delete was induced by a chunk migration, and
      * so should be ignored by the user as an internal maintenance operation and not a
      * real delete.
+     *
+     * "deletedDoc" is a reference to an optional copy of the pre-image of the doc before deletion.
+     * If deletedDoc != boost::none, then the opObserver should assume that the caller intended
+     * the pre-image to be stored/logged in addition to the documentKey.
      */
     virtual void onDelete(OperationContext* opCtx,
                           const NamespaceString& nss,
@@ -148,7 +172,8 @@ public:
                                     Collection* coll,
                                     const NamespaceString& collectionName,
                                     const CollectionOptions& options,
-                                    const BSONObj& idIndex) = 0;
+                                    const BSONObj& idIndex,
+                                    const OplogSlot& createOpTime) = 0;
     /**
      * This function logs an oplog entry when a 'collMod' command on a collection is executed.
      * Since 'collMod' commands can take a variety of different formats, the 'o' field of the
@@ -185,17 +210,21 @@ public:
                            OptionalCollectionUUID uuid,
                            const BSONObj& collModCmd,
                            const CollectionOptions& oldCollOptions,
-                           boost::optional<TTLCollModInfo> ttlInfo) = 0;
+                           boost::optional<IndexCollModInfo> indexInfo) = 0;
     virtual void onDropDatabase(OperationContext* opCtx, const std::string& dbName) = 0;
 
     /**
      * This function logs an oplog entry when a 'drop' command on a collection is executed.
      * Returns the optime of the oplog entry successfully written to the oplog.
      * Returns a null optime if an oplog entry was not written for this operation.
+     *
+     * 'dropType' describes whether the collection drop is one-phase or two-phase.
      */
     virtual repl::OpTime onDropCollection(OperationContext* opCtx,
                                           const NamespaceString& collectionName,
-                                          OptionalCollectionUUID uuid) = 0;
+                                          OptionalCollectionUUID uuid,
+                                          std::uint64_t numRecords,
+                                          CollectionDropType dropType) = 0;
 
     /**
      * This function logs an oplog entry when an index is dropped. The namespace of the index,
@@ -214,42 +243,109 @@ public:
 
     /**
      * This function logs an oplog entry when a 'renameCollection' command on a collection is
-     * executed.
+     * executed. It should be used specifically in instances where the optime is necessary to
+     * be obtained prior to performing the actual rename, and should only be used in conjunction
+     * with postRenameCollection.
      * Returns the optime of the oplog entry successfully written to the oplog.
      * Returns a null optime if an oplog entry was not written for this operation.
      */
-    virtual repl::OpTime onRenameCollection(OperationContext* opCtx,
-                                            const NamespaceString& fromCollection,
-                                            const NamespaceString& toCollection,
-                                            OptionalCollectionUUID uuid,
-                                            OptionalCollectionUUID dropTargetUUID,
-                                            bool stayTemp) = 0;
+    virtual repl::OpTime preRenameCollection(OperationContext* opCtx,
+                                             const NamespaceString& fromCollection,
+                                             const NamespaceString& toCollection,
+                                             OptionalCollectionUUID uuid,
+                                             OptionalCollectionUUID dropTargetUUID,
+                                             std::uint64_t numRecords,
+                                             bool stayTemp) = 0;
+    /**
+     * This function performs all op observer handling for a 'renameCollection' command except for
+     * logging the oplog entry. It should be used specifically in instances where the optime is
+     * necessary to be obtained prior to performing the actual rename, and should only be used in
+     * conjunction with preRenameCollection.
+     */
+    virtual void postRenameCollection(OperationContext* opCtx,
+                                      const NamespaceString& fromCollection,
+                                      const NamespaceString& toCollection,
+                                      OptionalCollectionUUID uuid,
+                                      OptionalCollectionUUID dropTargetUUID,
+                                      bool stayTemp) = 0;
+    /**
+     * This function logs an oplog entry when a 'renameCollection' command on a collection is
+     * executed. It calls preRenameCollection to log the entry and postRenameCollection to do all
+     * other handling.
+     */
+    virtual void onRenameCollection(OperationContext* opCtx,
+                                    const NamespaceString& fromCollection,
+                                    const NamespaceString& toCollection,
+                                    OptionalCollectionUUID uuid,
+                                    OptionalCollectionUUID dropTargetUUID,
+                                    std::uint64_t numRecords,
+                                    bool stayTemp) = 0;
+
     virtual void onApplyOps(OperationContext* opCtx,
                             const std::string& dbName,
                             const BSONObj& applyOpCmd) = 0;
     virtual void onEmptyCapped(OperationContext* opCtx,
                                const NamespaceString& collectionName,
                                OptionalCollectionUUID uuid) = 0;
+
     /**
-     * The onTransactionCommit method is called on the commit of an atomic transaction, before the
-     * RecoveryUnit onCommit() is called.  It must not be called when no transaction is active.
+     * The onUnpreparedTransactionCommit method is called on the commit of an unprepared
+     * transaction, before the RecoveryUnit onCommit() is called.  It must not be called when no
+     * transaction is active.
+     *
+     * The 'statements' are the list of CRUD operations to be applied in this transaction.
+     *
+     * The 'numberOfPreImagesToWrite' is the number of CRUD operations that have a pre-image
+     * to write as a noop oplog entry. The op observer will reserve oplog slots for these
+     * preimages in addition to the statements.
      */
-    virtual void onTransactionCommit(OperationContext* opCtx) = 0;
+    virtual void onUnpreparedTransactionCommit(OperationContext* opCtx,
+                                               std::vector<repl::ReplOperation>* statements,
+                                               size_t numberOfPreImagesToWrite) = 0;
+    /**
+     * The onPreparedTransactionCommit method is called on the commit of a prepared transaction,
+     * after the RecoveryUnit onCommit() is called.  It must not be called when no transaction is
+     * active.
+     *
+     * The 'commitOplogEntryOpTime' is passed in to be used as the OpTime of the oplog entry. The
+     * 'commitTimestamp' is the timestamp at which the multi-document transaction was committed.
+     *
+     * The 'statements' are the list of CRUD operations to be applied in this transaction.
+     */
+    virtual void onPreparedTransactionCommit(
+        OperationContext* opCtx,
+        OplogSlot commitOplogEntryOpTime,
+        Timestamp commitTimestamp,
+        const std::vector<repl::ReplOperation>& statements) noexcept = 0;
 
     /**
      * The onTransactionPrepare method is called when an atomic transaction is prepared. It must be
-     * called when a transaction is active. It generates an OpTime and sets the prepare timestamp on
-     * the recovery unit.
-     * TODO: This is an incomplete implementation and should only be used for testing. It does not
-     * write the prepare oplog entry, only generates an OpTime.
+     * called when a transaction is active.
+     *
+     * 'reservedSlots' is a list of oplog slots reserved for the oplog entries in a transaction. The
+     * last reserved slot represents the prepareOpTime used for the prepare oplog entry.
+     *
+     * The 'statements' are the list of CRUD operations to be applied in this transaction.
+     *
+     * The 'numberOfPreImagesToWrite' is the number of CRUD operations that have a pre-image
+     * to write as a noop oplog entry. The op observer will reserve oplog slots for these
+     * preimages in addition to the statements.
      */
-    virtual void onTransactionPrepare(OperationContext* opCtx) = 0;
+    virtual void onTransactionPrepare(OperationContext* opCtx,
+                                      const std::vector<OplogSlot>& reservedSlots,
+                                      std::vector<repl::ReplOperation>* statements,
+                                      size_t numberOfPreImagesToWrite) = 0;
 
     /**
      * The onTransactionAbort method is called when an atomic transaction aborts, before the
-     * RecoveryUnit onRollback() is called.  It must not be called when no transaction is active.
+     * RecoveryUnit onRollback() is called. It must not be called when the transaction to abort is
+     * active.
+     *
+     * If the transaction was prepared, then 'abortOplogEntryOpTime' is passed in to be used as the
+     * OpTime of the oplog entry.
      */
-    virtual void onTransactionAbort(OperationContext* opCtx) = 0;
+    virtual void onTransactionAbort(OperationContext* opCtx,
+                                    boost::optional<OplogSlot> abortOplogEntryOpTime) = 0;
 
     /**
      * A structure to hold information about a replication rollback suitable to be passed along to
@@ -279,7 +375,7 @@ public:
         bool configServerConfigVersionRolledBack = false;
 
         // Maps command names to a count of the number of those commands that are being rolled back.
-        StringMap<std::uint32_t> rollbackCommandCounts;
+        StringMap<long long> rollbackCommandCounts;
     };
 
     /**
@@ -298,6 +394,16 @@ public:
      */
     virtual void onReplicationRollback(OperationContext* opCtx,
                                        const RollbackObserverInfo& rbInfo) = 0;
+
+    /**
+     * Called when the majority commit point is updated by replication.
+     *
+     * This is called while holding a very hot mutex (the ReplicationCoordinator mutex). Therefore
+     * it should avoid doing any work that can be done later, and avoid calling back into any
+     * replication functions that take this mutex (which would cause self-deadlock).
+     */
+    virtual void onMajorityCommitPointUpdate(ServiceContext* service,
+                                             const repl::OpTime& newCommitPoint) = 0;
 
     struct Times;
 

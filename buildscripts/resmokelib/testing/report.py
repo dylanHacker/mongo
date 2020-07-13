@@ -3,27 +3,32 @@
 This is used to support additional test status and timing information for the report.json file.
 """
 
-from __future__ import absolute_import
-
 import copy
 import threading
 import time
 import unittest
 
-from .. import config as _config
-from .. import logging
+from buildscripts.resmokelib import config as _config
+from buildscripts.resmokelib import logging
 
 
 # pylint: disable=attribute-defined-outside-init
 class TestReport(unittest.TestResult):  # pylint: disable=too-many-instance-attributes
     """Record test status and timing information."""
 
-    def __init__(self, job_logger, suite_options):
-        """Initialize the TestReport with the buildlogger configuration."""
+    def __init__(self, job_logger, suite_options, job_num=None):
+        """
+        Initialize the TestReport with the buildlogger configuration.
+
+        :param job_logger: The higher-level logger that will be used to print metadata about the test.
+        :param suite_options: Options for the suite being executed.
+        :param job_num: The number corresponding to the job this test runs in.
+        """
 
         unittest.TestResult.__init__(self)
 
         self.job_logger = job_logger
+        self.job_num = job_num
         self.suite_options = suite_options
 
         self._lock = threading.Lock()
@@ -42,7 +47,7 @@ class TestReport(unittest.TestResult):  # pylint: disable=too-many-instance-attr
 
         # TestReports that are used when running tests need a JobLogger but combined reports don't
         # use the logger.
-        combined_report = cls(logging.loggers.EXECUTOR_LOGGER,
+        combined_report = cls(logging.loggers.ROOT_EXECUTOR_LOGGER,
                               _config.SuiteOptions.ALL_INHERITED.resolve())
         combining_time = time.time()
 
@@ -89,29 +94,32 @@ class TestReport(unittest.TestResult):  # pylint: disable=too-many-instance-attr
 
         return combined_report
 
-    def startTest(self, test, dynamic=False):  # pylint: disable=invalid-name,arguments-differ
+    def startTest(self, test):  # pylint: disable=invalid-name
         """Call before 'test' is run."""
 
         unittest.TestResult.startTest(self, test)
 
-        test_info = _TestInfo(test.id(), dynamic)
-        test_info.start_time = time.time()
+        test_info = _TestInfo(test.id(), test.test_name, test.dynamic)
 
         basename = test.basename()
         command = test.as_command()
-        self.job_logger.info("Running %s...\n%s", basename, command)
+        if command:
+            self.job_logger.info("Running %s...\n%s", basename, command)
+        else:
+            self.job_logger.info("Running %s...", basename)
 
         with self._lock:
             self.test_infos.append(test_info)
-            if dynamic:
+            if test.dynamic:
                 self.num_dynamic += 1
 
         # Set up the test-specific logger.
-        test_logger = self.job_logger.new_test_logger(test.short_name(), test.basename(), command,
-                                                      test.logger)
-        test_info.url_endpoint = test_logger.url_endpoint
+        (test_logger, url_endpoint) = logging.loggers.new_test_logger(
+            test.short_name(), test.basename(), command, test.logger, self.job_num, self.job_logger)
+        test_info.url_endpoint = url_endpoint
 
         test.override_logger(test_logger)
+        test_info.start_time = time.time()
 
     def stopTest(self, test):  # pylint: disable=invalid-name
         """Call after 'test' has run."""
@@ -121,9 +129,11 @@ class TestReport(unittest.TestResult):  # pylint: disable=too-many-instance-attr
         with self._lock:
             test_info = self.find_test_info(test)
             test_info.end_time = time.time()
+            test_status = "no failures detected" if test_info.status == "pass" else "failed"
 
         time_taken = test_info.end_time - test_info.start_time
-        self.job_logger.info("%s ran in %0.2f seconds.", test.basename(), time_taken)
+        self.job_logger.info("%s ran in %0.2f seconds: %s.", test.basename(), time_taken,
+                             test_status)
 
         # Asynchronously closes the buildlogger test handler to avoid having too many threads open
         # on 32-bit systems.
@@ -151,6 +161,7 @@ class TestReport(unittest.TestResult):  # pylint: disable=too-many-instance-attr
 
     def setError(self, test):  # pylint: disable=invalid-name
         """Change the outcome of an existing test to an error."""
+        self.job_logger.info("setError(%s)", test)
 
         with self._lock:
             test_info = self.find_test_info(test)
@@ -262,7 +273,7 @@ class TestReport(unittest.TestResult):  # pylint: disable=too-many-instance-attr
         with self._lock:
             for test_info in self.test_infos:
                 result = {
-                    "test_file": test_info.test_id,
+                    "test_file": test_info.test_file,
                     "status": test_info.evergreen_status,
                     "exit_code": test_info.return_code,
                     "start": test_info.start_time,
@@ -292,7 +303,10 @@ class TestReport(unittest.TestResult):  # pylint: disable=too-many-instance-attr
         for result in report_dict["results"]:
             # By convention, dynamic tests are named "<basename>:<hook name>".
             is_dynamic = ":" in result["test_file"]
-            test_info = _TestInfo(result["test_file"], is_dynamic)
+            test_file = result["test_file"]
+            # Using test_file as the test id is ok here since the test id only needs to be unique
+            # during suite execution.
+            test_info = _TestInfo(test_file, test_file, is_dynamic)
             test_info.url_endpoint = result.get("url")
             test_info.status = result["status"]
             test_info.evergreen_status = test_info.status
@@ -341,10 +355,11 @@ class TestReport(unittest.TestResult):  # pylint: disable=too-many-instance-attr
 class _TestInfo(object):  # pylint: disable=too-many-instance-attributes
     """Holder for the test status and timing information."""
 
-    def __init__(self, test_id, dynamic):
+    def __init__(self, test_id, test_file, dynamic):
         """Initialize the _TestInfo instance."""
 
         self.test_id = test_id
+        self.test_file = test_file
         self.dynamic = dynamic
 
         self.start_time = None
@@ -353,3 +368,22 @@ class _TestInfo(object):  # pylint: disable=too-many-instance-attributes
         self.evergreen_status = None
         self.return_code = None
         self.url_endpoint = None
+
+
+def test_order(test_name):
+    """
+    A key function used for sorting _TestInfo objects by recommended order of investigation.
+
+    Investigate setup/teardown errors, then hooks, then test files.
+    """
+
+    if 'fixture_setup' in test_name:
+        return 1
+    elif 'fixture_teardown' in test_name:
+        return 2
+    elif 'fixture_abort' in test_name:
+        return 3
+    elif ':' in test_name:
+        return 4
+    else:
+        return 5

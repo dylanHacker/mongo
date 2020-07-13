@@ -1,23 +1,24 @@
 /**
- *    Copyright 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -40,13 +41,9 @@ namespace {
 TEST(KillCursorsResponseTest, parseFromBSONSuccess) {
     StatusWith<KillCursorsResponse> result = KillCursorsResponse::parseFromBSON(
         BSON("cursorsKilled" << BSON_ARRAY(CursorId(123)) << "cursorsNotFound"
-                             << BSON_ARRAY(CursorId(456) << CursorId(6))
-                             << "cursorsAlive"
+                             << BSON_ARRAY(CursorId(456) << CursorId(6)) << "cursorsAlive"
                              << BSON_ARRAY(CursorId(7) << CursorId(8) << CursorId(9))
-                             << "cursorsUnknown"
-                             << BSONArray()
-                             << "ok"
-                             << 1.0));
+                             << "cursorsUnknown" << BSONArray() << "ok" << 1.0));
     ASSERT_OK(result.getStatus());
     KillCursorsResponse response = result.getValue();
     ASSERT_EQ(response.cursorsKilled.size(), 1U);
@@ -64,11 +61,8 @@ TEST(KillCursorsResponseTest, parseFromBSONSuccess) {
 TEST(KillCursorsResponseTest, parseFromBSONSuccessOmitCursorsAlive) {
     StatusWith<KillCursorsResponse> result = KillCursorsResponse::parseFromBSON(
         BSON("cursorsKilled" << BSON_ARRAY(CursorId(123)) << "cursorsNotFound"
-                             << BSON_ARRAY(CursorId(456) << CursorId(6))
-                             << "cursorsUnknown"
-                             << BSON_ARRAY(CursorId(789))
-                             << "ok"
-                             << 1.0));
+                             << BSON_ARRAY(CursorId(456) << CursorId(6)) << "cursorsUnknown"
+                             << BSON_ARRAY(CursorId(789)) << "ok" << 1.0));
     ASSERT_NOT_OK(result.getStatus());
     ASSERT_EQ(result.getStatus().code(), ErrorCodes::FailedToParse);
 }
@@ -83,13 +77,11 @@ TEST(KillCursorsResponseTest, parseFromBSONCommandNotOk) {
 }
 
 TEST(KillCursorsResponseTest, parseFromBSONFieldNotArray) {
-    StatusWith<KillCursorsResponse> result = KillCursorsResponse::parseFromBSON(
-        BSON("cursorsKilled" << BSON_ARRAY(CursorId(123)) << "cursorsNotFound"
-                             << "foobar"
-                             << "cursorsAlive"
-                             << BSON_ARRAY(CursorId(7) << CursorId(8) << CursorId(9))
-                             << "ok"
-                             << 1.0));
+    StatusWith<KillCursorsResponse> result = KillCursorsResponse::parseFromBSON(BSON(
+        "cursorsKilled" << BSON_ARRAY(CursorId(123)) << "cursorsNotFound"
+                        << "foobar"
+                        << "cursorsAlive" << BSON_ARRAY(CursorId(7) << CursorId(8) << CursorId(9))
+                        << "ok" << 1.0));
     ASSERT_NOT_OK(result.getStatus());
     ASSERT_EQ(result.getStatus().code(), ErrorCodes::FailedToParse);
 }
@@ -97,13 +89,23 @@ TEST(KillCursorsResponseTest, parseFromBSONFieldNotArray) {
 TEST(KillCursorsResponseTest, parseFromBSONArrayContainsInvalidElement) {
     StatusWith<KillCursorsResponse> result = KillCursorsResponse::parseFromBSON(
         BSON("cursorsKilled" << BSON_ARRAY(CursorId(123)) << "cursorsNotFound"
-                             << BSON_ARRAY(CursorId(456) << CursorId(6))
-                             << "cursorsAlive"
-                             << BSON_ARRAY(CursorId(7) << "foobar" << CursorId(9))
-                             << "ok"
-                             << 1.0));
+                             << BSON_ARRAY(CursorId(456) << CursorId(6)) << "cursorsAlive"
+                             << BSON_ARRAY(CursorId(7) << "foobar" << CursorId(9)) << "ok" << 1.0));
     ASSERT_NOT_OK(result.getStatus());
     ASSERT_EQ(result.getStatus().code(), ErrorCodes::FailedToParse);
+}
+
+TEST(KillCursorsResponseTest, parseFromBSONEmptyArrays) {
+    // Verifies that a kill cursors response with empty cursor ID arrays is accepted.
+    StatusWith<KillCursorsResponse> result = KillCursorsResponse::parseFromBSON(
+        BSON("cursorsKilled" << BSONArray() << "cursorsNotFound" << BSONArray() << "cursorsAlive"
+                             << BSONArray() << "cursorsUnknown" << BSONArray() << "ok" << 1.0));
+    ASSERT_OK(result.getStatus());
+    KillCursorsResponse response = result.getValue();
+    ASSERT_EQ(response.cursorsKilled.size(), 0U);
+    ASSERT_EQ(response.cursorsNotFound.size(), 0U);
+    ASSERT_EQ(response.cursorsAlive.size(), 0U);
+    ASSERT_EQ(response.cursorsUnknown.size(), 0U);
 }
 
 TEST(KillCursorsResponseTest, toBSON) {
@@ -115,16 +117,26 @@ TEST(KillCursorsResponseTest, toBSON) {
     BSONObj responseObj = response.toBSON();
     BSONObj expectedResponse =
         BSON("cursorsKilled" << BSON_ARRAY(CursorId(123)) << "cursorsNotFound"
-                             << BSON_ARRAY(CursorId(456) << CursorId(6))
-                             << "cursorsAlive"
+                             << BSON_ARRAY(CursorId(456) << CursorId(6)) << "cursorsAlive"
                              << BSON_ARRAY(CursorId(7) << CursorId(8) << CursorId(9))
-                             << "cursorsUnknown"
-                             << BSONArray()
-                             << "ok"
-                             << 1.0);
+                             << "cursorsUnknown" << BSONArray() << "ok" << 1.0);
+    ASSERT_BSONOBJ_EQ(responseObj, expectedResponse);
+}
+
+TEST(KillCursorsResponseTest, toBSONWithZeroKilledNotFoundAliveUnknownCursors) {
+    std::vector<CursorId> killed;
+    std::vector<CursorId> notFound;
+    std::vector<CursorId> alive;
+    std::vector<CursorId> unknown;
+    // Verifies that a kill cursors response with empty cursor ID arrays can be created and is
+    // correctly serialized to a BSON object.
+    KillCursorsResponse response(killed, notFound, alive, unknown);
+    BSONObj responseObj = response.toBSON();
+    BSONObj expectedResponse =
+        BSON("cursorsKilled" << BSONArray() << "cursorsNotFound" << BSONArray() << "cursorsAlive"
+                             << BSONArray() << "cursorsUnknown" << BSONArray() << "ok" << 1.0);
     ASSERT_BSONOBJ_EQ(responseObj, expectedResponse);
 }
 
 }  // namespace
-
 }  // namespace mongo

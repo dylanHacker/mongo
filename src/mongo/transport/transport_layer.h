@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,16 +29,21 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 
 #include "mongo/base/status.h"
-#include "mongo/stdx/functional.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/transport/session.h"
+#include "mongo/util/functional.h"
 #include "mongo/util/future.h"
-#include "mongo/util/net/message.h"
+#include "mongo/util/out_of_line_executor.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
+
+class OperationContext;
+
 namespace transport {
 
 enum ConnectSSLMode { kGlobalSSLMode, kEnableSSL, kDisableSSL };
@@ -59,7 +65,8 @@ using ReactorHandle = std::shared_ptr<Reactor>;
  * References to the TransportLayer should be stored on service context objects.
  */
 class TransportLayer {
-    MONGO_DISALLOW_COPYING(TransportLayer);
+    TransportLayer(const TransportLayer&) = delete;
+    TransportLayer& operator=(const TransportLayer&) = delete;
 
 public:
     static const Status SessionUnknownStatus;
@@ -77,7 +84,8 @@ public:
 
     virtual Future<SessionHandle> asyncConnect(HostAndPort peer,
                                                ConnectSSLMode sslMode,
-                                               const ReactorHandle& reactor) = 0;
+                                               const ReactorHandle& reactor,
+                                               Milliseconds timeout) = 0;
 
     /**
      * Start the TransportLayer. After this point, the TransportLayer will begin accepting active
@@ -103,34 +111,50 @@ public:
     enum WhichReactor { kIngress, kEgress, kNewReactor };
     virtual ReactorHandle getReactor(WhichReactor which) = 0;
 
+    virtual BatonHandle makeBaton(OperationContext* opCtx) const {
+        return opCtx->getServiceContext()->makeBaton(opCtx);
+    }
+
 protected:
     TransportLayer() = default;
 };
 
 class ReactorTimer {
 public:
-    ReactorTimer() = default;
+    ReactorTimer();
+
     ReactorTimer(const ReactorTimer&) = delete;
     ReactorTimer& operator=(const ReactorTimer&) = delete;
 
+    /*
+     * The destructor calls cancel() to ensure outstanding Futures are filled.
+     */
     virtual ~ReactorTimer() = default;
 
-    /*
-     * Cancel any outstanding calls to waitFor/waitUntil. The future will have
-     * an ErrorCodes::CallbackCancelled status.
-     */
-    virtual void cancel() = 0;
+    size_t id() const {
+        return _id;
+    }
 
     /*
-     * Returns a future that will be filled with Status::OK after the timeout has
-     * ellapsed or has been cancelled.
+     * Cancel any outstanding future from waitFor/waitUntil. The future will be filled with an
+     * ErrorCodes::CallbackCancelled status.
+     *
+     * If no future is outstanding, then this is a noop.
      */
+    virtual void cancel(const BatonHandle& baton = nullptr) = 0;
 
-    virtual Future<void> waitFor(Milliseconds timeout) = 0;
-    virtual Future<void> waitUntil(Date_t timeout) = 0;
+    /*
+     * Returns a future that will be filled with Status::OK after the deadline has passed.
+     *
+     * Calling this implicitly calls cancel().
+     */
+    virtual Future<void> waitUntil(Date_t deadline, const BatonHandle& baton = nullptr) = 0;
+
+private:
+    const size_t _id;
 };
 
-class Reactor {
+class Reactor : public OutOfLineExecutor {
 public:
     Reactor(const Reactor&) = delete;
     Reactor& operator=(const Reactor&) = delete;
@@ -143,22 +167,10 @@ public:
     virtual void run() noexcept = 0;
     virtual void runFor(Milliseconds time) noexcept = 0;
     virtual void stop() = 0;
+    virtual void drain() = 0;
 
-    using Task = stdx::function<void()>;
-
-    enum ScheduleMode { kDispatch, kPost };
-    virtual void schedule(ScheduleMode mode, Task task) = 0;
-
-    template <typename Callback>
-    Future<FutureContinuationResult<Callback>> execute(Callback&& cb) {
-        Promise<FutureContinuationResult<Callback>> promise;
-        auto future = promise.getFuture();
-
-        schedule(kPost,
-                 [ cb = std::forward<Callback>(cb), sp = promise.share() ] { sp.setWith(cb); });
-
-        return future;
-    }
+    virtual void schedule(Task task) = 0;
+    virtual void dispatch(Task task) = 0;
 
     virtual bool onReactorThread() const = 0;
 

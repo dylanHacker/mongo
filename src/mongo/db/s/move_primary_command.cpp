@@ -1,32 +1,33 @@
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -35,9 +36,9 @@
 #include "mongo/db/s/active_move_primaries_registry.h"
 #include "mongo/db/s/move_primary_source_manager.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/move_primary_gen.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -48,14 +49,17 @@ namespace {
  */
 void uassertStatusOKWithWarning(const Status& status) {
     if (!status.isOK()) {
-        warning() << "movePrimary failed" << causedBy(redact(status));
+        LOGV2_WARNING(23762,
+                      "movePrimary failed: {error}",
+                      "movePrimary failed",
+                      "error"_attr = redact(status));
         uassertStatusOK(status);
     }
 }
 
 class MovePrimaryCommand : public BasicCommand {
 public:
-    MovePrimaryCommand() : BasicCommand("_movePrimary") {}
+    MovePrimaryCommand() : BasicCommand("_shardsvrMovePrimary", "_movePrimary") {}
 
     std::string help() const override {
         return "should not be calling this directly";
@@ -99,7 +103,7 @@ public:
         uassertStatusOK(shardingState->canAcceptShardedCommands());
 
         const auto movePrimaryRequest =
-            ShardMovePrimary::parse(IDLParserErrorContext("_movePrimary"), cmdObj);
+            ShardMovePrimary::parse(IDLParserErrorContext("_shardsvrMovePrimary"), cmdObj);
         const auto dbname = parseNs("", cmdObj);
 
         uassert(
@@ -112,10 +116,11 @@ public:
                 dbname != NamespaceString::kAdminDb && dbname != NamespaceString::kConfigDb &&
                     dbname != NamespaceString::kLocalDb);
 
-        uassert(ErrorCodes::InvalidOptions,
-                str::stream() << "_movePrimary must be called with majority writeConcern, got "
-                              << cmdObj,
-                opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
+        uassert(
+            ErrorCodes::InvalidOptions,
+            str::stream() << "_shardsvrMovePrimary must be called with majority writeConcern, got "
+                          << cmdObj,
+            opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
 
         uassert(ErrorCodes::InvalidOptions,
                 "you have to specify where you want to move it",
@@ -151,7 +156,7 @@ private:
     static void _runImpl(OperationContext* opCtx,
                          const ShardMovePrimary movePrimaryRequest,
                          const StringData dbname) {
-        ShardId fromShardId = ShardingState::get(opCtx)->getShardName();
+        ShardId fromShardId = ShardingState::get(opCtx)->shardId();
         ShardId toShardId = movePrimaryRequest.getTo().toString();
 
         MovePrimarySourceManager movePrimarySourceManager(

@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -43,8 +44,8 @@ namespace mongo {
 namespace {
 
 using PullNodeTest = UpdateNodeTest;
-using mongo::mutablebson::Element;
 using mongo::mutablebson::countChildren;
+using mongo::mutablebson::Element;
 
 TEST(PullNodeTest, InitWithBadMatchExpressionFails) {
     auto update = fromjson("{$pull: {a: {b: {$foo: 1}}}}");
@@ -138,7 +139,7 @@ TEST_F(PullNodeTest, TargetNotFound) {
     mutablebson::Document doc(fromjson("{}"));
     setPathToCreate("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()));
+    auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{}"), doc);
@@ -155,10 +156,11 @@ TEST_F(PullNodeTest, ApplyToStringFails) {
     mutablebson::Document doc(fromjson("{a: 'foo'}"));
     setPathTaken("a");
     addIndexedPath("a");
-    ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root()["a"])),
-                                AssertionException,
-                                ErrorCodes::BadValue,
-                                "Cannot apply $pull to a non-array value");
+    ASSERT_THROWS_CODE_AND_WHAT(
+        node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams()),
+        AssertionException,
+        ErrorCodes::BadValue,
+        "Cannot apply $pull to a non-array value");
 }
 
 TEST_F(PullNodeTest, ApplyToObjectFails) {
@@ -170,10 +172,11 @@ TEST_F(PullNodeTest, ApplyToObjectFails) {
     mutablebson::Document doc(fromjson("{a: {foo: 'bar'}}"));
     setPathTaken("a");
     addIndexedPath("a");
-    ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root()["a"])),
-                                AssertionException,
-                                ErrorCodes::BadValue,
-                                "Cannot apply $pull to a non-array value");
+    ASSERT_THROWS_CODE_AND_WHAT(
+        node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams()),
+        AssertionException,
+        ErrorCodes::BadValue,
+        "Cannot apply $pull to a non-array value");
 }
 
 TEST_F(PullNodeTest, ApplyToNonViablePathFails) {
@@ -187,7 +190,7 @@ TEST_F(PullNodeTest, ApplyToNonViablePathFails) {
     setPathTaken("a");
     addIndexedPath("a");
     ASSERT_THROWS_CODE_AND_WHAT(
-        node.apply(getApplyParams(doc.root()["a"])),
+        node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams()),
         AssertionException,
         ErrorCodes::PathNotViable,
         "Cannot use the part (b) of (a.b) to traverse the element ({a: 1})");
@@ -203,7 +206,7 @@ TEST_F(PullNodeTest, ApplyToMissingElement) {
     setPathToCreate("d");
     setPathTaken("a.b.c");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]["c"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]["c"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: {c: {}}}}"), doc);
@@ -220,7 +223,7 @@ TEST_F(PullNodeTest, ApplyToEmptyArray) {
     mutablebson::Document doc(fromjson("{a: []}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: []}"), doc);
@@ -237,7 +240,7 @@ TEST_F(PullNodeTest, ApplyToArrayMatchingNone) {
     mutablebson::Document doc(fromjson("{a: [2, 3, 4, 5]}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [2, 3, 4, 5]}"), doc);
@@ -254,7 +257,7 @@ TEST_F(PullNodeTest, ApplyToArrayMatchingOne) {
     mutablebson::Document doc(fromjson("{a: [0, 1, 2, 3]}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [1, 2, 3]}"), doc);
@@ -271,7 +274,7 @@ TEST_F(PullNodeTest, ApplyToArrayMatchingSeveral) {
     mutablebson::Document doc(fromjson("{a: [0, 1, 0, 2, 0, 3, 0, 4, 0, 5]}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [1, 2, 3, 4, 5]}"), doc);
@@ -288,7 +291,7 @@ TEST_F(PullNodeTest, ApplyToArrayMatchingAll) {
     mutablebson::Document doc(fromjson("{a: [0, -1, -2, -3, -4, -5]}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: []}"), doc);
@@ -305,7 +308,7 @@ TEST_F(PullNodeTest, ApplyNoIndexDataNoLogBuilder) {
     mutablebson::Document doc(fromjson("{a: [0, 1, 2, 3]}"));
     setPathTaken("a");
     setLogBuilderToNull();
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [1, 2, 3]}"), doc);
@@ -316,16 +319,17 @@ TEST_F(PullNodeTest, ApplyWithCollation) {
     // With the collation, this update will pull any string whose reverse is greater than the
     // reverse of the "abc" string.
     auto update = fromjson("{$pull : {a: {$gt: 'abc'}}}");
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(&collator);
+    expCtx->setCollator(std::move(collator));
     PullNode node;
     ASSERT_OK(node.init(update["$pull"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: ['zaa', 'zcc', 'zbb', 'zee']}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: ['zaa', 'zbb']}"), doc);
@@ -335,16 +339,17 @@ TEST_F(PullNodeTest, ApplyWithCollation) {
 
 TEST_F(PullNodeTest, ApplyWithCollationDoesNotAffectNonStringMatches) {
     auto update = fromjson("{$pull : {a: {$lt: 1}}}");
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kAlwaysEqual);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kAlwaysEqual);
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(&collator);
+    expCtx->setCollator(std::move(collator));
     PullNode node;
     ASSERT_OK(node.init(update["$pull"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: [2, 1, 0, -1, -2, -3]}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [2, 1]}"), doc);
@@ -354,16 +359,17 @@ TEST_F(PullNodeTest, ApplyWithCollationDoesNotAffectNonStringMatches) {
 
 TEST_F(PullNodeTest, ApplyWithCollationDoesNotAffectRegexMatches) {
     auto update = fromjson("{$pull : {a: /a/}}");
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kAlwaysEqual);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kAlwaysEqual);
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(&collator);
+    expCtx->setCollator(std::move(collator));
     PullNode node;
     ASSERT_OK(node.init(update["$pull"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: ['b', 'a', 'aab', 'cb', 'bba']}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: ['b', 'cb']}"), doc);
@@ -373,16 +379,17 @@ TEST_F(PullNodeTest, ApplyWithCollationDoesNotAffectRegexMatches) {
 
 TEST_F(PullNodeTest, ApplyStringLiteralMatchWithCollation) {
     auto update = fromjson("{$pull : {a: 'c'}}");
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kAlwaysEqual);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kAlwaysEqual);
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(&collator);
+    expCtx->setCollator(std::move(collator));
     PullNode node;
     ASSERT_OK(node.init(update["$pull"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: ['b', 'a', 'aab', 'cb', 'bba']}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: []}"), doc);
@@ -392,16 +399,17 @@ TEST_F(PullNodeTest, ApplyStringLiteralMatchWithCollation) {
 
 TEST_F(PullNodeTest, ApplyCollationDoesNotAffectNumberLiteralMatches) {
     auto update = fromjson("{$pull : {a: 99}}");
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kAlwaysEqual);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kAlwaysEqual);
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(&collator);
+    expCtx->setCollator(std::move(collator));
     PullNode node;
     ASSERT_OK(node.init(update["$pull"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: ['a', 99, 'b', 2, 'c', 99, 'd']}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: ['a', 'b', 2, 'c', 'd']}"), doc);
@@ -418,7 +426,7 @@ TEST_F(PullNodeTest, ApplyStringMatchAfterSetCollator) {
     // First without a collator.
     mutablebson::Document doc(fromjson("{ a : ['a', 'b', 'c', 'd'] }"));
     setPathTaken("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: ['a', 'b', 'd']}"), doc);
@@ -430,7 +438,7 @@ TEST_F(PullNodeTest, ApplyStringMatchAfterSetCollator) {
     mutablebson::Document doc2(fromjson("{ a : ['a', 'b', 'c', 'd'] }"));
     resetApplyParams();
     setPathTaken("a");
-    result = node.apply(getApplyParams(doc2.root()["a"]));
+    result = node.apply(getApplyParams(doc2.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: []}"), doc2);
@@ -446,7 +454,7 @@ TEST_F(PullNodeTest, ApplyElementMatchAfterSetCollator) {
     // First without a collator.
     mutablebson::Document doc(fromjson("{ a : ['a', 'b', 'c', 'd'] }"));
     setPathTaken("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: ['a', 'b']}"), doc);
@@ -458,7 +466,7 @@ TEST_F(PullNodeTest, ApplyElementMatchAfterSetCollator) {
     mutablebson::Document doc2(fromjson("{ a : ['a', 'b', 'c', 'd'] }"));
     resetApplyParams();
     setPathTaken("a");
-    result = node.apply(getApplyParams(doc2.root()["a"]));
+    result = node.apply(getApplyParams(doc2.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: []}"), doc2);
@@ -474,7 +482,7 @@ TEST_F(PullNodeTest, ApplyObjectMatchAfterSetCollator) {
     // First without a collator.
     mutablebson::Document doc(fromjson("{a : [{b: 'w'}, {b: 'x'}, {b: 'y'}, {b: 'z'}]}"));
     setPathTaken("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a : [{b: 'w'}, {b: 'x'}, {b: 'z'}]}"), doc);
@@ -486,7 +494,7 @@ TEST_F(PullNodeTest, ApplyObjectMatchAfterSetCollator) {
     mutablebson::Document doc2(fromjson("{a : [{b: 'w'}, {b: 'x'}, {b: 'y'}, {b: 'z'}]}"));
     resetApplyParams();
     setPathTaken("a");
-    result = node.apply(getApplyParams(doc2.root()["a"]));
+    result = node.apply(getApplyParams(doc2.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: []}"), doc2);
@@ -507,7 +515,7 @@ TEST_F(PullNodeTest, SetCollatorDoesNotAffectClone) {
     // The original node should now have collation.
     mutablebson::Document doc(fromjson("{ a : ['a', 'b', 'c', 'd'] }"));
     setPathTaken("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: []}"), doc);
@@ -517,7 +525,7 @@ TEST_F(PullNodeTest, SetCollatorDoesNotAffectClone) {
     mutablebson::Document doc2(fromjson("{ a : ['a', 'b', 'c', 'd'] }"));
     resetApplyParams();
     setPathTaken("a");
-    result = cloneNode->apply(getApplyParams(doc2.root()["a"]));
+    result = cloneNode->apply(getApplyParams(doc2.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: ['a', 'b', 'd']}"), doc2);
@@ -537,7 +545,7 @@ TEST_F(PullNodeTest, ApplyComplexDocAndMatching1) {
     mutablebson::Document doc(fromjson("{a: {b: [{x: 1}, {y: 'y'}, {x: 2}, {z: 'z'}]}}"));
     setPathTaken("a.b");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: [{x: 1}, {x: 2}]}}"), doc);
@@ -554,7 +562,7 @@ TEST_F(PullNodeTest, ApplyComplexDocAndMatching2) {
     mutablebson::Document doc(fromjson("{a: {b: [{x: 1}, {y: 'y'}, {x: 2}, {z: 'z'}]}}"));
     setPathTaken("a.b");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: [{x: 1}, {x: 2}, {z: 'z'}]}}"), doc);
@@ -571,7 +579,7 @@ TEST_F(PullNodeTest, ApplyComplexDocAndMatching3) {
     mutablebson::Document doc(fromjson("{a: {b: [{x: 1}, {y: 'y'}, {x: 2}, {z: 'z'}]}}"));
     setPathTaken("a.b");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: [{x: 2}, {z: 'z'}]}}"), doc);
@@ -581,9 +589,10 @@ TEST_F(PullNodeTest, ApplyComplexDocAndMatching3) {
 
 TEST_F(PullNodeTest, ApplyFullPredicateWithCollation) {
     auto update = fromjson("{$pull: {'a.b': {x: 'blah'}}}");
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kAlwaysEqual);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kAlwaysEqual);
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(&collator);
+    expCtx->setCollator(std::move(collator));
     PullNode node;
     ASSERT_OK(node.init(update["$pull"]["a.b"], expCtx));
 
@@ -591,7 +600,7 @@ TEST_F(PullNodeTest, ApplyFullPredicateWithCollation) {
         fromjson("{a: {b: [{x: 'foo', y: 1}, {x: 'bar', y: 2}, {x: 'baz', y: 3}]}}"));
     setPathTaken("a.b");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: []}}"), doc);
@@ -608,7 +617,7 @@ TEST_F(PullNodeTest, ApplyScalarValueMod) {
     mutablebson::Document doc(fromjson("{a: [1, 2, 1, 2, 1, 2]}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [2, 2, 2]}"), doc);
@@ -625,7 +634,7 @@ TEST_F(PullNodeTest, ApplyObjectValueMod) {
     mutablebson::Document doc(fromjson("{a: [{x: 1}, {y: 2}, {x: 1}, {y: 2}]}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [{x: 1}, {x: 1}]}"), doc);
@@ -643,7 +652,7 @@ TEST_F(PullNodeTest, DocumentationExample1) {
         fromjson("{flags: ['vme', 'de', 'pse', 'tsc', 'msr', 'pae', 'mce']}"));
     setPathTaken("flags");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["flags"]));
+    auto result = node.apply(getApplyParams(doc.root()["flags"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{flags: ['vme', 'de', 'pse', 'tsc', 'pae', 'mce']}"), doc);
@@ -661,7 +670,7 @@ TEST_F(PullNodeTest, DocumentationExample2a) {
     mutablebson::Document doc(fromjson("{votes: [3, 5, 6, 7, 7, 8]}"));
     setPathTaken("votes");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["votes"]));
+    auto result = node.apply(getApplyParams(doc.root()["votes"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{votes: [3, 5, 6, 8]}"), doc);
@@ -678,7 +687,7 @@ TEST_F(PullNodeTest, DocumentationExample2b) {
     mutablebson::Document doc(fromjson("{votes: [3, 5, 6, 7, 7, 8]}"));
     setPathTaken("votes");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["votes"]));
+    auto result = node.apply(getApplyParams(doc.root()["votes"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{votes: [3, 5, 6]}"), doc);
@@ -695,7 +704,7 @@ TEST_F(PullNodeTest, ApplyPullWithObjectValueToArrayWithNonObjectValue) {
     mutablebson::Document doc(fromjson("{a: [{x: 1}, 2]}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [2]}"), doc);
@@ -713,7 +722,7 @@ TEST_F(PullNodeTest, CannotModifyImmutableField) {
     setPathTaken("_id.a");
     addImmutablePath("_id");
     ASSERT_THROWS_CODE_AND_WHAT(
-        node.apply(getApplyParams(doc.root()["_id"]["a"])),
+        node.apply(getApplyParams(doc.root()["_id"]["a"]), getUpdateNodeApplyParams()),
         AssertionException,
         ErrorCodes::ImmutableField,
         "Performing an update on the path '_id.a' would modify the immutable field '_id'");
@@ -728,7 +737,7 @@ TEST_F(PullNodeTest, SERVER_3988) {
     mutablebson::Document doc(fromjson("{x: 1, y: [2, 3, 4, 'abc', 'xyz']}"));
     setPathTaken("y");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["y"]));
+    auto result = node.apply(getApplyParams(doc.root()["y"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{x: 1, y: [2, 3, 4, 'abc']}"), doc);

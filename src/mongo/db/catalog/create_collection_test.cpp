@@ -1,23 +1,24 @@
 /**
- *    Copyright 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,9 +29,11 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/catalog/collection_catalog_entry.h"
+#include <memory>
+
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/create_collection.h"
-#include "mongo/db/catalog/uuid_catalog.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
@@ -38,7 +41,7 @@
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/uuid.h"
 
@@ -52,6 +55,8 @@ private:
     void tearDown() override;
 
 protected:
+    void validateValidator(const std::string& validatorStr, const int expectedError);
+
     // Use StorageInterface to access storage features below catalog interface.
     std::unique_ptr<repl::StorageInterface> _storage;
 };
@@ -63,11 +68,11 @@ void CreateCollectionTest::setUp() {
     auto service = getServiceContext();
 
     // Set up ReplicationCoordinator and ensure that we are primary.
-    auto replCoord = stdx::make_unique<repl::ReplicationCoordinatorMock>(service);
+    auto replCoord = std::make_unique<repl::ReplicationCoordinatorMock>(service);
     ASSERT_OK(replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
     repl::ReplicationCoordinator::set(service, std::move(replCoord));
 
-    _storage = stdx::make_unique<repl::StorageInterfaceImpl>();
+    _storage = std::make_unique<repl::StorageInterfaceImpl>();
 }
 
 void CreateCollectionTest::tearDown() {
@@ -82,6 +87,27 @@ void CreateCollectionTest::tearDown() {
  */
 ServiceContext::UniqueOperationContext makeOpCtx() {
     return cc().makeOperationContext();
+}
+
+void CreateCollectionTest::validateValidator(const std::string& validatorStr,
+                                             const int expectedError) {
+    NamespaceString newNss("test.newCollWithValidation");
+
+    auto opCtx = makeOpCtx();
+    Lock::GlobalLock lk(opCtx.get(), MODE_X);  // Satisfy low-level locking invariants.
+
+    CollectionOptions options;
+    options.validator = fromjson(validatorStr);
+    options.uuid = UUID::gen();
+
+    AutoGetOrCreateDb autoDb(opCtx.get(), newNss.db(), MODE_X);
+    auto db = autoDb.getDb();
+    ASSERT_TRUE(db) << "Cannot create collection " << newNss << " because database " << newNss.db()
+                    << " does not exist.";
+
+    const auto status =
+        db->userCreateNS(opCtx.get(), newNss, options, false /*createDefaultIndexes*/);
+    ASSERT_EQ(expectedError, status.code());
 }
 
 /**
@@ -99,8 +125,7 @@ CollectionOptions getCollectionOptions(OperationContext* opCtx, const NamespaceS
     auto collection = autoColl.getCollection();
     ASSERT_TRUE(collection) << "Unable to get collections options for " << nss
                             << " because collection does not exist.";
-    auto catalogEntry = collection->getCatalogEntry();
-    return catalogEntry->getCollectionOptions(opCtx);
+    return DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, collection->getCatalogId());
 }
 
 /**
@@ -119,11 +144,12 @@ TEST_F(CreateCollectionTest, CreateCollectionForApplyOpsWithSpecificUuidNoExisti
     ASSERT_FALSE(collectionExists(opCtx.get(), newNss));
 
     auto uuid = UUID::gen();
-    Lock::DBLock lock(opCtx.get(), newNss.db(), MODE_X);
+    Lock::DBLock lock(opCtx.get(), newNss.db(), MODE_IX);
     ASSERT_OK(createCollectionForApplyOps(opCtx.get(),
                                           newNss.db().toString(),
-                                          uuid.toBSON()["uuid"],
-                                          BSON("create" << newNss.coll())));
+                                          uuid,
+                                          BSON("create" << newNss.coll()),
+                                          /*allowRenameOutOfTheWay*/ false));
 
     ASSERT_TRUE(collectionExists(opCtx.get(), newNss));
 }
@@ -135,7 +161,7 @@ TEST_F(CreateCollectionTest,
 
     auto opCtx = makeOpCtx();
     auto uuid = UUID::gen();
-    Lock::DBLock lock(opCtx.get(), newNss.db(), MODE_X);
+    Lock::GlobalLock lk(opCtx.get(), MODE_X);  // Satisfy low-level locking invariants.
 
     // Create existing collection using StorageInterface.
     {
@@ -150,8 +176,9 @@ TEST_F(CreateCollectionTest,
     // to create.
     ASSERT_OK(createCollectionForApplyOps(opCtx.get(),
                                           newNss.db().toString(),
-                                          uuid.toBSON()["uuid"],
-                                          BSON("create" << newNss.coll())));
+                                          uuid,
+                                          BSON("create" << newNss.coll()),
+                                          /*allowRenameOutOfTheWay*/ true));
 
     ASSERT_FALSE(collectionExists(opCtx.get(), curNss));
     ASSERT_TRUE(collectionExists(opCtx.get(), newNss));
@@ -163,7 +190,7 @@ TEST_F(CreateCollectionTest,
 
     auto opCtx = makeOpCtx();
     auto uuid = UUID::gen();
-    Lock::DBLock lock(opCtx.get(), newNss.db(), MODE_X);
+    Lock::GlobalLock lk(opCtx.get(), MODE_X);  // Satisfy low-level locking invariants.
 
     // Create existing collection with same name but different UUID using StorageInterface.
     auto existingCollectionUuid = UUID::gen();
@@ -178,18 +205,20 @@ TEST_F(CreateCollectionTest,
     // This should rename the existing collection 'newNss' to a randomly generated collection name.
     ASSERT_OK(createCollectionForApplyOps(opCtx.get(),
                                           newNss.db().toString(),
-                                          uuid.toBSON()["uuid"],
-                                          BSON("create" << newNss.coll())));
+                                          uuid,
+                                          BSON("create" << newNss.coll()),
+                                          /*allowRenameOutOfTheWay*/ true));
 
     ASSERT_TRUE(collectionExists(opCtx.get(), newNss));
     ASSERT_EQUALS(uuid, getCollectionUuid(opCtx.get(), newNss));
 
     // Check that old collection that was renamed out of the way still exists.
-    auto& uuidCatalog = UUIDCatalog::get(opCtx.get());
-    auto renamedCollectionNss = uuidCatalog.lookupNSSByUUID(existingCollectionUuid);
-    ASSERT_TRUE(collectionExists(opCtx.get(), renamedCollectionNss))
+    auto& catalog = CollectionCatalog::get(opCtx.get());
+    auto renamedCollectionNss = catalog.lookupNSSByUUID(opCtx.get(), existingCollectionUuid);
+    ASSERT(renamedCollectionNss);
+    ASSERT_TRUE(collectionExists(opCtx.get(), *renamedCollectionNss))
         << "old renamed collection with UUID " << existingCollectionUuid
-        << " missing: " << renamedCollectionNss;
+        << " missing: " << *renamedCollectionNss;
 }
 
 TEST_F(CreateCollectionTest,
@@ -201,7 +230,7 @@ TEST_F(CreateCollectionTest,
 
     auto opCtx = makeOpCtx();
     auto uuid = UUID::gen();
-    Lock::DBLock lock(opCtx.get(), newNss.db(), MODE_X);
+    Lock::DBLock lock(opCtx.get(), newNss.db(), MODE_IX);
 
     // Create drop pending collection using StorageInterface.
     {
@@ -217,11 +246,25 @@ TEST_F(CreateCollectionTest,
     ASSERT_EQUALS(ErrorCodes::NamespaceExists,
                   createCollectionForApplyOps(opCtx.get(),
                                               newNss.db().toString(),
-                                              uuid.toBSON()["uuid"],
-                                              BSON("create" << newNss.coll())));
+                                              uuid,
+                                              BSON("create" << newNss.coll()),
+                                              /*allowRenameOutOfTheWay*/ false));
 
     ASSERT_TRUE(collectionExists(opCtx.get(), dropPendingNss));
     ASSERT_FALSE(collectionExists(opCtx.get(), newNss));
 }
 
+TEST_F(CreateCollectionTest, ValidationOptions) {
+    // Try a valid validator before trying invalid validators.
+    validateValidator("", static_cast<int>(ErrorCodes::Error::OK));
+    validateValidator("{a: {$exists: false}}", static_cast<int>(ErrorCodes::Error::OK));
+
+    // Invalid validators.
+    validateValidator(
+        "{$expr: {$function: {body: 'function(age) { return age >= 21; }', args: ['$age'], lang: "
+        "'js'}}}",
+        4660800);
+    validateValidator("{$expr: {$_internalJsEmit: {eval: 'function() {}', this: {}}}}", 4660801);
+    validateValidator("{$where: 'this.a == this.b'}", static_cast<int>(ErrorCodes::BadValue));
+}
 }  // namespace

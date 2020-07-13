@@ -1,23 +1,24 @@
 /**
- *    Copyright 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -33,27 +34,29 @@
 #include <memory>
 
 #include "mongo/bson/bsonmisc.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/oplog_interface_local.h"
+#include "mongo/db/repl/oplog_applier_impl_test_fixture.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
 
 namespace {
 
@@ -63,14 +66,10 @@ using namespace mongo::repl;
 const auto kIndexVersion = IndexDescriptor::IndexVersion::kV2;
 
 BSONObj makeIdIndexSpec(const NamespaceString& nss) {
-    return BSON("ns" << nss.toString() << "name"
-                     << "_id_"
-                     << "key"
-                     << BSON("_id" << 1)
-                     << "unique"
-                     << true
-                     << "v"
-                     << static_cast<int>(kIndexVersion));
+    return BSON("name"
+                << "_id_"
+                << "key" << BSON("_id" << 1) << "unique" << true << "v"
+                << static_cast<int>(kIndexVersion));
 }
 
 /**
@@ -118,30 +117,28 @@ void createCollection(OperationContext* opCtx,
         auto db = ctx.db();
         ASSERT_TRUE(db);
         mongo::WriteUnitOfWork wuow(opCtx);
-        auto coll = db->createCollection(opCtx, nss.ns(), options);
+        auto coll = db->createCollection(opCtx, nss, options);
         ASSERT_TRUE(coll);
         wuow.commit();
     });
 }
 
 /**
- * Create an index on the given collection. Returns the number of indexes that exist on the
+ * Create an index on an empty collection. Returns the number of indexes that exist on the
  * collection after the given index is created.
  */
-int createIndexForColl(OperationContext* opCtx, NamespaceString nss, BSONObj indexSpec) {
+int _createIndexOnEmptyCollection(OperationContext* opCtx, NamespaceString nss, BSONObj indexSpec) {
     Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
     AutoGetCollection autoColl(opCtx, nss, MODE_X);
     auto coll = autoColl.getCollection();
 
-    MultiIndexBlock indexer(opCtx, coll);
-    ASSERT_OK(indexer.init(indexSpec).getStatus());
-
-    WriteUnitOfWork wunit(opCtx);
-    indexer.commit();
-    wunit.commit();
-
     auto indexCatalog = coll->getIndexCatalog();
     ASSERT(indexCatalog);
+
+    WriteUnitOfWork wunit(opCtx);
+    ASSERT_OK(indexCatalog->createIndexOnEmptyCollection(opCtx, indexSpec).getStatus());
+    wunit.commit();
+
     return indexCatalog->numIndexesReady(opCtx);
 }
 
@@ -150,7 +147,6 @@ int createIndexForColl(OperationContext* opCtx, NamespaceString nss, BSONObj ind
  */
 TimestampedBSONObj makeOplogEntry(OpTime opTime) {
     BSONObjBuilder bob(opTime.toBSON());
-    bob.append("h", 1LL);
     bob.append("op", "c");
     bob.append("ns", "test.t");
     return {bob.obj(), opTime.getTimestamp()};
@@ -159,8 +155,8 @@ TimestampedBSONObj makeOplogEntry(OpTime opTime) {
 /**
  * Counts the number of keys in an index using an IndexAccessMethod::validate call.
  */
-int64_t getIndexKeyCount(OperationContext* opCtx, IndexCatalog* cat, IndexDescriptor* desc) {
-    auto idx = cat->getIndex(desc);
+int64_t getIndexKeyCount(OperationContext* opCtx, IndexCatalog* cat, const IndexDescriptor* desc) {
+    auto idx = cat->getEntry(desc)->accessMethod();
     int64_t numKeys;
     ValidateResults fullRes;
     idx->validate(opCtx, &numKeys, &fullRes);
@@ -201,7 +197,7 @@ private:
         ServiceContextMongoDTest::setUp();
         _createOpCtx();
         auto service = getServiceContext();
-        auto replCoord = stdx::make_unique<ReplicationCoordinatorMock>(service);
+        auto replCoord = std::make_unique<ReplicationCoordinatorMock>(service);
         _replicationCoordinatorMock = replCoord.get();
         ReplicationCoordinator::set(service, std::move(replCoord));
     }
@@ -216,8 +212,8 @@ private:
     void _createOpCtx() {
         _opCtx = cc().makeOperationContext();
         // We are not replicating nor validating these writes.
-        _uwb = stdx::make_unique<UnreplicatedWritesBlock>(_opCtx.get());
-        _ddv = stdx::make_unique<DisableDocumentValidation>(_opCtx.get());
+        _uwb = std::make_unique<UnreplicatedWritesBlock>(_opCtx.get());
+        _ddv = std::make_unique<DisableDocumentValidation>(_opCtx.get());
     }
 
     ServiceContext::UniqueOperationContext _opCtx;
@@ -268,32 +264,26 @@ TEST_F(StorageInterfaceImplTest,
 }
 
 /**
- * Check collection contents. OplogInterface returns documents in reverse natural order.
+ * Check collection contents.
  */
 void _assertDocumentsInCollectionEquals(OperationContext* opCtx,
                                         const NamespaceString& nss,
                                         const std::vector<BSONObj>& docs) {
-    std::vector<BSONObj> reversedDocs(docs);
-    std::reverse(reversedDocs.begin(), reversedDocs.end());
-    OplogInterfaceLocal oplog(opCtx, nss.ns());
-    auto iter = oplog.makeIterator();
-    for (const auto& doc : reversedDocs) {
-        ASSERT_BSONOBJ_EQ(doc, unittest::assertGet(iter->next()).first);
+    CollectionReader reader(opCtx, nss);
+    for (const auto& doc : docs) {
+        ASSERT_BSONOBJ_EQ(doc, unittest::assertGet(reader.next()));
     }
-    ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, iter->next().getStatus());
+    ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, reader.next().getStatus());
 }
 
 void _assertDocumentsInCollectionEquals(OperationContext* opCtx,
                                         const NamespaceString& nss,
                                         const std::vector<TimestampedBSONObj>& docs) {
-    std::vector<TimestampedBSONObj> reversedDocs(docs);
-    std::reverse(reversedDocs.begin(), reversedDocs.end());
-    OplogInterfaceLocal oplog(opCtx, nss.ns());
-    auto iter = oplog.makeIterator();
-    for (const auto& doc : reversedDocs) {
-        ASSERT_BSONOBJ_EQ(doc.obj, unittest::assertGet(iter->next()).first);
+    CollectionReader reader(opCtx, nss);
+    for (const auto& doc : docs) {
+        ASSERT_BSONOBJ_EQ(doc.obj, unittest::assertGet(reader.next()));
     }
-    ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, iter->next().getStatus());
+    ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, reader.next().getStatus());
 }
 
 /**
@@ -304,8 +294,7 @@ void _assertRollbackIDDocument(OperationContext* opCtx, int id) {
         opCtx,
         NamespaceString(StorageInterfaceImpl::kDefaultRollbackIdNamespace),
         {BSON("_id" << StorageInterfaceImpl::kRollbackIdDocumentId
-                    << StorageInterfaceImpl::kRollbackIdFieldName
-                    << id)});
+                    << StorageInterfaceImpl::kRollbackIdFieldName << id)});
 }
 
 TEST_F(StorageInterfaceImplTest, RollbackIdInitializesIncrementsAndReadsProperly) {
@@ -385,8 +374,7 @@ TEST_F(StorageInterfaceImplTest, GetRollbackIDReturnsBadStatusIfRollbackIDIsNotI
 
     std::vector<TimestampedBSONObj> badDoc = {
         TimestampedBSONObj{BSON("_id" << StorageInterfaceImpl::kRollbackIdDocumentId
-                                      << StorageInterfaceImpl::kRollbackIdFieldName
-                                      << "bad id"),
+                                      << StorageInterfaceImpl::kRollbackIdFieldName << "bad id"),
                            Timestamp::min()}};
     ASSERT_OK(storage.insertDocuments(opCtx, nss, transformInserts(badDoc)));
     ASSERT_EQUALS(ErrorCodes::TypeMismatch, storage.getRollbackID(opCtx).getStatus());
@@ -455,12 +443,8 @@ TEST_F(StorageInterfaceImplTest,
     }
     ASSERT_OK(storage.insertDocuments(opCtx, nss, docs));
 
-    // Check collection contents. OplogInterface returns documents in reverse natural order.
-    OplogInterfaceLocal oplog(opCtx, nss.ns());
-    auto iter = oplog.makeIterator();
-    ASSERT_BSONOBJ_EQ(doc2.doc, unittest::assertGet(iter->next()).first);
-    ASSERT_BSONOBJ_EQ(doc1.doc, unittest::assertGet(iter->next()).first);
-    ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, iter->next().getStatus());
+    // Check collection contents.
+    _assertDocumentsInCollectionEquals(opCtx, nss, {doc1.doc, doc2.doc});
 }
 
 TEST_F(StorageInterfaceImplTest, InsertDocumentsSavesOperationsReturnsOpTimeOfLastOperation) {
@@ -476,12 +460,8 @@ TEST_F(StorageInterfaceImplTest, InsertDocumentsSavesOperationsReturnsOpTimeOfLa
     auto op2 = makeOplogEntry({Timestamp(Seconds(1), 0), 1LL});
     ASSERT_OK(storage.insertDocuments(opCtx, nss, transformInserts({op1, op2})));
 
-    // Check contents of oplog. OplogInterface iterates over oplog collection in reverse.
-    repl::OplogInterfaceLocal oplog(opCtx, nss.ns());
-    auto iter = oplog.makeIterator();
-    ASSERT_BSONOBJ_EQ(op2.obj, unittest::assertGet(iter->next()).first);
-    ASSERT_BSONOBJ_EQ(op1.obj, unittest::assertGet(iter->next()).first);
-    ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, iter->next().getStatus());
+    // Check contents of oplog.
+    _assertDocumentsInCollectionEquals(opCtx, nss, {op1.obj, op2.obj});
 }
 
 TEST_F(StorageInterfaceImplTest, InsertDocumentsSavesOperationsWhenCollSpecifiedWithUUID) {
@@ -500,12 +480,8 @@ TEST_F(StorageInterfaceImplTest, InsertDocumentsSavesOperationsWhenCollSpecified
     ASSERT_OK(storage.insertDocuments(
         opCtx, {nss.db().toString(), *options.uuid}, transformInserts({op1, op2})));
 
-    // Check contents of oplog. OplogInterface iterates over oplog collection in reverse.
-    repl::OplogInterfaceLocal oplog(opCtx, nss.ns());
-    auto iter = oplog.makeIterator();
-    ASSERT_BSONOBJ_EQ(op2.obj, unittest::assertGet(iter->next()).first);
-    ASSERT_BSONOBJ_EQ(op1.obj, unittest::assertGet(iter->next()).first);
-    ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, iter->next().getStatus());
+    // Check contents of oplog.
+    _assertDocumentsInCollectionEquals(opCtx, nss, {op1.obj, op2.obj});
 }
 
 TEST_F(StorageInterfaceImplTest,
@@ -524,7 +500,7 @@ TEST_F(StorageInterfaceImplTest, InsertDocumentThrowsNamespaceNotFoundIfOplogUUI
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
     ASSERT_THROWS_CODE(
-        storage.insertDocuments(opCtx, {"local", UUID::gen()}, transformInserts({op})).ignore(),
+        storage.insertDocuments(opCtx, {"local", UUID::gen()}, transformInserts({op})),
         DBException,
         ErrorCodes::NamespaceNotFound);
 }
@@ -609,7 +585,7 @@ void _testDestroyUncommitedCollectionBulkLoader(
     OperationContext* opCtx,
     const NamespaceString& nss,
     std::vector<BSONObj> secondaryIndexes,
-    stdx::function<void(std::unique_ptr<CollectionBulkLoader> loader)> destroyLoaderFn) {
+    std::function<void(std::unique_ptr<CollectionBulkLoader> loader)> destroyLoaderFn) {
     StorageInterfaceImpl storage;
     CollectionOptions opts = generateOptionsWithUuid();
     auto loaderStatus =
@@ -641,9 +617,7 @@ TEST_F(StorageInterfaceImplTest, DestroyingUncommittedCollectionBulkLoaderDropsI
     auto opCtx = getOperationContext();
     auto nss = makeNamespace(_agent);
     std::vector<BSONObj> indexes = {BSON("v" << 1 << "key" << BSON("x" << 1) << "name"
-                                             << "x_1"
-                                             << "ns"
-                                             << nss.ns())};
+                                             << "x_1")};
     auto destroyLoaderFn = [](std::unique_ptr<CollectionBulkLoader> loader) {
         // Destroy 'loader' by letting it go out of scope.
     };
@@ -666,9 +640,7 @@ TEST_F(StorageInterfaceImplTest,
     auto opCtx = getOperationContext();
     auto nss = makeNamespace(_agent);
     std::vector<BSONObj> indexes = {BSON("v" << 1 << "key" << BSON("x" << 1) << "name"
-                                             << "x_1"
-                                             << "ns"
-                                             << nss.ns())};
+                                             << "x_1")};
     auto destroyLoaderFn = [](std::unique_ptr<CollectionBulkLoader> loader) {
         // Destroy 'loader' in a new thread that does not have a Client.
         stdx::thread([&loader]() { loader.reset(); }).join();
@@ -679,7 +651,7 @@ TEST_F(StorageInterfaceImplTest,
 TEST_F(StorageInterfaceImplTest, CreateCollectionThatAlreadyExistsFails) {
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
-    NamespaceString nss("test.system.indexes");
+    NamespaceString nss("test.foo");
     createCollection(opCtx, nss);
 
     const CollectionOptions opts = generateOptionsWithUuid();
@@ -820,7 +792,9 @@ TEST_F(StorageInterfaceImplTest, RenameCollectionWithStayTempFalseMakesItNotTemp
 
     AutoGetCollectionForReadCommand autoColl2(opCtx, toNss);
     ASSERT_TRUE(autoColl2.getCollection());
-    ASSERT_FALSE(autoColl2.getCollection()->getCatalogEntry()->getCollectionOptions(opCtx).temp);
+    ASSERT_FALSE(DurableCatalog::get(opCtx)
+                     ->getCollectionOptions(opCtx, autoColl2.getCollection()->getCatalogId())
+                     .temp);
 }
 
 TEST_F(StorageInterfaceImplTest, RenameCollectionWithStayTempTrueMakesItTemp) {
@@ -839,7 +813,9 @@ TEST_F(StorageInterfaceImplTest, RenameCollectionWithStayTempTrueMakesItTemp) {
 
     AutoGetCollectionForReadCommand autoColl2(opCtx, toNss);
     ASSERT_TRUE(autoColl2.getCollection());
-    ASSERT_TRUE(autoColl2.getCollection()->getCatalogEntry()->getCollectionOptions(opCtx).temp);
+    ASSERT_TRUE(DurableCatalog::get(opCtx)
+                    ->getCollectionOptions(opCtx, autoColl2.getCollection()->getCatalogId())
+                    .temp);
 }
 
 TEST_F(StorageInterfaceImplTest, RenameCollectionFailsBetweenDatabases) {
@@ -931,10 +907,7 @@ TEST_F(StorageInterfaceImplTest, FindDocumentsReturnsIndexOptionsConflictIfIndex
     auto nss = makeNamespace(_agent);
     std::vector<BSONObj> indexes = {BSON("v" << 1 << "key" << BSON("x" << 1) << "name"
                                              << "x_1"
-                                             << "ns"
-                                             << nss.ns()
-                                             << "partialFilterExpression"
-                                             << BSON("y" << 1))};
+                                             << "partialFilterExpression" << BSON("y" << 1))};
     auto loader = unittest::assertGet(storage.createCollectionForBulkLoading(
         nss, generateOptionsWithUuid(), makeIdIndexSpec(nss), indexes));
     std::vector<BSONObj> docs = {BSON("_id" << 1), BSON("_id" << 1), BSON("_id" << 2)};
@@ -992,8 +965,8 @@ void _assertDocumentsEqual(const StatusWith<std::vector<BSONObj>>& statusWithDoc
                            const std::vector<BSONObj>& expectedDocs) {
     const auto actualDocs = unittest::assertGet(statusWithDocs);
     auto iter = actualDocs.cbegin();
-    std::string msg = str::stream() << "expected: " << _toString(expectedDocs)
-                                    << "; actual: " << _toString(actualDocs);
+    std::string msg = str::stream()
+        << "expected: " << _toString(expectedDocs) << "; actual: " << _toString(actualDocs);
     for (const auto& doc : expectedDocs) {
         ASSERT_TRUE(iter != actualDocs.cend()) << msg;
         ASSERT_BSONOBJ_EQ(doc, *(iter++));
@@ -1004,7 +977,7 @@ void _assertDocumentsEqual(const StatusWith<std::vector<BSONObj>>& statusWithDoc
 /**
  * Returns first BSONObj from a StatusWith<std::vector<BSONObj>>.
  */
-BSONObj _assetGetFront(const StatusWith<std::vector<BSONObj>>& statusWithDocs) {
+BSONObj _assertGetFront(const StatusWith<std::vector<BSONObj>>& statusWithDocs) {
     auto&& docs = statusWithDocs.getValue();
     ASSERT_FALSE(docs.empty());
     return docs.front();
@@ -1029,13 +1002,13 @@ TEST_F(StorageInterfaceImplTest,
     // startKey not provided
     ASSERT_BSONOBJ_EQ(
         BSON("_id" << 0),
-        _assetGetFront(storage.findDocuments(opCtx,
-                                             nss,
-                                             indexName,
-                                             StorageInterface::ScanDirection::kForward,
-                                             {},
-                                             BoundInclusion::kIncludeStartKeyOnly,
-                                             1U)));
+        _assertGetFront(storage.findDocuments(opCtx,
+                                              nss,
+                                              indexName,
+                                              StorageInterface::ScanDirection::kForward,
+                                              {},
+                                              BoundInclusion::kIncludeStartKeyOnly,
+                                              1U)));
 
     // startKey not provided. limit is 0.
     _assertDocumentsEqual(storage.findDocuments(opCtx,
@@ -1060,75 +1033,75 @@ TEST_F(StorageInterfaceImplTest,
     // startKey provided; include start key
     ASSERT_BSONOBJ_EQ(
         BSON("_id" << 0),
-        _assetGetFront(storage.findDocuments(opCtx,
-                                             nss,
-                                             indexName,
-                                             StorageInterface::ScanDirection::kForward,
-                                             BSON("" << 0),
-                                             BoundInclusion::kIncludeStartKeyOnly,
-                                             1U)));
+        _assertGetFront(storage.findDocuments(opCtx,
+                                              nss,
+                                              indexName,
+                                              StorageInterface::ScanDirection::kForward,
+                                              BSON("" << 0),
+                                              BoundInclusion::kIncludeStartKeyOnly,
+                                              1U)));
     ASSERT_BSONOBJ_EQ(
         BSON("_id" << 1),
-        _assetGetFront(storage.findDocuments(opCtx,
-                                             nss,
-                                             indexName,
-                                             StorageInterface::ScanDirection::kForward,
-                                             BSON("" << 1),
-                                             BoundInclusion::kIncludeStartKeyOnly,
-                                             1U)));
+        _assertGetFront(storage.findDocuments(opCtx,
+                                              nss,
+                                              indexName,
+                                              StorageInterface::ScanDirection::kForward,
+                                              BSON("" << 1),
+                                              BoundInclusion::kIncludeStartKeyOnly,
+                                              1U)));
 
     ASSERT_BSONOBJ_EQ(
         BSON("_id" << 1),
-        _assetGetFront(storage.findDocuments(opCtx,
-                                             nss,
-                                             indexName,
-                                             StorageInterface::ScanDirection::kForward,
-                                             BSON("" << 0.5),
-                                             BoundInclusion::kIncludeStartKeyOnly,
-                                             1U)));
+        _assertGetFront(storage.findDocuments(opCtx,
+                                              nss,
+                                              indexName,
+                                              StorageInterface::ScanDirection::kForward,
+                                              BSON("" << 0.5),
+                                              BoundInclusion::kIncludeStartKeyOnly,
+                                              1U)));
 
     // startKey provided; include both start and end keys
     ASSERT_BSONOBJ_EQ(
         BSON("_id" << 1),
-        _assetGetFront(storage.findDocuments(opCtx,
-                                             nss,
-                                             indexName,
-                                             StorageInterface::ScanDirection::kForward,
-                                             BSON("" << 1),
-                                             BoundInclusion::kIncludeStartKeyOnly,
-                                             1U)));
+        _assertGetFront(storage.findDocuments(opCtx,
+                                              nss,
+                                              indexName,
+                                              StorageInterface::ScanDirection::kForward,
+                                              BSON("" << 1),
+                                              BoundInclusion::kIncludeStartKeyOnly,
+                                              1U)));
 
     // startKey provided; exclude start key
     ASSERT_BSONOBJ_EQ(
         BSON("_id" << 2),
-        _assetGetFront(storage.findDocuments(opCtx,
-                                             nss,
-                                             indexName,
-                                             StorageInterface::ScanDirection::kForward,
-                                             BSON("" << 1),
-                                             BoundInclusion::kIncludeEndKeyOnly,
-                                             1U)));
+        _assertGetFront(storage.findDocuments(opCtx,
+                                              nss,
+                                              indexName,
+                                              StorageInterface::ScanDirection::kForward,
+                                              BSON("" << 1),
+                                              BoundInclusion::kIncludeEndKeyOnly,
+                                              1U)));
 
     ASSERT_BSONOBJ_EQ(
         BSON("_id" << 2),
-        _assetGetFront(storage.findDocuments(opCtx,
-                                             nss,
-                                             indexName,
-                                             StorageInterface::ScanDirection::kForward,
-                                             BSON("" << 1.5),
-                                             BoundInclusion::kIncludeEndKeyOnly,
-                                             1U)));
+        _assertGetFront(storage.findDocuments(opCtx,
+                                              nss,
+                                              indexName,
+                                              StorageInterface::ScanDirection::kForward,
+                                              BSON("" << 1.5),
+                                              BoundInclusion::kIncludeEndKeyOnly,
+                                              1U)));
 
     // startKey provided; exclude both start and end keys
     ASSERT_BSONOBJ_EQ(
         BSON("_id" << 2),
-        _assetGetFront(storage.findDocuments(opCtx,
-                                             nss,
-                                             indexName,
-                                             StorageInterface::ScanDirection::kForward,
-                                             BSON("" << 1),
-                                             BoundInclusion::kExcludeBothStartAndEndKeys,
-                                             1U)));
+        _assertGetFront(storage.findDocuments(opCtx,
+                                              nss,
+                                              indexName,
+                                              StorageInterface::ScanDirection::kForward,
+                                              BSON("" << 1),
+                                              BoundInclusion::kExcludeBothStartAndEndKeys,
+                                              1U)));
 
     // startKey provided; exclude both start and end keys.
     // A limit of 3 should return 2 documents because we reached the end of the collection.
@@ -1166,13 +1139,13 @@ TEST_F(StorageInterfaceImplTest,
     // startKey not provided
     ASSERT_BSONOBJ_EQ(
         BSON("_id" << 4),
-        _assetGetFront(storage.findDocuments(opCtx,
-                                             nss,
-                                             indexName,
-                                             StorageInterface::ScanDirection::kBackward,
-                                             {},
-                                             BoundInclusion::kIncludeStartKeyOnly,
-                                             1U)));
+        _assertGetFront(storage.findDocuments(opCtx,
+                                              nss,
+                                              indexName,
+                                              StorageInterface::ScanDirection::kBackward,
+                                              {},
+                                              BoundInclusion::kIncludeStartKeyOnly,
+                                              1U)));
 
     // startKey not provided. limit is 0.
     _assertDocumentsEqual(storage.findDocuments(opCtx,
@@ -1197,55 +1170,55 @@ TEST_F(StorageInterfaceImplTest,
     // startKey provided; include start key
     ASSERT_BSONOBJ_EQ(
         BSON("_id" << 4),
-        _assetGetFront(storage.findDocuments(opCtx,
-                                             nss,
-                                             indexName,
-                                             StorageInterface::ScanDirection::kBackward,
-                                             BSON("" << 4),
-                                             BoundInclusion::kIncludeStartKeyOnly,
-                                             1U)));
+        _assertGetFront(storage.findDocuments(opCtx,
+                                              nss,
+                                              indexName,
+                                              StorageInterface::ScanDirection::kBackward,
+                                              BSON("" << 4),
+                                              BoundInclusion::kIncludeStartKeyOnly,
+                                              1U)));
     ASSERT_BSONOBJ_EQ(
         BSON("_id" << 3),
-        _assetGetFront(storage.findDocuments(opCtx,
-                                             nss,
-                                             indexName,
-                                             StorageInterface::ScanDirection::kBackward,
-                                             BSON("" << 3),
-                                             BoundInclusion::kIncludeStartKeyOnly,
-                                             1U)));
+        _assertGetFront(storage.findDocuments(opCtx,
+                                              nss,
+                                              indexName,
+                                              StorageInterface::ScanDirection::kBackward,
+                                              BSON("" << 3),
+                                              BoundInclusion::kIncludeStartKeyOnly,
+                                              1U)));
 
     // startKey provided; include both start and end keys
     ASSERT_BSONOBJ_EQ(
         BSON("_id" << 4),
-        _assetGetFront(storage.findDocuments(opCtx,
-                                             nss,
-                                             indexName,
-                                             StorageInterface::ScanDirection::kBackward,
-                                             BSON("" << 4),
-                                             BoundInclusion::kIncludeBothStartAndEndKeys,
-                                             1U)));
+        _assertGetFront(storage.findDocuments(opCtx,
+                                              nss,
+                                              indexName,
+                                              StorageInterface::ScanDirection::kBackward,
+                                              BSON("" << 4),
+                                              BoundInclusion::kIncludeBothStartAndEndKeys,
+                                              1U)));
 
     // startKey provided; exclude start key
     ASSERT_BSONOBJ_EQ(
         BSON("_id" << 2),
-        _assetGetFront(storage.findDocuments(opCtx,
-                                             nss,
-                                             indexName,
-                                             StorageInterface::ScanDirection::kBackward,
-                                             BSON("" << 3),
-                                             BoundInclusion::kIncludeEndKeyOnly,
-                                             1U)));
+        _assertGetFront(storage.findDocuments(opCtx,
+                                              nss,
+                                              indexName,
+                                              StorageInterface::ScanDirection::kBackward,
+                                              BSON("" << 3),
+                                              BoundInclusion::kIncludeEndKeyOnly,
+                                              1U)));
 
     // startKey provided; exclude both start and end keys
     ASSERT_BSONOBJ_EQ(
         BSON("_id" << 2),
-        _assetGetFront(storage.findDocuments(opCtx,
-                                             nss,
-                                             indexName,
-                                             StorageInterface::ScanDirection::kBackward,
-                                             BSON("" << 3),
-                                             BoundInclusion::kExcludeBothStartAndEndKeys,
-                                             1U)));
+        _assertGetFront(storage.findDocuments(opCtx,
+                                              nss,
+                                              indexName,
+                                              StorageInterface::ScanDirection::kBackward,
+                                              BSON("" << 3),
+                                              BoundInclusion::kExcludeBothStartAndEndKeys,
+                                              1U)));
 
     // startKey provided; exclude both start and end keys.
     // A limit of 3 should return 2 documents because we reached the beginning of the collection.
@@ -1278,21 +1251,17 @@ TEST_F(StorageInterfaceImplTest,
                                  {BSON("_id" << 0), Timestamp(0), OpTime::kUninitializedTerm}}));
     ASSERT_BSONOBJ_EQ(
         BSON("_id" << 1),
-        _assetGetFront(storage.findDocuments(opCtx,
-                                             nss,
-                                             boost::none,
-                                             StorageInterface::ScanDirection::kForward,
-                                             {},
-                                             BoundInclusion::kIncludeStartKeyOnly,
-                                             1U)));
+        _assertGetFront(storage.findDocuments(opCtx,
+                                              nss,
+                                              boost::none,
+                                              StorageInterface::ScanDirection::kForward,
+                                              {},
+                                              BoundInclusion::kIncludeStartKeyOnly,
+                                              1U)));
 
-    // Check collection contents. OplogInterface returns documents in reverse natural order.
-    OplogInterfaceLocal oplog(opCtx, nss.ns());
-    auto iter = oplog.makeIterator();
-    ASSERT_BSONOBJ_EQ(BSON("_id" << 0), unittest::assertGet(iter->next()).first);
-    ASSERT_BSONOBJ_EQ(BSON("_id" << 2), unittest::assertGet(iter->next()).first);
-    ASSERT_BSONOBJ_EQ(BSON("_id" << 1), unittest::assertGet(iter->next()).first);
-    ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, iter->next().getStatus());
+    // Check collection contents.
+    _assertDocumentsInCollectionEquals(
+        opCtx, nss, {BSON("_id" << 1), BSON("_id" << 2), BSON("_id" << 0)});
 }
 
 TEST_F(StorageInterfaceImplTest,
@@ -1309,13 +1278,13 @@ TEST_F(StorageInterfaceImplTest,
                                  {BSON("_id" << 0), Timestamp(0), OpTime::kUninitializedTerm}}));
     ASSERT_BSONOBJ_EQ(
         BSON("_id" << 0),
-        _assetGetFront(storage.findDocuments(opCtx,
-                                             nss,
-                                             boost::none,
-                                             StorageInterface::ScanDirection::kBackward,
-                                             {},
-                                             BoundInclusion::kIncludeStartKeyOnly,
-                                             1U)));
+        _assertGetFront(storage.findDocuments(opCtx,
+                                              nss,
+                                              boost::none,
+                                              StorageInterface::ScanDirection::kBackward,
+                                              {},
+                                              BoundInclusion::kIncludeStartKeyOnly,
+                                              1U)));
 
     _assertDocumentsInCollectionEquals(
         opCtx, nss, {BSON("_id" << 1), BSON("_id" << 2), BSON("_id" << 0)});
@@ -1442,13 +1411,13 @@ TEST_F(StorageInterfaceImplTest,
     // startKey not provided
     ASSERT_BSONOBJ_EQ(
         BSON("_id" << 0),
-        _assetGetFront(storage.deleteDocuments(opCtx,
-                                               nss,
-                                               indexName,
-                                               StorageInterface::ScanDirection::kForward,
-                                               {},
-                                               BoundInclusion::kIncludeStartKeyOnly,
-                                               1U)));
+        _assertGetFront(storage.deleteDocuments(opCtx,
+                                                nss,
+                                                indexName,
+                                                StorageInterface::ScanDirection::kForward,
+                                                {},
+                                                BoundInclusion::kIncludeStartKeyOnly,
+                                                1U)));
 
     _assertDocumentsInCollectionEquals(opCtx,
                                        nss,
@@ -1483,13 +1452,13 @@ TEST_F(StorageInterfaceImplTest,
     // startKey provided; include start key
     ASSERT_BSONOBJ_EQ(
         BSON("_id" << 2),
-        _assetGetFront(storage.deleteDocuments(opCtx,
-                                               nss,
-                                               indexName,
-                                               StorageInterface::ScanDirection::kForward,
-                                               BSON("" << 2),
-                                               BoundInclusion::kIncludeStartKeyOnly,
-                                               1U)));
+        _assertGetFront(storage.deleteDocuments(opCtx,
+                                                nss,
+                                                indexName,
+                                                StorageInterface::ScanDirection::kForward,
+                                                BSON("" << 2),
+                                                BoundInclusion::kIncludeStartKeyOnly,
+                                                1U)));
 
     _assertDocumentsInCollectionEquals(opCtx,
                                        nss,
@@ -1503,13 +1472,13 @@ TEST_F(StorageInterfaceImplTest,
     // startKey provided; exclude start key
     ASSERT_BSONOBJ_EQ(
         BSON("_id" << 5),
-        _assetGetFront(storage.deleteDocuments(opCtx,
-                                               nss,
-                                               indexName,
-                                               StorageInterface::ScanDirection::kForward,
-                                               BSON("" << 4),
-                                               BoundInclusion::kIncludeEndKeyOnly,
-                                               1U)));
+        _assertGetFront(storage.deleteDocuments(opCtx,
+                                                nss,
+                                                indexName,
+                                                StorageInterface::ScanDirection::kForward,
+                                                BSON("" << 4),
+                                                BoundInclusion::kIncludeEndKeyOnly,
+                                                1U)));
 
     _assertDocumentsInCollectionEquals(
         opCtx,
@@ -1553,13 +1522,13 @@ TEST_F(StorageInterfaceImplTest,
     // startKey not provided
     ASSERT_BSONOBJ_EQ(
         BSON("_id" << 7),
-        _assetGetFront(storage.deleteDocuments(opCtx,
-                                               nss,
-                                               indexName,
-                                               StorageInterface::ScanDirection::kBackward,
-                                               {},
-                                               BoundInclusion::kIncludeStartKeyOnly,
-                                               1U)));
+        _assertGetFront(storage.deleteDocuments(opCtx,
+                                                nss,
+                                                indexName,
+                                                StorageInterface::ScanDirection::kBackward,
+                                                {},
+                                                BoundInclusion::kIncludeStartKeyOnly,
+                                                1U)));
 
     _assertDocumentsInCollectionEquals(opCtx,
                                        nss,
@@ -1594,13 +1563,13 @@ TEST_F(StorageInterfaceImplTest,
     // startKey provided; include start key
     ASSERT_BSONOBJ_EQ(
         BSON("_id" << 5),
-        _assetGetFront(storage.deleteDocuments(opCtx,
-                                               nss,
-                                               indexName,
-                                               StorageInterface::ScanDirection::kBackward,
-                                               BSON("" << 5),
-                                               BoundInclusion::kIncludeStartKeyOnly,
-                                               1U)));
+        _assertGetFront(storage.deleteDocuments(opCtx,
+                                                nss,
+                                                indexName,
+                                                StorageInterface::ScanDirection::kBackward,
+                                                BSON("" << 5),
+                                                BoundInclusion::kIncludeStartKeyOnly,
+                                                1U)));
 
     _assertDocumentsInCollectionEquals(opCtx,
                                        nss,
@@ -1614,13 +1583,13 @@ TEST_F(StorageInterfaceImplTest,
     // startKey provided; exclude start key
     ASSERT_BSONOBJ_EQ(
         BSON("_id" << 2),
-        _assetGetFront(storage.deleteDocuments(opCtx,
-                                               nss,
-                                               indexName,
-                                               StorageInterface::ScanDirection::kBackward,
-                                               BSON("" << 3),
-                                               BoundInclusion::kIncludeEndKeyOnly,
-                                               1U)));
+        _assertGetFront(storage.deleteDocuments(opCtx,
+                                                nss,
+                                                indexName,
+                                                StorageInterface::ScanDirection::kBackward,
+                                                BSON("" << 3),
+                                                BoundInclusion::kIncludeEndKeyOnly,
+                                                1U)));
 
     _assertDocumentsInCollectionEquals(
         opCtx,
@@ -1656,13 +1625,13 @@ TEST_F(StorageInterfaceImplTest,
                                  {BSON("_id" << 0), Timestamp(0), OpTime::kUninitializedTerm}}));
     ASSERT_BSONOBJ_EQ(
         BSON("_id" << 1),
-        _assetGetFront(storage.deleteDocuments(opCtx,
-                                               nss,
-                                               boost::none,
-                                               StorageInterface::ScanDirection::kForward,
-                                               {},
-                                               BoundInclusion::kIncludeStartKeyOnly,
-                                               1U)));
+        _assertGetFront(storage.deleteDocuments(opCtx,
+                                                nss,
+                                                boost::none,
+                                                StorageInterface::ScanDirection::kForward,
+                                                {},
+                                                BoundInclusion::kIncludeStartKeyOnly,
+                                                1U)));
 
     _assertDocumentsInCollectionEquals(opCtx, nss, {BSON("_id" << 2), BSON("_id" << 0)});
 }
@@ -1681,13 +1650,13 @@ TEST_F(StorageInterfaceImplTest,
                                  {BSON("_id" << 0), Timestamp(0), OpTime::kUninitializedTerm}}));
     ASSERT_BSONOBJ_EQ(
         BSON("_id" << 0),
-        _assetGetFront(storage.deleteDocuments(opCtx,
-                                               nss,
-                                               boost::none,
-                                               StorageInterface::ScanDirection::kBackward,
-                                               {},
-                                               BoundInclusion::kIncludeStartKeyOnly,
-                                               1U)));
+        _assertGetFront(storage.deleteDocuments(opCtx,
+                                                nss,
+                                                boost::none,
+                                                StorageInterface::ScanDirection::kBackward,
+                                                {},
+                                                BoundInclusion::kIncludeStartKeyOnly,
+                                                1U)));
 
     _assertDocumentsInCollectionEquals(opCtx, nss, {BSON("_id" << 1), BSON("_id" << 2)});
 }
@@ -1909,10 +1878,9 @@ TEST_F(StorageInterfaceImplTest, FindByIdThrowsIfUUIDNotInCatalog) {
     auto obj = BSON("_id"
                     << "kyle");
     StorageInterfaceImpl storage;
-    ASSERT_THROWS_CODE(
-        storage.findById(opCtx, {"local", UUID::gen()}, obj["_id"]).getStatus().ignore(),
-        DBException,
-        ErrorCodes::NamespaceNotFound);
+    ASSERT_THROWS_CODE(storage.findById(opCtx, {"local", UUID::gen()}, obj["_id"]).getStatus(),
+                       DBException,
+                       ErrorCodes::NamespaceNotFound);
 }
 
 TEST_F(StorageInterfaceImplTest, FindByIdReturnsNamespaceNotFoundWhenDatabaseDoesNotExist) {
@@ -1976,16 +1944,35 @@ TEST_F(StorageInterfaceImplTest, FindByIdReturnsDocumentWhenDocumentExists) {
                           opCtx, {nss.db().toString(), *options.uuid}, doc2["_id"])));
 }
 
+TEST_F(StorageInterfaceImplTest, FindByIdReturnsBadStatusIfPlanExecutorFails) {
+    auto opCtx = getOperationContext();
+    auto nss = makeNamespace(_agent);
+    auto options = generateOptionsWithUuid();
+
+    StorageInterfaceImpl storage;
+    ASSERT_OK(storage.createCollection(opCtx, nss, options));
+    auto doc1 = BSON("_id" << 0 << "x" << 0);
+    auto doc2 = BSON("_id" << 1 << "x" << 1);
+    auto doc3 = BSON("_id" << 2 << "x" << 2);
+    ASSERT_OK(storage.insertDocuments(opCtx,
+                                      nss,
+                                      {{doc1, Timestamp(0), OpTime::kUninitializedTerm},
+                                       {doc2, Timestamp(0), OpTime::kUninitializedTerm},
+                                       {doc3, Timestamp(0), OpTime::kUninitializedTerm}}));
+
+    FailPointEnableBlock planExecKiller("planExecutorAlwaysFails");
+    ASSERT_NOT_OK(storage.findById(opCtx, nss, doc2["_id"]));
+}
+
 TEST_F(StorageInterfaceImplTest, DeleteByIdThrowsIfUUIDNotInCatalog) {
     auto op = makeOplogEntry({Timestamp(Seconds(1), 0), 1LL});
     auto opCtx = getOperationContext();
     auto obj = BSON("_id"
                     << "kyle");
     StorageInterfaceImpl storage;
-    ASSERT_THROWS_CODE(
-        storage.deleteById(opCtx, {"local", UUID::gen()}, obj["_id"]).getStatus().ignore(),
-        DBException,
-        ErrorCodes::NamespaceNotFound);
+    ASSERT_THROWS_CODE(storage.deleteById(opCtx, {"local", UUID::gen()}, obj["_id"]).getStatus(),
+                       DBException,
+                       ErrorCodes::NamespaceNotFound);
 }
 
 TEST_F(StorageInterfaceImplTest, DeleteByIdReturnsNamespaceNotFoundWhenDatabaseDoesNotExist) {
@@ -2057,7 +2044,7 @@ TEST_F(StorageInterfaceImplTest, UpsertByIdThrowsIfUUIDNotInCatalog) {
     auto obj = BSON("_id"
                     << "kyle");
     StorageInterfaceImpl storage;
-    ASSERT_THROWS_CODE(storage.upsertById(opCtx, {"local", UUID::gen()}, obj["_id"], obj).ignore(),
+    ASSERT_THROWS_CODE(storage.upsertById(opCtx, {"local", UUID::gen()}, obj["_id"], obj),
                        DBException,
                        ErrorCodes::NamespaceNotFound);
 }
@@ -2244,17 +2231,16 @@ TEST_F(StorageInterfaceImplTest,
 
     auto unknownUpdateOp = BSON("$unknownUpdateOp" << BSON("x" << 1000));
     ASSERT_THROWS_CODE_AND_WHAT(
-        storage.upsertById(opCtx, nss, BSON("" << 1).firstElement(), unknownUpdateOp).ignore(),
+        storage.upsertById(opCtx, nss, BSON("" << 1).firstElement(), unknownUpdateOp),
         AssertionException,
         ErrorCodes::FailedToParse,
-        "Unknown modifier: $unknownUpdateOp");
+        "Unknown modifier: $unknownUpdateOp. Expected a valid update modifier or pipeline-style "
+        "update specified as an array");
 
-    ASSERT_THROWS_CODE(storage
-                           .upsertById(opCtx,
-                                       {nss.db().toString(), *options.uuid},
-                                       BSON("" << 1).firstElement(),
-                                       unknownUpdateOp)
-                           .ignore(),
+    ASSERT_THROWS_CODE(storage.upsertById(opCtx,
+                                          {nss.db().toString(), *options.uuid},
+                                          BSON("" << 1).firstElement(),
+                                          unknownUpdateOp),
                        DBException,
                        ErrorCodes::FailedToParse);
 }
@@ -2266,10 +2252,9 @@ TEST_F(StorageInterfaceImplTest, DeleteByFilterReturnsNamespaceNotFoundWhenDatab
     auto filter = BSON("x" << 1);
     auto status = storage.deleteByFilter(opCtx, nss, filter);
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, status);
-    ASSERT_EQUALS(str::stream() << "Database [nosuchdb] not found. Unable to delete documents in "
-                                << nss.ns()
-                                << " using filter "
-                                << filter,
+    ASSERT_EQUALS(std::string(str::stream()
+                              << "Database [nosuchdb] not found. Unable to delete documents in "
+                              << nss.ns() << " using filter " << filter),
                   status.reason());
 }
 
@@ -2362,12 +2347,11 @@ TEST_F(StorageInterfaceImplTest, DeleteByFilterReturnsNamespaceNotFoundWhenColle
     auto filter = BSON("x" << 1);
     auto status = storage.deleteByFilter(opCtx, wrongColl, filter);
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, status);
-    ASSERT_EQUALS(
-        str::stream() << "Collection [mydb.wrongColl] not found. Unable to delete documents in "
-                      << wrongColl.ns()
-                      << " using filter "
-                      << filter,
-        status.reason());
+    ASSERT_EQUALS(std::string(
+                      str::stream()
+                      << "Collection [mydb.wrongColl] not found. Unable to delete documents in "
+                      << wrongColl.ns() << " using filter " << filter),
+                  status.reason());
 }
 
 TEST_F(StorageInterfaceImplTest, DeleteByFilterReturnsSuccessIfCollectionIsEmpty) {
@@ -2486,8 +2470,7 @@ TEST_F(StorageInterfaceImplTest,
     CollectionOptions options = generateOptionsWithUuid();
     options.collation = BSON("locale"
                              << "en_US"
-                             << "strength"
-                             << 2);
+                             << "strength" << 2);
     ASSERT_OK(storage.createCollection(opCtx, nss, options));
 
     auto doc1 = BSON("_id" << 1 << "x"
@@ -2662,19 +2645,18 @@ TEST_F(StorageInterfaceImplTest, SetIndexIsMultikeySucceeds) {
     ASSERT_OK(storage.createCollection(opCtx, nss, CollectionOptions()));
 
     auto indexName = "a_b_1";
-    auto indexSpec =
-        BSON("name" << indexName << "ns" << nss.ns() << "key" << BSON("a.b" << 1) << "v"
-                    << static_cast<int>(kIndexVersion));
-    ASSERT_EQUALS(createIndexForColl(opCtx, nss, indexSpec), 2);
+    auto indexSpec = BSON("name" << indexName << "key" << BSON("a.b" << 1) << "v"
+                                 << static_cast<int>(kIndexVersion));
+    ASSERT_EQUALS(_createIndexOnEmptyCollection(opCtx, nss, indexSpec), 2);
 
     MultikeyPaths paths = {{1}};
     ASSERT_OK(storage.setIndexIsMultikey(opCtx, nss, indexName, paths, Timestamp(3, 3)));
     AutoGetCollectionForReadCommand autoColl(opCtx, nss);
     ASSERT_TRUE(autoColl.getCollection());
     auto indexCatalog = autoColl.getCollection()->getIndexCatalog();
-    ASSERT(indexCatalog->isMultikey(opCtx, indexCatalog->findIndexByName(opCtx, indexName)));
-    ASSERT(paths ==
-           indexCatalog->getMultikeyPaths(opCtx, indexCatalog->findIndexByName(opCtx, indexName)));
+    auto entry = indexCatalog->findIndexByName(opCtx, indexName)->getEntry();
+    ASSERT(entry->isMultikey());
+    ASSERT(paths == entry->getMultikeyPaths(opCtx));
 }
 
 }  // namespace

@@ -1,9 +1,9 @@
-/** This tests ensures that when a stand-alone server is started with something in
+/**
+ * This tests ensures that when a stand-alone server is started with something in
  *  local.system.replset, it doesn't start the TTL monitor (SERVER-6609). The test creates a
  *  dummy replset config & TTL collection, then restarts the member and ensures that it doesn't
  *  time out the docs in the TTL collection. Then it removes the "config" and
  *  restarts, ensuring that the TTL monitor deletes the docs.
- *  @tags: [SERVER-32997]
  */
 
 var runner;
@@ -36,7 +36,7 @@ var restartWithConfig = function() {
 
 var restartWithoutConfig = function() {
     var localDB = conn.getDB("local");
-    assert.writeOK(localDB.system.replset.remove({}));
+    assert.commandWorked(localDB.system.replset.remove({}));
 
     MongoRunner.stopMongod(conn);
 

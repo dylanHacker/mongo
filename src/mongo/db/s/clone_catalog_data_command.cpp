@@ -1,37 +1,39 @@
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/cloner.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
@@ -39,19 +41,19 @@
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/clone_catalog_data_gen.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
 
 /**
- * Currently, _cloneCatalogData will clone all data (including metadata). In the second part of
+ * Currently, _shardsvrCloneCatalogData will clone all data (including metadata). In the second part
+ * of
  * PM-1017 (Introduce Database Versioning in Sharding Config) this command will be changed to only
  * clone catalog metadata, as the name would suggest.
  */
 class CloneCatalogDataCommand : public BasicCommand {
 public:
-    CloneCatalogDataCommand() : BasicCommand("_cloneCatalogData") {}
+    CloneCatalogDataCommand() : BasicCommand("_shardsvrCloneCatalogData", "_cloneCatalogData") {}
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
@@ -85,16 +87,17 @@ public:
         uassertStatusOK(shardingState->canAcceptShardedCommands());
 
         uassert(ErrorCodes::IllegalOperation,
-                str::stream() << "_cloneCatalogData can only be run on shard servers",
+                str::stream() << "_shardsvrCloneCatalogData can only be run on shard servers",
                 serverGlobalParams.clusterRole == ClusterRole::ShardServer);
 
         uassert(ErrorCodes::InvalidOptions,
-                str::stream() << "_cloneCatalogData must be called with majority writeConcern, got "
-                              << cmdObj,
+                str::stream()
+                    << "_shardsvrCloneCatalogData must be called with majority writeConcern, got "
+                    << cmdObj,
                 opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
 
         const auto cloneCatalogDataRequest =
-            CloneCatalogData::parse(IDLParserErrorContext("_cloneCatalogData"), cmdObj);
+            CloneCatalogData::parse(IDLParserErrorContext("_shardsvrCloneCatalogData"), cmdObj);
         const auto dbname = cloneCatalogDataRequest.getCommandParameter().toString();
 
         uassert(
@@ -110,34 +113,25 @@ public:
         auto from = cloneCatalogDataRequest.getFrom();
 
         uassert(ErrorCodes::InvalidOptions,
-                str::stream() << "Can't run _cloneCatalogData without a source",
+                str::stream() << "Can't run _shardsvrCloneCatalogData without a source",
                 !from.empty());
 
         auto const catalogClient = Grid::get(opCtx)->catalogClient();
         const auto shardedColls = catalogClient->getAllShardedCollectionsForDb(
             opCtx, dbname, repl::ReadConcernLevel::kMajorityReadConcern);
 
-        bool shardedCollectionsExistOnDb = false;
+        DisableDocumentValidation disableValidation(opCtx);
 
-        BSONArrayBuilder barr;
-        for (const auto& shardedColl : shardedColls) {
-            shardedCollectionsExistOnDb = true;
-            barr.append(shardedColl.ns());
+        // Clone the non-ignored collections.
+        std::set<std::string> clonedColls;
+        Lock::DBLock dbXLock(opCtx, dbname, MODE_X);
+
+        Cloner cloner;
+        uassertStatusOK(cloner.copyDb(opCtx, dbname, from.toString(), shardedColls, &clonedColls));
+        {
+            BSONArrayBuilder cloneBarr = result.subarrayStart("clonedColls");
+            cloneBarr.append(clonedColls);
         }
-
-        BSONObjBuilder cloneCommandBuilder;
-        cloneCommandBuilder << "clone" << from << "collsToIgnore" << barr.arr()
-                            << bypassDocumentValidationCommandOption() << true;
-
-        BSONObj cloneResult;
-        DBDirectClient client(opCtx);
-        client.runCommand(dbname, cloneCommandBuilder.obj(), cloneResult);
-
-        uassertStatusOK(getStatusFromCommandResult(cloneResult));
-
-        result.append("shardedCollectionsExistOnDb", shardedCollectionsExistOnDb);
-
-        result.appendElementsUnique(CommandHelpers::filterCommandReplyForPassthrough(cloneResult));
 
         return true;
     }

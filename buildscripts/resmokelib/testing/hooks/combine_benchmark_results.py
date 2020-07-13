@@ -1,8 +1,5 @@
 """Module for generating the test results file fed into the perf plugin."""
 
-from __future__ import absolute_import
-from __future__ import division
-
 import collections
 import datetime
 import json
@@ -71,7 +68,7 @@ class CombineBenchmarkResults(interface.Hook):
             "results": []
         }
 
-        for name, report in self.benchmark_reports.items():
+        for name, report in list(self.benchmark_reports.items()):
             test_report = {
                 "name": name, "context": report.context._asdict(),
                 "results": report.generate_perf_plugin_dict()
@@ -112,9 +109,12 @@ class _BenchmarkThreadsReport(object):
     {
       "context": {
         "date": "2015/03/17-18:40:25",
+        "execuable": "./build/opt/mongo/db/concurrency/lock_manager_bm"
         "num_cpus": 40,
         "mhz_per_cpu": 2801,
         "cpu_scaling_enabled": false,
+        "caches": [
+        ],
         "library_build_type": "debug"
       },
       "benchmarks": [
@@ -131,12 +131,15 @@ class _BenchmarkThreadsReport(object):
     """
 
     CONTEXT_FIELDS = [
-        "date", "cpu_scaling_enabled", "num_cpus", "mhz_per_cpu", "library_build_type"
+        "date", "cpu_scaling_enabled", "num_cpus", "mhz_per_cpu", "library_build_type",
+        "executable", "caches"
     ]
     Context = collections.namedtuple("Context", CONTEXT_FIELDS)  # type: ignore
 
     def __init__(self, context_dict):
-        self.context = self.Context(**context_dict)
+        # `context_dict` was parsed from a json file and might have additional fields.
+        relevant = dict(filter(lambda e: e[0] in self.Context._fields, context_dict.items()))
+        self.context = self.Context(**relevant)
 
         # list of benchmark runs for each thread.
         self.thread_benchmark_map = collections.defaultdict(list)
@@ -164,7 +167,7 @@ class _BenchmarkThreadsReport(object):
         """
 
         res = {}
-        for thread_count, reports in self.thread_benchmark_map.items():
+        for thread_count, reports in list(self.thread_benchmark_map.items()):
             thread_report = {
                 "error_values": [0 for _ in range(len(reports))],
                 "ops_per_sec_values": []  # This is actually storing latency per op, not ops/s

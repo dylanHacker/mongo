@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
@@ -35,21 +36,21 @@
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/commands/cluster_commands_helpers.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/log.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
 namespace {
 
-MONGO_FP_DECLARE(setDropCollDistLockWait);
+MONGO_FAIL_POINT_DEFINE(setDropCollDistLockWait);
 
 /**
  * Internal sharding command run on config servers to drop a collection from a database.
@@ -93,19 +94,15 @@ public:
              const std::string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
+        uassert(ErrorCodes::IllegalOperation,
+                "_configsvrDropCollection can only be run on config servers",
+                serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
 
-        if (serverGlobalParams.clusterRole != ClusterRole::ConfigServer) {
-            return CommandHelpers::appendCommandStatus(
-                result,
-                Status(ErrorCodes::IllegalOperation,
-                       "_configsvrDropCollection can only be run on config servers"));
-        }
+        // Set the operation context read concern level to local for reads into the config database.
+        repl::ReadConcernArgs::get(opCtx) =
+            repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
 
         const NamespaceString nss(parseNs(dbname, cmdObj));
-        uassert(
-            ErrorCodes::InvalidNamespace,
-            str::stream() << "invalid db name specified: " << nss.db(),
-            NamespaceString::validDBName(nss.db(), NamespaceString::DollarInDbNameBehavior::Allow));
 
         uassert(ErrorCodes::InvalidOptions,
                 str::stream() << "dropCollection must be called with majority writeConcern, got "
@@ -113,96 +110,81 @@ public:
                 opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
 
         Seconds waitFor(DistLockManager::kDefaultLockTimeout);
-        MONGO_FAIL_POINT_BLOCK(setDropCollDistLockWait, customWait) {
-            const BSONObj& data = customWait.getData();
-            waitFor = Seconds(data["waitForSecs"].numberInt());
-        }
+        setDropCollDistLockWait.execute(
+            [&](const BSONObj& data) { waitFor = Seconds(data["waitForSecs"].numberInt()); });
 
         auto const catalogClient = Grid::get(opCtx)->catalogClient();
+
+        auto scopedDbLock =
+            ShardingCatalogManager::get(opCtx)->serializeCreateOrDropDatabase(opCtx, nss.db());
+        auto scopedCollLock =
+            ShardingCatalogManager::get(opCtx)->serializeCreateOrDropCollection(opCtx, nss);
+
         auto dbDistLock = uassertStatusOK(
             catalogClient->getDistLockManager()->lock(opCtx, nss.db(), "dropCollection", waitFor));
         auto collDistLock = uassertStatusOK(
             catalogClient->getDistLockManager()->lock(opCtx, nss.ns(), "dropCollection", waitFor));
 
-        ON_BLOCK_EXIT(
-            [opCtx, nss] { Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(nss); });
+        ON_BLOCK_EXIT([opCtx, nss] { Grid::get(opCtx)->catalogCache()->onEpochChange(nss); });
 
-        auto collStatus =
-            catalogClient->getCollection(opCtx, nss, repl::ReadConcernLevel::kLocalReadConcern);
-        if (collStatus == ErrorCodes::NamespaceNotFound) {
-            // We checked the sharding catalog and found that this collection doesn't exist.
-            // This may be because it never existed, or because a drop command was sent
-            // previously. This data might not be majority committed though, so we will set the
-            // client's last optime to the system's last optime to ensure the client waits for
-            // the writeConcern to be satisfied.
-            repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
-
-            // If the DB isn't in the sharding catalog either, consider the drop a success.
-            auto dbStatus = catalogClient->getDatabase(
-                opCtx, nss.db().toString(), repl::ReadConcernLevel::kLocalReadConcern);
-            if (dbStatus == ErrorCodes::NamespaceNotFound) {
-                return true;
-            }
-            uassertStatusOK(dbStatus);
-            // If we found the DB but not the collection, the collection might exist and not be
-            // sharded, so send the command to the primary shard.
-            _dropUnshardedCollectionFromShard(
-                opCtx, dbStatus.getValue().value.getPrimary(), nss, &result);
-        } else {
-            uassertStatusOK(collStatus);
-            uassertStatusOK(ShardingCatalogManager::get(opCtx)->dropCollection(opCtx, nss));
-        }
+        _dropCollection(opCtx, nss);
 
         return true;
     }
 
 private:
-    static void _dropUnshardedCollectionFromShard(OperationContext* opCtx,
-                                                  const ShardId& shardId,
-                                                  const NamespaceString& nss,
-                                                  BSONObjBuilder* result) {
+    static void _dropCollection(OperationContext* opCtx, const NamespaceString& nss) {
+        auto const catalogClient = Grid::get(opCtx)->catalogClient();
 
-        const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
+        auto collStatus =
+            catalogClient->getCollection(opCtx, nss, repl::ReadConcernArgs::get(opCtx).getLevel());
+        if (collStatus == ErrorCodes::NamespaceNotFound) {
+            // We checked the sharding catalog and found that this collection doesn't exist. This
+            // may be because it never existed, or because a drop command was sent previously. This
+            // data might not be majority committed though, so we will set the client's last optime
+            // to the system's last optime to ensure the client waits for the writeConcern to be
+            // satisfied.
+            repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
 
-        const auto dropCommandBSON = [shardRegistry, opCtx, &shardId, &nss] {
-            BSONObjBuilder builder;
-            builder.append("drop", nss.coll());
+            // If the DB isn't in the sharding catalog either, consider the drop a success.
+            auto dbStatus = catalogClient->getDatabase(
+                opCtx, nss.db().toString(), repl::ReadConcernArgs::get(opCtx).getLevel());
+            if (dbStatus == ErrorCodes::NamespaceNotFound) {
+                return;
+            }
+            uassertStatusOK(dbStatus);
 
-            // Append the chunk version for the specified namespace indicating that we believe it is
-            // not sharded. Collections residing on the config server are never sharded so do not
-            // send the shard version.
-            if (shardId != shardRegistry->getConfigShard()->getId()) {
-                ChunkVersion::UNSHARDED().appendForCommands(&builder);
+            // If we found the DB but not the collection, and the primary shard for the database is
+            // the config server, run the drop only against the config server unless the collection
+            // is config.system.sessions, since no other collections whose primary shard is the
+            // config server can have been sharded.
+            const auto primaryShard = dbStatus.getValue().value.getPrimary();
+            if (primaryShard == "config" && nss != NamespaceString::kLogicalSessionsNamespace) {
+                auto cmdDropResult =
+                    uassertStatusOK(Grid::get(opCtx)
+                                        ->shardRegistry()
+                                        ->getConfigShard()
+                                        ->runCommandWithFixedRetryAttempts(
+                                            opCtx,
+                                            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                            nss.db().toString(),
+                                            BSON("drop" << nss.coll()),
+                                            Shard::RetryPolicy::kIdempotent));
+
+                // If the collection doesn't exist, consider the drop a success.
+                if (cmdDropResult.commandStatus == ErrorCodes::NamespaceNotFound) {
+                    return;
+                }
+                uassertStatusOK(cmdDropResult.commandStatus);
+                return;
             }
 
-            if (!opCtx->getWriteConcern().usedDefault) {
-                builder.append(WriteConcernOptions::kWriteConcernField,
-                               opCtx->getWriteConcern().toBSON());
-            }
-
-            return builder.obj();
-        }();
-
-        const auto shard = uassertStatusOK(shardRegistry->getShard(opCtx, shardId));
-
-        auto cmdDropResult = uassertStatusOK(shard->runCommandWithFixedRetryAttempts(
-            opCtx,
-            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-            nss.db().toString(),
-            dropCommandBSON,
-            Shard::RetryPolicy::kIdempotent));
-
-        // If the collection doesn't exist, consider the drop a success.
-        if (cmdDropResult.commandStatus == ErrorCodes::NamespaceNotFound) {
-            return;
+            ShardingCatalogManager::get(opCtx)->ensureDropCollectionCompleted(opCtx, nss);
+        } else {
+            uassertStatusOK(collStatus);
+            ShardingCatalogManager::get(opCtx)->dropCollection(opCtx, nss);
         }
-
-        uassertStatusOK(cmdDropResult.commandStatus);
-        if (!cmdDropResult.writeConcernStatus.isOK()) {
-            appendWriteConcernErrorToCmdResponse(
-                shardId, cmdDropResult.response["writeConcernError"], *result);
-        }
-    };
+    }
 
 } configsvrDropCollectionCmd;
 

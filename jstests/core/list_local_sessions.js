@@ -11,13 +11,17 @@
 // ]
 
 (function() {
-    'use strict';
+'use strict';
 
-    const admin = db.getSisterDB('admin');
-    function listLocalSessions() {
-        return admin.aggregate([{'$listLocalSessions': {allUsers: false}}]);
-    }
+const admin = db.getSisterDB('admin');
+function listLocalSessions() {
+    return admin.aggregate([{'$listLocalSessions': {allUsers: false}}]);
+}
 
+// Get current log level.
+let originalLogLevel = assert.commandWorked(admin.setLogLevel(1)).was.verbosity;
+
+try {
     // Start a new session and capture its sessionId.
     const myid = assert.commandWorked(db.runCommand({startSession: 1})).id.id;
     assert(myid !== undefined);
@@ -49,9 +53,9 @@
         return {user: authUsers[0].user, db: authUsers[0].db};
     })();
 
-    function listMyLocalSessions() {
+    const listMyLocalSessions = function() {
         return admin.aggregate([{'$listLocalSessions': {users: [myusername]}}]);
-    }
+    };
 
     const myArray = assert.doesNotThrow(listMyLocalSessions)
                         .toArray()
@@ -72,4 +76,8 @@
         0,
         bsonWoCompare(myArray, resultArrayMine),
         "set of listed sessions for user contains different sessions from prior $listLocalSessions run");
+
+} finally {
+    admin.setLogLevel(originalLogLevel);
+}
 })();

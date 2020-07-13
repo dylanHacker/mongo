@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -91,29 +92,30 @@ TEST(ElemMatchObjectMatchExpression, MatchesNonArray) {
     ElemMatchObjectMatchExpression op("a", eq.release());
     // Directly nested objects are not matched with $elemMatch.  An intervening array is
     // required.
-    ASSERT(!op.matchesBSON(BSON("a" << BSON("b" << 5)), NULL));
-    ASSERT(!op.matchesBSON(BSON("a" << BSON("0" << (BSON("b" << 5)))), NULL));
-    ASSERT(!op.matchesBSON(BSON("a" << 4), NULL));
+    ASSERT(!op.matchesBSON(BSON("a" << BSON("b" << 5)), nullptr));
+    ASSERT(!op.matchesBSON(BSON("a" << BSON("0" << (BSON("b" << 5)))), nullptr));
+    ASSERT(!op.matchesBSON(BSON("a" << 4), nullptr));
 }
 
 TEST(ElemMatchObjectMatchExpression, MatchesArrayObject) {
     BSONObj baseOperand = BSON("b" << 5);
     unique_ptr<ComparisonMatchExpression> eq(new EqualityMatchExpression("b", baseOperand["b"]));
     ElemMatchObjectMatchExpression op("a", eq.release());
-    ASSERT(op.matchesBSON(BSON("a" << BSON_ARRAY(BSON("b" << 5))), NULL));
-    ASSERT(op.matchesBSON(BSON("a" << BSON_ARRAY(4 << BSON("b" << 5))), NULL));
-    ASSERT(op.matchesBSON(BSON("a" << BSON_ARRAY(BSONObj() << BSON("b" << 5))), NULL));
-    ASSERT(op.matchesBSON(BSON("a" << BSON_ARRAY(BSON("b" << 6) << BSON("b" << 5))), NULL));
+    ASSERT(op.matchesBSON(BSON("a" << BSON_ARRAY(BSON("b" << 5))), nullptr));
+    ASSERT(op.matchesBSON(BSON("a" << BSON_ARRAY(4 << BSON("b" << 5))), nullptr));
+    ASSERT(op.matchesBSON(BSON("a" << BSON_ARRAY(BSONObj() << BSON("b" << 5))), nullptr));
+    ASSERT(op.matchesBSON(BSON("a" << BSON_ARRAY(BSON("b" << 6) << BSON("b" << 5))), nullptr));
 }
 
 TEST(ElemMatchObjectMatchExpression, MatchesMultipleNamedValues) {
     BSONObj baseOperand = BSON("c" << 5);
     unique_ptr<ComparisonMatchExpression> eq(new EqualityMatchExpression("c", baseOperand["c"]));
     ElemMatchObjectMatchExpression op("a.b", eq.release());
-    ASSERT(op.matchesBSON(BSON("a" << BSON_ARRAY(BSON("b" << BSON_ARRAY(BSON("c" << 5))))), NULL));
+    ASSERT(
+        op.matchesBSON(BSON("a" << BSON_ARRAY(BSON("b" << BSON_ARRAY(BSON("c" << 5))))), nullptr));
     ASSERT(op.matchesBSON(BSON("a" << BSON_ARRAY(BSON("b" << BSON_ARRAY(BSON("c" << 1)))
                                                  << BSON("b" << BSON_ARRAY(BSON("c" << 5))))),
-                          NULL));
+                          nullptr));
 }
 
 TEST(ElemMatchObjectMatchExpression, ElemMatchKey) {
@@ -201,27 +203,27 @@ TEST(ElemMatchValueMatchExpression, MatchesNonArray) {
     ElemMatchObjectMatchExpression op("a", gt.release());
     // Directly nested objects are not matched with $elemMatch.  An intervening array is
     // required.
-    ASSERT(!op.matchesBSON(BSON("a" << 6), NULL));
-    ASSERT(!op.matchesBSON(BSON("a" << BSON("0" << 6)), NULL));
+    ASSERT(!op.matchesBSON(BSON("a" << 6), nullptr));
+    ASSERT(!op.matchesBSON(BSON("a" << BSON("0" << 6)), nullptr));
 }
 
 TEST(ElemMatchValueMatchExpression, MatchesArrayScalar) {
     BSONObj baseOperand = BSON("$gt" << 5);
     unique_ptr<ComparisonMatchExpression> gt(new GTMatchExpression("", baseOperand["$gt"]));
     ElemMatchValueMatchExpression op("a", gt.release());
-    ASSERT(op.matchesBSON(BSON("a" << BSON_ARRAY(6)), NULL));
-    ASSERT(op.matchesBSON(BSON("a" << BSON_ARRAY(4 << 6)), NULL));
-    ASSERT(op.matchesBSON(BSON("a" << BSON_ARRAY(BSONObj() << 7)), NULL));
+    ASSERT(op.matchesBSON(BSON("a" << BSON_ARRAY(6)), nullptr));
+    ASSERT(op.matchesBSON(BSON("a" << BSON_ARRAY(4 << 6)), nullptr));
+    ASSERT(op.matchesBSON(BSON("a" << BSON_ARRAY(BSONObj() << 7)), nullptr));
 }
 
 TEST(ElemMatchValueMatchExpression, MatchesMultipleNamedValues) {
     BSONObj baseOperand = BSON("$gt" << 5);
     unique_ptr<ComparisonMatchExpression> gt(new GTMatchExpression("", baseOperand["$gt"]));
     ElemMatchValueMatchExpression op("a.b", gt.release());
-    ASSERT(op.matchesBSON(BSON("a" << BSON_ARRAY(BSON("b" << BSON_ARRAY(6)))), NULL));
+    ASSERT(op.matchesBSON(BSON("a" << BSON_ARRAY(BSON("b" << BSON_ARRAY(6)))), nullptr));
     ASSERT(op.matchesBSON(
         BSON("a" << BSON_ARRAY(BSON("b" << BSON_ARRAY(4)) << BSON("b" << BSON_ARRAY(4 << 6)))),
-        NULL));
+        nullptr));
 }
 
 TEST(ElemMatchValueMatchExpression, ElemMatchKey) {
@@ -344,19 +346,19 @@ TEST(AndOfElemMatch, Matches) {
     andOfEM->add(elemMatch2.release());
 
     BSONObj nonArray = BSON("x" << 4);
-    ASSERT(!andOfEM->matchesBSON(nonArray, NULL));
+    ASSERT(!andOfEM->matchesBSON(nonArray, nullptr));
     BSONObj emptyArray = BSON("x" << BSONArray());
-    ASSERT(!andOfEM->matchesBSON(emptyArray, NULL));
+    ASSERT(!andOfEM->matchesBSON(emptyArray, nullptr));
     BSONObj nonNumberArray = BSON("x" << BSON_ARRAY("q"));
-    ASSERT(!andOfEM->matchesBSON(nonNumberArray, NULL));
+    ASSERT(!andOfEM->matchesBSON(nonNumberArray, nullptr));
     BSONObj singleMatch = BSON("x" << BSON_ARRAY(5));
-    ASSERT(!andOfEM->matchesBSON(singleMatch, NULL));
+    ASSERT(!andOfEM->matchesBSON(singleMatch, nullptr));
     BSONObj otherMatch = BSON("x" << BSON_ARRAY(105));
-    ASSERT(!andOfEM->matchesBSON(otherMatch, NULL));
+    ASSERT(!andOfEM->matchesBSON(otherMatch, nullptr));
     BSONObj bothMatch = BSON("x" << BSON_ARRAY(5 << 105));
-    ASSERT(andOfEM->matchesBSON(bothMatch, NULL));
+    ASSERT(andOfEM->matchesBSON(bothMatch, nullptr));
     BSONObj neitherMatch = BSON("x" << BSON_ARRAY(0 << 200));
-    ASSERT(!andOfEM->matchesBSON(neitherMatch, NULL));
+    ASSERT(!andOfEM->matchesBSON(neitherMatch, nullptr));
 }
 
 TEST(SizeMatchExpression, MatchesElement) {
@@ -381,15 +383,15 @@ TEST(SizeMatchExpression, MatchesNonArray) {
 
 TEST(SizeMatchExpression, MatchesArray) {
     SizeMatchExpression size("a", 2);
-    ASSERT(size.matchesBSON(BSON("a" << BSON_ARRAY(4 << 5.5)), NULL));
+    ASSERT(size.matchesBSON(BSON("a" << BSON_ARRAY(4 << 5.5)), nullptr));
     // Arrays are not unwound to look for matching subarrays.
-    ASSERT(!size.matchesBSON(BSON("a" << BSON_ARRAY(4 << 5.5 << BSON_ARRAY(1 << 2))), NULL));
+    ASSERT(!size.matchesBSON(BSON("a" << BSON_ARRAY(4 << 5.5 << BSON_ARRAY(1 << 2))), nullptr));
 }
 
 TEST(SizeMatchExpression, MatchesNestedArray) {
     SizeMatchExpression size("a.2", 2);
     // A numerically referenced nested array is matched.
-    ASSERT(size.matchesBSON(BSON("a" << BSON_ARRAY(4 << 5.5 << BSON_ARRAY(1 << 2))), NULL));
+    ASSERT(size.matchesBSON(BSON("a" << BSON_ARRAY(4 << 5.5 << BSON_ARRAY(1 << 2))), nullptr));
 }
 
 TEST(SizeMatchExpression, ElemMatchKey) {

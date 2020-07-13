@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
- *    linked combinations including the prograxm with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -31,12 +32,11 @@
 #include <benchmark/benchmark.h>
 
 #include "mongo/base/init.h"
-#include "mongo/bson/inline_decls.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/platform/random.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -55,14 +55,14 @@ ChunkRange getRangeForChunk(int i, int nChunks) {
 }
 
 template <typename ShardSelectorFn>
-auto makeChunkManagerWithShardSelector(int nShards, int nChunks, ShardSelectorFn selectShard) {
+auto makeChunkManagerWithShardSelector(int nShards, uint32_t nChunks, ShardSelectorFn selectShard) {
     const auto collEpoch = OID::gen();
     const auto collName = NamespaceString("test.foo");
     const auto shardKeyPattern = KeyPattern(BSON("_id" << 1));
 
     std::vector<ChunkType> chunks;
     chunks.reserve(nChunks);
-    for (int i = 0; i < nChunks; ++i) {
+    for (uint32_t i = 0; i < nChunks; ++i) {
         chunks.emplace_back(collName,
                             getRangeForChunk(i, nChunks),
                             ChunkVersion{i + 1, 0, collEpoch},
@@ -85,17 +85,19 @@ ShardId optimalShardSelector(int i, int nShards, int nChunks) {
     return ShardId(str::stream() << "shard" << shardNum);
 }
 
-NOINLINE_DECL auto makeChunkManagerWithPessimalBalancedDistribution(int nShards, int nChunks) {
+MONGO_COMPILER_NOINLINE auto makeChunkManagerWithPessimalBalancedDistribution(int nShards,
+                                                                              uint32_t nChunks) {
     return makeChunkManagerWithShardSelector(nShards, nChunks, pessimalShardSelector);
 }
 
-NOINLINE_DECL auto makeChunkManagerWithOptimalBalancedDistribution(int nShards, int nChunks) {
+MONGO_COMPILER_NOINLINE auto makeChunkManagerWithOptimalBalancedDistribution(int nShards,
+                                                                             uint32_t nChunks) {
     return makeChunkManagerWithShardSelector(nShards, nChunks, optimalShardSelector);
 }
 
-NOINLINE_DECL auto runIncrementalUpdate(const CollectionMetadata& cm,
-                                        const std::vector<ChunkType>& newChunks) {
-    auto rt = cm.getChunkManager()->getRoutingHistory().makeUpdated(newChunks);
+MONGO_COMPILER_NOINLINE auto runIncrementalUpdate(const CollectionMetadata& cm,
+                                                  const std::vector<ChunkType>& newChunks) {
+    auto rt = cm.getChunkManager()->getRoutingHistory()->makeUpdated(newChunks);
     return std::make_unique<CollectionMetadata>(std::make_shared<ChunkManager>(rt, boost::none),
                                                 ShardId("shard0"));
 }
@@ -120,12 +122,15 @@ void BM_IncrementalRefreshOfPessimalBalancedDistribution(benchmark::State& state
     }
 }
 
-BENCHMARK(BM_IncrementalRefreshOfPessimalBalancedDistribution)->Args({2, 50000});
+BENCHMARK(BM_IncrementalRefreshOfPessimalBalancedDistribution)
+    ->Args({2, 50000})
+    ->Args({2, 250000})
+    ->Args({2, 500000});
 
 template <typename ShardSelectorFn>
 auto BM_FullBuildOfChunkManager(benchmark::State& state, ShardSelectorFn selectShard) {
     const int nShards = state.range(0);
-    const int nChunks = state.range(1);
+    const uint32_t nChunks = state.range(1);
 
     const auto collEpoch = OID::gen();
     const auto collName = NamespaceString("test.foo");
@@ -133,7 +138,7 @@ auto BM_FullBuildOfChunkManager(benchmark::State& state, ShardSelectorFn selectS
 
     std::vector<ChunkType> chunks;
     chunks.reserve(nChunks);
-    for (int i = 0; i < nChunks; ++i) {
+    for (uint32_t i = 0; i < nChunks; ++i) {
         chunks.emplace_back(collName,
                             getRangeForChunk(i, nChunks),
                             ChunkVersion{i + 1, 0, collEpoch},
@@ -267,6 +272,24 @@ void BM_GetShardIdsForRange(benchmark::State& state,
 }
 
 template <typename CollectionMetadataBuilderFn>
+void BM_GetShardIdsForRangeMinKeyToMaxKey(benchmark::State& state,
+                                          CollectionMetadataBuilderFn makeCollectionMetadata) {
+    const int nShards = state.range(0);
+    const int nChunks = state.range(1);
+
+    auto cm = makeCollectionMetadata(nShards, nChunks);
+    auto min = BSON("_id" << MINKEY);
+    auto max = BSON("_id" << MAXKEY);
+
+    for (auto keepRunning : state) {
+        std::set<ShardId> shardIds;
+        cm->getChunkManager()->getShardIdsForRange(min, max, &shardIds);
+    }
+
+    state.SetItemsProcessed(state.iterations());
+}
+
+template <typename CollectionMetadataBuilderFn>
 void BM_KeyBelongsToMe(benchmark::State& state,
                        CollectionMetadataBuilderFn makeCollectionMetadata) {
     const int nShards = state.range(0);
@@ -331,6 +354,12 @@ MONGO_INITIALIZER(RegisterBenchmarks)(InitializerContext* context) {
             BM_GetShardIdsForRange, Pessimal, makeChunkManagerWithPessimalBalancedDistribution),
         REGISTER_BENCHMARK_CAPTURE(
             BM_GetShardIdsForRange, Optimal, makeChunkManagerWithOptimalBalancedDistribution),
+        REGISTER_BENCHMARK_CAPTURE(BM_GetShardIdsForRangeMinKeyToMaxKey,
+                                   Pessimal,
+                                   makeChunkManagerWithPessimalBalancedDistribution),
+        REGISTER_BENCHMARK_CAPTURE(BM_GetShardIdsForRangeMinKeyToMaxKey,
+                                   Optimal,
+                                   makeChunkManagerWithOptimalBalancedDistribution),
         REGISTER_BENCHMARK_CAPTURE(
             BM_KeyBelongsToMe, Pessimal, makeChunkManagerWithPessimalBalancedDistribution),
         REGISTER_BENCHMARK_CAPTURE(

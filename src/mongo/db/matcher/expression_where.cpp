@@ -1,25 +1,24 @@
-// expression_where.cpp
-
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,6 +31,8 @@
 
 #include "mongo/db/matcher/expression_where.h"
 
+#include <memory>
+
 #include "mongo/base/init.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
@@ -39,32 +40,46 @@
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/scripting/engine.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/util/scopeguard.h"
 
 
 namespace mongo {
 
-using std::unique_ptr;
 using std::string;
 using std::stringstream;
-using stdx::make_unique;
+using std::unique_ptr;
+
+namespace {
+std::string getAuthenticatedUserNamesToken(Client* client) {
+    StringBuilder sb;
+
+    auto as = AuthorizationSession::get(client);
+    for (auto nameIter = as->getAuthenticatedUserNames(); nameIter.more(); nameIter.next()) {
+        // Using a NUL byte which isn't valid in usernames to separate them.
+        sb << '\0' << nameIter->getUnambiguousName();
+    }
+
+    return sb.str();
+}
+}  // namespace
 
 WhereMatchExpression::WhereMatchExpression(OperationContext* opCtx,
                                            WhereParams params,
                                            StringData dbName)
     : WhereMatchExpressionBase(std::move(params)), _dbName(dbName.toString()), _opCtx(opCtx) {
-    invariant(_opCtx != NULL);
+    invariant(_opCtx != nullptr);
 
     uassert(
         ErrorCodes::BadValue, "no globalScriptEngine in $where parsing", getGlobalScriptEngine());
 
     uassert(ErrorCodes::BadValue, "ns for $where cannot be empty", dbName.size() != 0);
 
-    const string userToken =
-        AuthorizationSession::get(Client::getCurrent())->getAuthenticatedUserNamesToken();
-
+    const auto userToken = getAuthenticatedUserNamesToken(opCtx->getClient());
     _scope = getGlobalScriptEngine()->getPooledScope(_opCtx, _dbName, "where" + userToken);
+    const auto guard = makeGuard([&] { _scope->unregisterOperation(); });
+
     _func = _scope->createFunction(getCode().c_str());
 
     uassert(ErrorCodes::BadValue, "$where compile error", _func);
@@ -74,15 +89,15 @@ bool WhereMatchExpression::matches(const MatchableDocument* doc, MatchDetails* d
     uassert(28692, "$where compile error", _func);
     BSONObj obj = doc->toBSON();
 
-    if (!getScope().isEmpty()) {
-        _scope->init(&getScope());
-    }
+    _scope->registerOperation(Client::getCurrent()->getOperationContext());
+    const auto guard = makeGuard([&] { _scope->unregisterOperation(); });
 
     _scope->advanceGeneration();
     _scope->setObject("obj", const_cast<BSONObj&>(obj));
     _scope->setBoolean("fullObject", true);  // this is a hack b/c fullObject used to be relevant
 
-    int err = _scope->invoke(_func, 0, &obj, 1000 * 60, false);
+    int err =
+        _scope->invoke(_func, nullptr, &obj, internalQueryJavaScriptFnTimeoutMillis.load(), false);
     if (err == -3) {  // INVOKE_ERROR
         stringstream ss;
         ss << "error on invocation of $where function:\n" << _scope->getError();
@@ -97,12 +112,11 @@ bool WhereMatchExpression::matches(const MatchableDocument* doc, MatchDetails* d
 unique_ptr<MatchExpression> WhereMatchExpression::shallowClone() const {
     WhereParams params;
     params.code = getCode();
-    params.scope = getScope();
     unique_ptr<WhereMatchExpression> e =
-        make_unique<WhereMatchExpression>(_opCtx, std::move(params), _dbName);
+        std::make_unique<WhereMatchExpression>(_opCtx, std::move(params), _dbName);
     if (getTag()) {
         e->setTag(getTag()->clone());
     }
     return std::move(e);
 }
-}
+}  // namespace mongo

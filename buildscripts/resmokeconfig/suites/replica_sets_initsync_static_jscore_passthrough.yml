@@ -11,9 +11,6 @@ selector:
   - jstests/core/capped_update.js
   # Having duplicate namespaces is not supported and will cause initial sync to fail.
   - jstests/core/views/duplicate_ns.js
-  # Restarting the catalog on the sync source will cause the downstream node to copy only a subset
-  # of the required data.
-  - jstests/core/restart_catalog.js
 
 run_hook_interval: &run_hook_interval 20
 executor:
@@ -25,7 +22,6 @@ executor:
       eval: "testingReplication = true;"
       readMode: commands
   hooks:
-  - class: CheckPrimary
   - class: IntermediateInitialSync
     n: *run_hook_interval
   - class: CleanEveryN
@@ -35,7 +31,8 @@ executor:
     mongod_options:
       set_parameters:
         enableTestCommands: 1
-        numInitialSyncAttempts: 1
+        collectionClonerBatchSize: 10
+        initialSyncOplogFetcherBatchSize: 10
     num_nodes: 2
     start_initial_sync_node: True
     replset_config_options:

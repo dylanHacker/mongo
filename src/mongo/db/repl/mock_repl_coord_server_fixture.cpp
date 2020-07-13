@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,11 +29,14 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/db/client.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/mock_repl_coord_server_fixture.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_entry.h"
@@ -43,7 +47,6 @@
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -60,10 +63,10 @@ void MockReplCoordServerFixture::setUp() {
     ASSERT_TRUE(_storageInterface == repl::StorageInterface::get(service));
 
     repl::ReplicationProcess::set(service,
-                                  stdx::make_unique<repl::ReplicationProcess>(
+                                  std::make_unique<repl::ReplicationProcess>(
                                       _storageInterface,
-                                      stdx::make_unique<repl::ReplicationConsistencyMarkersMock>(),
-                                      stdx::make_unique<repl::ReplicationRecoveryMock>()));
+                                      std::make_unique<repl::ReplicationConsistencyMarkersMock>(),
+                                      std::make_unique<repl::ReplicationRecoveryMock>()));
 
     ASSERT_OK(repl::ReplicationProcess::get(service)->initializeRollbackID(opCtx()));
 
@@ -73,7 +76,7 @@ void MockReplCoordServerFixture::setUp() {
         ConnectionString::forReplicaSet("sessionTxnStateTest", {HostAndPort("a:1")}).toString());
 
     repl::ReplicationCoordinator::set(
-        service, stdx::make_unique<repl::ReplicationCoordinatorMock>(service, replSettings));
+        service, std::make_unique<repl::ReplicationCoordinatorMock>(service, replSettings));
     ASSERT_OK(
         repl::ReplicationCoordinator::get(service)->setFollowerMode(repl::MemberState::RS_PRIMARY));
 
@@ -84,14 +87,10 @@ void MockReplCoordServerFixture::setUp() {
 
     repl::setOplogCollectionName(service);
     repl::acquireOplogCollectionForLogging(opCtx());
-}
 
-void MockReplCoordServerFixture::tearDown() {
-    // ServiceContextMongoDTest::tearDown() will try to create it's own opCtx, and it's not
-    // allowed to have 2 present per client, so destroy this one.
-    _opCtx.reset();
-
-    ServiceContextMongoDTest::tearDown();
+    repl::DropPendingCollectionReaper::set(
+        service,
+        std::make_unique<repl::DropPendingCollectionReaper>(repl::StorageInterface::get(service)));
 }
 
 void MockReplCoordServerFixture::insertOplogEntry(const repl::OplogEntry& entry) {
@@ -102,7 +101,6 @@ void MockReplCoordServerFixture::insertOplogEntry(const repl::OplogEntry& entry)
     auto status = coll->insertDocument(opCtx(),
                                        InsertStatement(entry.toBSON()),
                                        &CurOp::get(opCtx())->debug(),
-                                       /* enforceQuota */ false,
                                        /* fromMigrate */ false);
     ASSERT_OK(status);
 }

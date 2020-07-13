@@ -24,12 +24,11 @@ function CollectionValidator() {
         assert.eq(typeof obj, 'object', 'The `obj` argument must be an object');
         assert(obj.hasOwnProperty('full'), 'Please specify whether to use full validation');
 
-        const full = obj.full;
-
-        let success = true;
+        // Failed collection validation results are saved in failed_res.
+        let full_res = {ok: 1, failed_res: []};
 
         // Don't run validate on view namespaces.
-        let filter = {type: "collection"};
+        let filter = {type: 'collection'};
         if (jsTest.options().skipValidationOnInvalidViewDefinitions) {
             // If skipValidationOnInvalidViewDefinitions=true, then we avoid resolving the view
             // catalog on the admin database.
@@ -44,9 +43,11 @@ function CollectionValidator() {
             jsTest.options().skipValidationNamespaces.length > 0) {
             let skippedCollections = [];
             for (let ns of jsTest.options().skipValidationNamespaces) {
-                // Strip off the database name from 'ns' to extract the collName.
+                // Attempt to strip the name of the database we are about to validate off of the
+                // namespace we wish to skip. If the replace() function does find a match with the
+                // database, then we know that the collection we want to skip is in the database we
+                // are about to validate. We will then put it in the 'filter' for later use.
                 const collName = ns.replace(new RegExp('^' + db.getName() + '\.'), '');
-                // Skip the collection 'collName' if the db name was removed from 'ns'.
                 if (collName !== ns) {
                     skippedCollections.push({name: {$ne: collName}});
                 }
@@ -56,12 +57,12 @@ function CollectionValidator() {
 
         let collInfo = db.getCollectionInfos(filter);
         for (let collDocument of collInfo) {
-            const coll = db.getCollection(collDocument["name"]);
-            const res = coll.validate(full);
+            const coll = db.getCollection(collDocument['name']);
+            const res = coll.validate(obj);
 
             if (!res.ok || !res.valid) {
                 if (jsTest.options().skipValidationOnNamespaceNotFound &&
-                    res.errmsg === 'ns not found') {
+                    res.codeName === "NamespaceNotFound") {
                     // During a 'stopStart' backup/restore on the secondary node, the actual list of
                     // collections can be out of date if ops are still being applied from the oplog.
                     // In this case we skip the collection if the ns was not found at time of
@@ -70,36 +71,54 @@ function CollectionValidator() {
                           ' since collection was not found');
                     continue;
                 }
-                print('Collection validation failed with response: ' + tojson(res));
+                const host = db.getMongo().host;
+                print('Collection validation failed on host ' + host +
+                      ' with response: ' + tojson(res));
                 dumpCollection(coll, 100);
-                success = false;
+                full_res.failed_res.push(res);
+                full_res.ok = 0;
             }
         }
 
-        return success;
+        return full_res;
     };
 
     // Run a separate thread to validate collections on each server in parallel.
-    const validateCollectionsThread = function(validatorFunc, host, testData) {
-        TestData = testData;  // Pass the TestData object from main thread.
-
+    const validateCollectionsThread = function(validatorFunc, host) {
         try {
             print('Running validate() on ' + host);
             const conn = new Mongo(host);
             conn.setSlaveOk();
             jsTest.authenticate(conn);
 
+            // Skip validating collections for arbiters.
+            if (conn.getDB('admin').isMaster('admin').arbiterOnly === true) {
+                print('Skipping collection validation on arbiter ' + host);
+                return {ok: 1};
+            }
+
+            const requiredFCV = jsTest.options().forceValidationWithFeatureCompatibilityVersion;
+            if (requiredFCV) {
+                // Make sure this node has the desired FCV as it may take time for the updates to
+                // replicate to the nodes that weren't part of the w=majority.
+                assert.soonNoExcept(() => {
+                    checkFCV(conn.getDB('admin'), requiredFCV);
+                    return true;
+                });
+            }
+
             const dbNames = conn.getDBNames();
             for (let dbName of dbNames) {
-                if (!validatorFunc(conn.getDB(dbName), {full: true})) {
-                    return {ok: 0};
+                const validateRes = validatorFunc(conn.getDB(dbName), {full: true});
+                if (validateRes.ok !== 1) {
+                    return {ok: 0, host: host, validateRes: validateRes};
                 }
             }
             return {ok: 1};
         } catch (e) {
             print('Exception caught in scoped thread running validationCollections on server: ' +
                   host);
-            return {ok: 0, error: e.toString(), stack: e.stack};
+            return {ok: 0, error: e.toString(), stack: e.stack, host: host};
         }
     };
 
@@ -110,8 +129,8 @@ function CollectionValidator() {
 
         try {
             hostList.forEach(host => {
-                const thread = new ScopedThread(
-                    validateCollectionsThread, this.validateCollections, host, TestData);
+                const thread =
+                    new Thread(validateCollectionsThread, this.validateCollections, host);
                 threads.push(thread);
                 thread.start();
             });
@@ -129,6 +148,6 @@ function CollectionValidator() {
     };
 }
 
-// Ensure compatability with existing callers. Cannot use `const` or `let` here since this file may
+// Ensure compatibility with existing callers. Cannot use `const` or `let` here since this file may
 // be loaded more than once.
 var validateCollections = new CollectionValidator().validateCollections;

@@ -1,30 +1,31 @@
 /**
-*    Copyright (C) 2014 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
@@ -36,7 +37,6 @@
 #include "mongo/base/secure_allocator.h"
 #include "mongo/base/status.h"
 #include "mongo/crypto/sha1_block.h"
-#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/platform/random.h"
 #include "mongo/util/assert_util.h"
@@ -102,15 +102,9 @@ public:
     }
 
     static std::vector<std::uint8_t> generateSecureRandomSalt() {
-        // Express salt length as a number of quad words, rounded up.
-        constexpr auto qwords = (saltLength() + sizeof(std::int64_t) - 1) / sizeof(std::int64_t);
-        std::array<std::int64_t, qwords> userSalt;
-
-        std::unique_ptr<SecureRandom> sr(SecureRandom::create());
-        std::generate(userSalt.begin(), userSalt.end(), [&sr] { return sr->nextInt64(); });
-        return std::vector<std::uint8_t>(reinterpret_cast<std::uint8_t*>(userSalt.data()),
-                                         reinterpret_cast<std::uint8_t*>(userSalt.data()) +
-                                             saltLength());
+        std::vector<std::uint8_t> salt(saltLength());
+        SecureRandom().fill(salt.data(), salt.size());
+        return salt;
     }
 
 private:
@@ -121,7 +115,7 @@ private:
         return std::tie(_password, _salt, _iterationCount);
     }
 
-    static constexpr auto saltLength() {
+    static constexpr auto saltLength() -> decltype(HashBlock::kHashLength) {
         return HashBlock::kHashLength - 4;
     }
 
@@ -138,6 +132,47 @@ template <typename T>
 bool operator!=(const Presecrets<T>& lhs, const Presecrets<T>& rhs) {
     return !(lhs == rhs);
 }
+template <typename HashBlock>
+struct SecretsHolder {
+    HashBlock clientKey;
+    HashBlock storedKey;
+    HashBlock serverKey;
+};
+
+template <typename HashBlock>
+class LockedSecretsPolicy {
+public:
+    LockedSecretsPolicy() = default;
+
+    const SecretsHolder<HashBlock>* operator->() const {
+        return &(*_holder);
+    }
+    SecretsHolder<HashBlock>* operator->() {
+        return &(*_holder);
+    }
+
+private:
+    using SecureSecrets = SecureAllocatorAuthDomain::SecureHandle<SecretsHolder<HashBlock>>;
+
+    SecureSecrets _holder;
+};
+
+template <typename HashBlock>
+class UnlockedSecretsPolicy {
+public:
+    UnlockedSecretsPolicy() = default;
+
+    const SecretsHolder<HashBlock>* operator->() const {
+        return &_holder;
+    }
+
+    SecretsHolder<HashBlock>* operator->() {
+        return &_holder;
+    }
+
+private:
+    SecretsHolder<HashBlock> _holder;
+};
 
 /* Stores all of the keys, generated from a password, needed for a client or server to perform a
  * SCRAM handshake.
@@ -145,21 +180,13 @@ bool operator!=(const Presecrets<T>& lhs, const Presecrets<T>& rhs) {
  * May be unpopulated. SCRAMSecrets created via the default constructor are unpopulated.
  * The behavior is undefined if the accessors are called when unpopulated.
  */
-template <typename HashBlock>
+template <typename HashBlock, template <typename> class MemoryPolicy = LockedSecretsPolicy>
 class Secrets {
-private:
-    struct SecretsHolder {
-        HashBlock clientKey;
-        HashBlock storedKey;
-        HashBlock serverKey;
-    };
-    using SecureSecrets = SecureAllocatorAuthDomain::SecureHandle<SecretsHolder>;
-
 public:
     Secrets() = default;
 
     Secrets(StringData client, StringData stored, StringData server)
-        : _ptr(std::make_shared<SecureSecrets>()) {
+        : _ptr(std::make_shared<MemoryPolicy<HashBlock>>()) {
         if (!client.empty()) {
             (*_ptr)->clientKey = uassertStatusOK(HashBlock::fromBuffer(
                 reinterpret_cast<const unsigned char*>(client.rawData()), client.size()));
@@ -170,13 +197,13 @@ public:
             reinterpret_cast<const unsigned char*>(server.rawData()), stored.size()));
     }
 
-    Secrets(const HashBlock& saltedPassword) : _ptr(std::make_shared<SecureSecrets>()) {
+    Secrets(const HashBlock& saltedPassword) : _ptr(std::make_shared<MemoryPolicy<HashBlock>>()) {
         // ClientKey := HMAC(saltedPassword, "Client Key")
-        (*_ptr)->clientKey = HashBlock::computeHmac(
+        (*_ptr)->clientKey = (HashBlock::computeHmac(
             saltedPassword.data(),
             saltedPassword.size(),
             reinterpret_cast<const unsigned char*>(kClientKeyConst.rawData()),
-            kClientKeyConst.size());
+            kClientKeyConst.size()));
         // StoredKey := H(clientKey)
         (*_ptr)->storedKey = HashBlock::computeHash(clientKey().data(), clientKey().size());
 
@@ -248,13 +275,20 @@ public:
 
     static BSONObj generateCredentials(std::string password, int iterationCount) {
         auto salt = Presecrets<HashBlock>::generateSecureRandomSalt();
-        Secrets<HashBlock> secrets(Presecrets<HashBlock>(password, salt, iterationCount));
-        const auto encodedSalt = base64::encode(reinterpret_cast<char*>(salt.data()), salt.size());
-        return BSON(kIterationCountFieldName << iterationCount << kSaltFieldName << encodedSalt
-                                             << kStoredKeyFieldName
-                                             << secrets.storedKey().toString()
-                                             << kServerKeyFieldName
-                                             << secrets.serverKey().toString());
+        return generateCredentials(salt, password, iterationCount);
+    }
+
+    static BSONObj generateCredentials(const std::vector<uint8_t>& salt,
+                                       const std::string& password,
+                                       int iterationCount) {
+        Secrets<HashBlock, MemoryPolicy> secrets(
+            Presecrets<HashBlock>(password, salt, iterationCount));
+        const auto encodedSalt =
+            base64::encode(StringData(reinterpret_cast<const char*>(salt.data()), salt.size()));
+        return BSON(kIterationCountFieldName
+                    << iterationCount << kSaltFieldName << encodedSalt << kStoredKeyFieldName
+                    << secrets.storedKey().toString() << kServerKeyFieldName
+                    << secrets.serverKey().toString());
     }
 
     const HashBlock& clientKey() const {
@@ -281,7 +315,7 @@ public:
     }
 
 private:
-    std::shared_ptr<SecureSecrets> _ptr;
+    std::shared_ptr<MemoryPolicy<HashBlock>> _ptr;
 };
 
 }  // namespace scram

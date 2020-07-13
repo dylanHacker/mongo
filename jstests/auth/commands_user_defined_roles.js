@@ -3,11 +3,15 @@
 Exhaustive test for authorization of commands with user-defined roles.
 
 The test logic implemented here operates on the test cases defined
-in jstests/auth/commands.js.
+in jstests/auth/lib/commands_lib.js.
 
 @tags: [requires_sharding]
 
 */
+
+// This test involves killing all sessions, which will not work as expected if the kill command is
+// sent with an implicit session.
+TestData.disableImplicitSessions = true;
 
 // constants
 var testUser = "userDefinedRolesTestUser";
@@ -36,23 +40,24 @@ function testProperAuthorization(conn, t, testcase, privileges) {
     authCommandsLib.authenticatedSetup(t, runOnDb);
 
     var command = t.command;
-    if (typeof(command) === "function") {
-        command = t.command(state);
+    if (typeof (command) === "function") {
+        command = t.command(state, testcase.commandArgs);
     }
     var res = runOnDb.runCommand(command);
 
     if (!testcase.expectFail && res.ok != 1 && res.code != commandNotSupportedCode) {
         // don't error if the test failed with code commandNotSupported since
-        // some storage engines (e.g wiredTiger) don't support some commands (e.g. touch)
+        // some storage engines don't support some commands.
         out = "command failed with " + tojson(res) + " on db " + testcase.runOnDb +
             " with privileges " + tojson(privileges);
     } else if (testcase.expectFail && res.code == authErrCode) {
-        out = "expected authorization success" + " but received " + tojson(res) + " on db " +
-            testcase.runOnDb + " with privileges " + tojson(privileges);
+        out = "expected authorization success" +
+            " but received " + tojson(res) + " on db " + testcase.runOnDb + " with privileges " +
+            tojson(privileges);
     }
 
     firstDb.logout();
-    authCommandsLib.teardown(conn, t, runOnDb);
+    authCommandsLib.teardown(conn, t, runOnDb, res);
     return out;
 }
 
@@ -74,14 +79,14 @@ function testInsufficientPrivileges(conn, t, testcase, privileges) {
     authCommandsLib.authenticatedSetup(t, runOnDb);
 
     var command = t.command;
-    if (typeof(command) === "function") {
-        command = t.command(state);
+    if (typeof (command) === "function") {
+        command = t.command(state, testcase.commandArgs);
     }
     var res = runOnDb.runCommand(command);
 
     if (res.ok == 1 || res.code != authErrCode) {
-        out = "expected authorization failure " + " but received " + tojson(res) +
-            " with privileges " + tojson(privileges);
+        out = "expected authorization failure " +
+            " but received " + tojson(res) + " with privileges " + tojson(privileges);
     }
 
     firstDb.logout();
@@ -206,7 +211,8 @@ authCommandsLib.runTests(conn, impls);
 MongoRunner.stopMongod(conn);
 
 // run all tests sharded
-// TODO: Remove 'shardAsReplicaSet: false' when SERVER-32672 is fixed.
+// TODO: SERVER-43897 Make commands_user_defined_roles.js and commands_builtin_roles.js start shards
+// as replica sets.
 conn = new ShardingTest({
     shards: 2,
     mongos: 1,

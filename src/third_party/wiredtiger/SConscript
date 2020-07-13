@@ -8,7 +8,7 @@ Import("endian")
 
 env = env.Clone()
 
-env.InjectThirdPartyIncludePaths(libraries=['snappy', 'zlib'])
+env.InjectThirdParty(libraries=['snappy', 'zlib', 'zstd'])
 
 if endian == "big":
     env.Append(CPPDEFINES=[('WORDS_BIGENDIAN', 1)])
@@ -27,11 +27,11 @@ if debugBuild:
 env.Append(CPPDEFINES=["HAVE_VERBOSE"])
 
 conf = Configure(env)
-if conf.CheckFunc("fallocate", "fcntl.h"):
+if conf.CheckFunc("fallocate"):
     conf.env.Append(CPPDEFINES=[
         "HAVE_FALLOCATE"
     ])
-if conf.CheckFunc("sync_file_range", "fcntl.h"):
+if conf.CheckFunc("sync_file_range"):
     conf.env.Append(CPPDEFINES=[
         "HAVE_SYNC_FILE_RANGE"
     ])
@@ -41,6 +41,10 @@ if env['TARGET_ARCH'] == 'x86_64' and conf.CheckCHeader('x86intrin.h'):
     conf.env.Append(CPPDEFINES=[
         "HAVE_X86INTRIN_H"
     ])
+if conf.CheckCHeader('arm_neon.h'):
+    conf.env.Append(CPPDEFINES=[
+        "HAVE_ARM_NEON_INTRIN_H"
+    ])
 env = conf.Finish();
 
 if env.TargetOSIs('windows'):
@@ -48,8 +52,8 @@ if env.TargetOSIs('windows'):
     env.Append(CFLAGS=[
         "/wd4090" # Ignore warning about mismatched const qualifiers
     ])
-    if env['MONGO_ALLOCATOR'] == 'tcmalloc':
-        env.InjectThirdPartyIncludePaths(libraries=['gperftools'])
+    if env['MONGO_ALLOCATOR'] in ['tcmalloc', 'tcmalloc-experimental']:
+        env.InjectThirdParty(libraries=['gperftools'])
         env.Append(CPPDEFINES=['HAVE_LIBTCMALLOC'])
 elif env.TargetOSIs('darwin'):
     env.Append(CPPPATH=["build_darwin"])
@@ -76,6 +80,7 @@ else:
 
 useZlib = True
 useSnappy = True
+useZstd = True
 
 version_file = 'build_posix/aclocal/version-set.m4'
 
@@ -153,17 +158,21 @@ condition_map = {
     'ZSERIES_HOST' : env['TARGET_ARCH'] == 's390x',
 }
 
-def filtered_filelist(f):
+def filtered_filelist(f, checksum):
     for line in f:
         file_cond = line.split()
         if line.startswith("#") or len(file_cond) == 0:
             continue
         if len(file_cond) == 1 or condition_map.get(file_cond[1], False):
-            yield file_cond[0]
+            if line.startswith('src/checksum/') == checksum:
+                yield file_cond[0]
 
 filelistfile = 'dist/filelist'
 with open(File(filelistfile).srcnode().abspath) as filelist:
-    wtsources = list(filtered_filelist(filelist))
+    wtsources = list(filtered_filelist(filelist, False))
+
+with open(File(filelistfile).srcnode().abspath) as filelist:
+    cssources = list(filtered_filelist(filelist, True))
 
 if useZlib:
     env.Append(CPPDEFINES=['HAVE_BUILTIN_EXTENSION_ZLIB'])
@@ -173,23 +182,54 @@ if useSnappy:
     env.Append(CPPDEFINES=['HAVE_BUILTIN_EXTENSION_SNAPPY'])
     wtsources.append("ext/compressors/snappy/snappy_compress.c")
 
+if useZstd:
+    env.Append(CPPDEFINES=['HAVE_BUILTIN_EXTENSION_ZSTD'])
+    wtsources.append("ext/compressors/zstd/zstd_compress.c")
+
 # Use hardware by default on all platforms if available.
 # If not available at runtime, we fall back to software in some cases.
-#
-# On zSeries we may disable because SLES 11 kernel doe not support the instructions.
-if not (env['TARGET_ARCH'] == 's390x' and get_option("use-s390x-crc32") == "off"):
-    env.Append(CPPDEFINES=["HAVE_CRC32_HARDWARE"])
+if (get_option("use-hardware-crc32") == "off"):
+    env.Append(CPPDEFINES=["HAVE_NO_CRC32_HARDWARE"])
+
+cslib = env.Library(
+    target="wiredtiger_checksum",
+    source=cssources,
+)
 
 wtlib = env.Library(
     target="wiredtiger",
     source=wtsources,
-    LIBDEPS=[
+    LIBDEPS_PRIVATE=[
+        'wiredtiger_checksum',
         '$BUILD_DIR/third_party/shim_snappy',
         '$BUILD_DIR/third_party/shim_zlib',
+        '$BUILD_DIR/third_party/shim_zstd',
     ],
     LIBDEPS_TAGS=[
         'init-no-global-side-effects',
     ],
 )
 
-env.Depends(wtlib, [filelistfile, version_file])
+env.Depends([cslib, wtlib], [filelistfile, version_file])
+
+wtbinEnv = env.Clone()
+
+if wtbinEnv.TargetOSIs("windows"):
+    # C4996: 'strdup': The POSIX name for this item is deprecated. Instead, use the ISO C and C++
+    # conformant name: _strdup. See online help for details.
+    wtbinEnv.Append(CFLAGS=["/wd4996"])
+
+# SCons's smart_link() decides to try and link as C because all of the
+# file extensions are .c; however, we must link with snappy, etc. as
+# C++ if we are not in dynamic mode. The smart_link() function isn't
+# used by default on Windows, so we leave the value unchanged on other
+# platforms. See # https://github.com/SCons/scons/issues/3673.
+if wtbinEnv["LINK"] == "$SMARTLINK" and get_option("link-model") != "dynamic":
+    wtbinEnv["LINK"] = "$CXX"
+
+wtbin = wtbinEnv.Program(
+    target="wt",
+    source=Glob("src/utilities/*.c"),
+    LIBDEPS=["wiredtiger"],
+    AIB_COMPONENT="dist-test",
+)

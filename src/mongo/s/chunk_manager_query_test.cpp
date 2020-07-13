@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,16 +27,19 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
 #include <set>
 
+#include "mongo/db/catalog/catalog_test_fixture.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/s/catalog_cache_test_fixture.h"
 #include "mongo/s/chunk_manager.h"
-#include "mongo/util/log.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
@@ -71,8 +75,18 @@ protected:
             makeChunkManager(kNss, shardKeyPattern, std::move(defaultCollator), false, splitPoints);
 
         std::set<ShardId> shardIds;
-        chunkManager->getShardIdsForQuery(operationContext(), query, queryCollation, &shardIds);
 
+        auto&& cif = [&]() {
+            if (queryCollation.isEmpty()) {
+                return std::unique_ptr<CollatorInterface>{};
+            } else {
+                return uassertStatusOK(CollatorFactoryInterface::get(getServiceContext())
+                                           ->makeFromBSON(queryCollation));
+            }
+        }();
+        auto expCtx =
+            make_intrusive<ExpressionContextForTest>(operationContext(), kNss, std::move(cif));
+        chunkManager->getShardIdsForQuery(expCtx, query, queryCollation, &shardIds);
         _assertShardIdsMatch(expectedShardIds, shardIds);
     }
 
@@ -404,7 +418,7 @@ TEST_F(ChunkManagerQueryTest, CollationStringsMultiShard) {
 TEST_F(ChunkManagerQueryTest, DefaultCollationStringsMultiShard) {
     runQueryTest(
         BSON("a" << 1),
-        stdx::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString),
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString),
         false,
         {BSON("a"
               << "x"),
@@ -422,7 +436,7 @@ TEST_F(ChunkManagerQueryTest, DefaultCollationStringsMultiShard) {
 TEST_F(ChunkManagerQueryTest, SimpleCollationStringsMultiShard) {
     runQueryTest(
         BSON("a" << 1),
-        stdx::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString),
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString),
         false,
         {BSON("a"
               << "x"),
@@ -440,7 +454,7 @@ TEST_F(ChunkManagerQueryTest, SimpleCollationStringsMultiShard) {
 TEST_F(ChunkManagerQueryTest, CollationNumbersMultiShard) {
     runQueryTest(
         BSON("a" << 1),
-        stdx::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString),
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString),
         false,
         {BSON("a"
               << "x"),
@@ -457,7 +471,7 @@ TEST_F(ChunkManagerQueryTest, CollationNumbersMultiShard) {
 TEST_F(ChunkManagerQueryTest, DefaultCollationNumbersMultiShard) {
     runQueryTest(
         BSON("a" << 1),
-        stdx::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString),
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString),
         false,
         {BSON("a"
               << "x"),
@@ -473,7 +487,7 @@ TEST_F(ChunkManagerQueryTest, DefaultCollationNumbersMultiShard) {
 TEST_F(ChunkManagerQueryTest, SimpleCollationNumbersMultiShard) {
     runQueryTest(
         BSON("a" << 1),
-        stdx::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString),
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString),
         false,
         {BSON("a"
               << "x"),
@@ -485,6 +499,40 @@ TEST_F(ChunkManagerQueryTest, SimpleCollationNumbersMultiShard) {
         BSON("locale"
              << "simple"),
         {ShardId("0")});
+}
+
+TEST_F(ChunkManagerQueryTest, SnapshotQueryWithMoreShardsThanLatestMetadata) {
+    const auto epoch = OID::gen();
+    ChunkVersion version(1, 0, epoch);
+
+    ChunkType chunk0(kNss, {BSON("x" << MINKEY), BSON("x" << 0)}, version, ShardId("0"));
+    chunk0.setName(OID::gen());
+
+    version.incMajor();
+    ChunkType chunk1(kNss, {BSON("x" << 0), BSON("x" << MAXKEY)}, version, ShardId("1"));
+    chunk1.setName(OID::gen());
+
+    auto oldRoutingTable = RoutingTableHistory::makeNew(
+        kNss, boost::none, BSON("x" << 1), nullptr, false, epoch, {chunk0, chunk1});
+
+    // Simulate move chunk {x: 0} to shard 0. Effectively moving all remaining chunks to shard 0.
+    version.incMajor();
+    chunk1.setVersion(version);
+    chunk1.setShard(chunk0.getShard());
+    chunk1.setHistory({ChunkHistory(Timestamp(20, 0), ShardId("0")),
+                       ChunkHistory(Timestamp(1, 0), ShardId("1"))});
+
+    auto newRoutingTable = oldRoutingTable->makeUpdated({chunk1});
+    ChunkManager chunkManager(newRoutingTable, Timestamp(5, 0));
+
+    std::set<ShardId> shardIds;
+    chunkManager.getShardIdsForRange(BSON("x" << MINKEY), BSON("x" << MAXKEY), &shardIds);
+    ASSERT_EQ(2, shardIds.size());
+
+    const auto expCtx = make_intrusive<ExpressionContextForTest>();
+    shardIds.clear();
+    chunkManager.getShardIdsForQuery(expCtx, BSON("x" << BSON("$gt" << -20)), {}, &shardIds);
+    ASSERT_EQ(2, shardIds.size());
 }
 
 }  // namespace

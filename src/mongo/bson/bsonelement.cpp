@@ -1,24 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -27,283 +27,246 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/bson/bsonelement.h"
 
 #include <boost/functional/hash.hpp>
 #include <cmath>
+#include <fmt/format.h>
 
 #include "mongo/base/compare_numbers.h"
 #include "mongo/base/data_cursor.h"
+#include "mongo/base/parse_number.h"
 #include "mongo/base/simple_string_data_comparator.h"
+#include "mongo/bson/generator_extended_canonical_2_0_0.h"
+#include "mongo/bson/generator_extended_relaxed_2_0_0.h"
+#include "mongo/bson/generator_legacy_strict.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/strnlen.h"
 #include "mongo/util/base64.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 #include "mongo/util/string_map.h"
-#include "mongo/util/stringutils.h"
 #include "mongo/util/uuid.h"
 
+#if !defined(__has_feature)
+#define __has_feature(x) 0
+#endif
+
 namespace mongo {
-namespace str = mongoutils::str;
 
 using std::dec;
 using std::hex;
 using std::string;
 
-string BSONElement::jsonString(JsonStringFormat format, bool includeFieldNames, int pretty) const {
-    std::stringstream s;
-    if (includeFieldNames)
-        s << '"' << escape(fieldName()) << "\" : ";
+const double BSONElement::kLongLongMaxPlusOneAsDouble =
+    scalbn(1, std::numeric_limits<long long>::digits);
+const long long BSONElement::kLargestSafeLongLongAsDouble =
+    scalbn(1, std::numeric_limits<double>::digits);
+const long long BSONElement::kSmallestSafeLongLongAsDouble =
+    scalbn(-1, std::numeric_limits<double>::digits);
+
+std::string BSONElement::jsonString(JsonStringFormat format,
+                                    bool includeSeparator,
+                                    bool includeFieldNames,
+                                    int pretty,
+                                    size_t writeLimit,
+                                    BSONObj* outTruncationResult) const {
+    fmt::memory_buffer buffer;
+    BSONObj truncation =
+        jsonStringBuffer(format, includeSeparator, includeFieldNames, pretty, buffer, writeLimit);
+    if (outTruncationResult) {
+        *outTruncationResult = truncation;
+    }
+    return fmt::to_string(buffer);
+}
+
+BSONObj BSONElement::jsonStringBuffer(JsonStringFormat format,
+                                      bool includeSeparator,
+                                      bool includeFieldNames,
+                                      int pretty,
+                                      fmt::memory_buffer& buffer,
+                                      size_t writeLimit) const {
+    auto withGenerator = [&](auto&& gen) {
+        return jsonStringGenerator(
+            gen, includeSeparator, includeFieldNames, pretty, buffer, writeLimit);
+    };
+    if (format == ExtendedCanonicalV2_0_0)
+        return withGenerator(ExtendedCanonicalV200Generator());
+    else if (format == ExtendedRelaxedV2_0_0)
+        return withGenerator(ExtendedRelaxedV200Generator(dateFormatIsLocalTimezone()));
+    else if (format == LegacyStrict) {
+        return withGenerator(LegacyStrictGenerator());
+    } else {
+        MONGO_UNREACHABLE;
+    }
+}
+
+template <typename Generator>
+BSONObj BSONElement::_jsonStringGenerator(const Generator& g,
+                                          bool includeSeparator,
+                                          bool includeFieldNames,
+                                          int pretty,
+                                          fmt::memory_buffer& buffer,
+                                          size_t writeLimit) const {
+    size_t before = buffer.size();
+    if (includeSeparator)
+        buffer.push_back(',');
+    if (pretty)
+        fmt::format_to(buffer, "\n{:<{}}", "", (pretty - 1) * 4);
+
+    if (includeFieldNames) {
+        g.writePadding(buffer);
+        g.writeString(buffer, fieldNameStringData());
+        g.writePadding(buffer);
+        buffer.push_back(':');
+        if (pretty)
+            buffer.push_back(' ');
+    }
+
+    g.writePadding(buffer);
+
     switch (type()) {
         case mongo::String:
+            g.writeString(buffer, StringData(valuestr(), valuestrsize() - 1));
+            break;
         case Symbol:
-            s << '"' << escape(string(valuestr(), valuestrsize() - 1)) << '"';
+            g.writeSymbol(buffer, StringData(valuestr(), valuestrsize() - 1));
             break;
         case NumberLong:
-            if (format == TenGen) {
-                s << "NumberLong(" << _numberLong() << ")";
-            } else {
-                s << "{ \"$numberLong\" : \"" << _numberLong() << "\" }";
-            }
+            g.writeInt64(buffer, _numberLong());
             break;
         case NumberInt:
-            if (format == TenGen) {
-                s << "NumberInt(" << _numberInt() << ")";
-                break;
-            }
+            g.writeInt32(buffer, _numberInt());
+            break;
         case NumberDouble:
-            if (number() >= -std::numeric_limits<double>::max() &&
-                number() <= std::numeric_limits<double>::max()) {
-                s.precision(16);
-                s << number();
-            }
-            // This is not valid JSON, but according to RFC-4627, "Numeric values that cannot be
-            // represented as sequences of digits (such as Infinity and NaN) are not permitted." so
-            // we are accepting the fact that if we have such values we cannot output valid JSON.
-            else if (std::isnan(number())) {
-                s << "NaN";
-            } else if (std::isinf(number())) {
-                s << (number() > 0 ? "Infinity" : "-Infinity");
-            } else {
-                StringBuilder ss;
-                ss << "Number " << number() << " cannot be represented in JSON";
-                string message = ss.str();
-                massert(10311, message.c_str(), false);
-            }
+            g.writeDouble(buffer, number());
             break;
         case NumberDecimal:
-            if (format == TenGen)
-                s << "NumberDecimal(\"";
-            else
-                s << "{ \"$numberDecimal\" : \"";
-            // Recognize again that this is not valid JSON according to RFC-4627.
-            // Also, treat -NaN and +NaN as the same thing for MongoDB.
-            if (numberDecimal().isNaN()) {
-                s << "NaN";
-            } else if (numberDecimal().isInfinite()) {
-                s << (numberDecimal().isNegative() ? "-Infinity" : "Infinity");
-            } else {
-                s << numberDecimal().toString();
-            }
-            if (format == TenGen)
-                s << "\")";
-            else
-                s << "\" }";
+            g.writeDecimal128(buffer, numberDecimal());
             break;
         case mongo::Bool:
-            s << (boolean() ? "true" : "false");
+            g.writeBool(buffer, boolean());
             break;
         case jstNULL:
-            s << "null";
+            g.writeNull(buffer);
             break;
         case Undefined:
-            if (format == Strict) {
-                s << "{ \"$undefined\" : true }";
-            } else {
-                s << "undefined";
+            g.writeUndefined(buffer);
+            break;
+        case Object: {
+            BSONObj truncated =
+                embeddedObject().jsonStringGenerator(g, pretty, false, buffer, writeLimit);
+            if (!truncated.isEmpty()) {
+                BSONObjBuilder builder;
+                builder.append(fieldNameStringData(), truncated);
+                return builder.obj();
             }
-            break;
-        case Object:
-            s << embeddedObject().jsonString(format, pretty);
-            break;
+            // return to not check the write limit below, we're not in a leaf
+            return truncated;
+        }
         case mongo::Array: {
-            if (embeddedObject().isEmpty()) {
-                s << "[]";
-                break;
+            BSONObj truncated =
+                embeddedObject().jsonStringGenerator(g, pretty, true, buffer, writeLimit);
+            if (!truncated.isEmpty()) {
+                BSONObjBuilder builder;
+                builder.append(fieldNameStringData(), truncated);
+                return builder.obj();
             }
-            s << "[ ";
-            BSONObjIterator i(embeddedObject());
-            BSONElement e = i.next();
-            if (!e.eoo()) {
-                int count = 0;
-                while (1) {
-                    if (pretty) {
-                        s << '\n';
-                        for (int x = 0; x < pretty; x++)
-                            s << "  ";
-                    }
-
-                    if (strtol(e.fieldName(), 0, 10) > count) {
-                        s << "undefined";
-                    } else {
-                        s << e.jsonString(format, false, pretty ? pretty + 1 : 0);
-                        e = i.next();
-                    }
-                    count++;
-                    if (e.eoo())
-                        break;
-                    s << ", ";
-                }
-            }
-            s << " ]";
-            break;
+            // return to not check the write limit below, we're not in a leaf
+            return truncated;
         }
-        case DBRef: {
-            if (format == TenGen)
-                s << "Dbref( ";
-            else
-                s << "{ \"$ref\" : ";
-            s << '"' << valuestr() << "\", ";
-            if (format != TenGen)
-                s << "\"$id\" : ";
-            s << '"' << mongo::OID::from(valuestr() + valuestrsize()) << "\" ";
-            if (format == TenGen)
-                s << ')';
-            else
-                s << '}';
+        case DBRef:
+            // valuestrsize() returns the size including the null terminator
+            g.writeDBRef(buffer,
+                         StringData(valuestr(), valuestrsize() - 1),
+                         OID::from(valuestr() + valuestrsize()));
             break;
-        }
         case jstOID:
-            if (format == TenGen) {
-                s << "ObjectId( ";
-            } else {
-                s << "{ \"$oid\" : ";
-            }
-            s << '"' << __oid() << '"';
-            if (format == TenGen) {
-                s << " )";
-            } else {
-                s << " }";
-            }
+            g.writeOID(buffer, __oid());
             break;
         case BinData: {
             ConstDataCursor reader(value());
             const int len = reader.readAndAdvance<LittleEndian<int>>();
             BinDataType type = static_cast<BinDataType>(reader.readAndAdvance<uint8_t>());
-
-            s << "{ \"$binary\" : \"";
-            base64::encode(s, reader.view(), len);
-            s << "\", \"$type\" : \"" << hex;
-            s.width(2);
-            s.fill('0');
-            s << type << dec;
-            s << "\" }";
-            break;
+            g.writeBinData(buffer, StringData(reader.view(), len), type);
         }
-        case mongo::Date:
-            if (format == Strict) {
-                Date_t d = date();
-                s << "{ \"$date\" : ";
-                // The two cases in which we cannot convert Date_t::millis to an ISO Date string are
-                // when the date is too large to format (SERVER-13760), and when the date is before
-                // the epoch (SERVER-11273).  Since Date_t internally stores millis as an unsigned
-                // long long, despite the fact that it is logically signed (SERVER-8573), this check
-                // handles both the case where Date_t::millis is too large, and the case where
-                // Date_t::millis is negative (before the epoch).
-                if (d.isFormattable()) {
-                    s << "\"" << dateToISOStringLocal(date()) << "\"";
-                } else {
-                    s << "{ \"$numberLong\" : \"" << d.toMillisSinceEpoch() << "\" }";
-                }
-                s << " }";
-            } else {
-                s << "Date( ";
-                if (pretty) {
-                    Date_t d = date();
-                    // The two cases in which we cannot convert Date_t::millis to an ISO Date string
-                    // are when the date is too large to format (SERVER-13760), and when the date is
-                    // before the epoch (SERVER-11273).  Since Date_t internally stores millis as an
-                    // unsigned long long, despite the fact that it is logically signed
-                    // (SERVER-8573), this check handles both the case where Date_t::millis is too
-                    // large, and the case where Date_t::millis is negative (before the epoch).
-                    if (d.isFormattable()) {
-                        s << "\"" << dateToISOStringLocal(date()) << "\"";
-                    } else {
-                        // FIXME: This is not parseable by the shell, since it may not fit in a
-                        // float
-                        s << d.toMillisSinceEpoch();
-                    }
-                } else {
-                    s << date().asInt64();
-                }
-                s << " )";
-            }
-            break;
-        case RegEx:
-            if (format == Strict) {
-                s << "{ \"$regex\" : \"" << escape(regex());
-                s << "\", \"$options\" : \"" << regexFlags() << "\" }";
-            } else {
-                s << "/" << escape(regex(), true) << "/";
-                // FIXME Worry about alpha order?
-                for (const char* f = regexFlags(); *f; ++f) {
-                    switch (*f) {
-                        case 'g':
-                        case 'i':
-                        case 'm':
-                            s << *f;
-                        default:
-                            break;
-                    }
-                }
-            }
-            break;
 
+        break;
+        case mongo::Date:
+            g.writeDate(buffer, date());
+            break;
+        case RegEx: {
+            StringData pattern(regex());
+            g.writeRegex(buffer, pattern, StringData(pattern.rawData() + pattern.size() + 1));
+        } break;
         case CodeWScope: {
             BSONObj scope = codeWScopeObject();
             if (!scope.isEmpty()) {
-                s << "{ \"$code\" : \"" << escape(_asCode()) << "\" , "
-                  << "\"$scope\" : " << scope.jsonString() << " }";
+                g.writeCodeWithScope(buffer, _asCode(), scope);
                 break;
             }
+            // fall through if scope is empty
         }
-
         case Code:
-            s << "\"" << escape(_asCode()) << "\"";
+            g.writeCode(buffer, _asCode());
             break;
-
         case bsonTimestamp:
-            if (format == TenGen) {
-                s << "Timestamp( " << durationCount<Seconds>(timestampTime().toDurationSinceEpoch())
-                  << ", " << timestampInc() << " )";
-            } else {
-                s << "{ \"$timestamp\" : { \"t\" : "
-                  << durationCount<Seconds>(timestampTime().toDurationSinceEpoch())
-                  << ", \"i\" : " << timestampInc() << " } }";
-            }
+            g.writeTimestamp(buffer, timestamp());
             break;
-
         case MinKey:
-            s << "{ \"$minKey\" : 1 }";
+            g.writeMinKey(buffer);
             break;
-
         case MaxKey:
-            s << "{ \"$maxKey\" : 1 }";
+            g.writeMaxKey(buffer);
             break;
-
         default:
-            StringBuilder ss;
-            ss << "Cannot create a properly formatted JSON string with "
-               << "element: " << toString() << " of type: " << type();
-            string message = ss.str();
-            massert(10312, message.c_str(), false);
+            MONGO_UNREACHABLE;
     }
-    return s.str();
+    // If a write limit is enabled and we went over it, record truncation info and roll back buffer.
+    if (writeLimit > 0 && buffer.size() > writeLimit) {
+        buffer.resize(before);
+
+        BSONObjBuilder builder;
+        BSONObjBuilder truncationInfo = builder.subobjStart(fieldNameStringData());
+        truncationInfo.append("type"_sd, typeName(type()));
+        truncationInfo.append("size"_sd, valuesize());
+        truncationInfo.done();
+        return builder.obj();
+    }
+    return BSONObj();
+}
+
+BSONObj BSONElement::jsonStringGenerator(ExtendedCanonicalV200Generator const& generator,
+                                         bool includeSeparator,
+                                         bool includeFieldNames,
+                                         int pretty,
+                                         fmt::memory_buffer& buffer,
+                                         size_t writeLimit) const {
+    return _jsonStringGenerator(
+        generator, includeSeparator, includeFieldNames, pretty, buffer, writeLimit);
+}
+BSONObj BSONElement::jsonStringGenerator(ExtendedRelaxedV200Generator const& generator,
+                                         bool includeSeparator,
+                                         bool includeFieldNames,
+                                         int pretty,
+                                         fmt::memory_buffer& buffer,
+                                         size_t writeLimit) const {
+    return _jsonStringGenerator(
+        generator, includeSeparator, includeFieldNames, pretty, buffer, writeLimit);
+}
+BSONObj BSONElement::jsonStringGenerator(LegacyStrictGenerator const& generator,
+                                         bool includeSeparator,
+                                         bool includeFieldNames,
+                                         int pretty,
+                                         fmt::memory_buffer& buffer,
+                                         size_t writeLimit) const {
+    return _jsonStringGenerator(
+        generator, includeSeparator, includeFieldNames, pretty, buffer, writeLimit);
 }
 
 namespace {
@@ -490,7 +453,7 @@ std::vector<BSONElement> BSONElement::Array() const {
         const char* f = e.fieldName();
 
         unsigned u;
-        Status status = parseNumberFromString(f, &u);
+        Status status = NumberParser{}(f, &u);
         if (status.isOK()) {
             verify(u < 1000000);
             if (u >= v.size())
@@ -544,9 +507,87 @@ bool BSONElement::binaryEqualValues(const BSONElement& rhs) const {
     return (valueSize == 0) || (memcmp(value(), rhs.value(), valueSize) == 0);
 }
 
+StatusWith<long long> BSONElement::parseIntegerElementToNonNegativeLong() const {
+    auto number = parseIntegerElementToLong();
+    if (!number.isOK()) {
+        return number;
+    }
+
+    if (number.getValue() < 0) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream() << "Expected a positive number in: " << toString(true, true));
+    }
+
+    return number;
+}
+
+StatusWith<long long> BSONElement::parseIntegerElementToLong() const {
+    if (!isNumber()) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream() << "Expected a number in: " << toString(true, true));
+    }
+
+    long long number = 0;
+    if (type() == BSONType::NumberDouble) {
+        auto eDouble = numberDouble();
+
+        // NaN doubles are rejected.
+        if (std::isnan(eDouble)) {
+            return Status(ErrorCodes::FailedToParse,
+                          str::stream()
+                              << "Expected an integer, but found NaN in: " << toString(true, true));
+        }
+
+        // No integral doubles that are too large to be represented as a 64 bit signed integer.
+        // We use 'kLongLongMaxAsDouble' because if we just did eDouble > 2^63-1, it would be
+        // compared against 2^63. eDouble=2^63 would not get caught that way.
+        if (eDouble >= kLongLongMaxPlusOneAsDouble ||
+            eDouble < std::numeric_limits<long long>::min()) {
+            return Status(ErrorCodes::FailedToParse,
+                          str::stream()
+                              << "Cannot represent as a 64-bit integer: " << toString(true, true));
+        }
+
+        // This checks if elem is an integral double.
+        if (eDouble != static_cast<double>(static_cast<long long>(eDouble))) {
+            return Status(ErrorCodes::FailedToParse,
+                          str::stream() << "Expected an integer: " << toString(true, true));
+        }
+
+        number = numberLong();
+    } else if (type() == BSONType::NumberDecimal) {
+        uint32_t signalingFlags = Decimal128::kNoFlag;
+        number = numberDecimal().toLongExact(&signalingFlags);
+        if (signalingFlags != Decimal128::kNoFlag) {
+            return Status(ErrorCodes::FailedToParse,
+                          str::stream()
+                              << "Cannot represent as a 64-bit integer: " << toString(true, true));
+        }
+    } else {
+        number = numberLong();
+    }
+
+    return number;
+}
+
+StatusWith<int> BSONElement::parseIntegerElementToInt() const {
+    auto parsedLong = parseIntegerElementToLong();
+    if (!parsedLong.isOK()) {
+        return parsedLong.getStatus();
+    }
+
+    auto valueLong = parsedLong.getValue();
+    if (valueLong < std::numeric_limits<int>::min() ||
+        valueLong > std::numeric_limits<int>::max()) {
+        return {ErrorCodes::FailedToParse,
+                str::stream() << "Cannot represent " << toString(true, true) << " in an int"};
+    }
+    return static_cast<int>(valueLong);
+}
+
 BSONObj BSONElement::embeddedObjectUserCheck() const {
     if (MONGO_likely(isABSONObj()))
-        return BSONObj(value());
+        return BSONObj(value(), BSONObj::LargeSizeTrait{});
     std::stringstream ss;
     ss << "invalid parameter: expected an object (" << fieldName() << ")";
     uasserted(10065, ss.str());
@@ -555,7 +596,7 @@ BSONObj BSONElement::embeddedObjectUserCheck() const {
 
 BSONObj BSONElement::embeddedObject() const {
     verify(isABSONObj());
-    return BSONObj(value());
+    return BSONObj(value(), BSONObj::LargeSizeTrait{});
 }
 
 BSONObj BSONElement::codeWScopeObject() const {
@@ -591,15 +632,48 @@ BSONElement BSONElement::operator[](StringData field) const {
 }
 
 namespace {
-NOINLINE_DECL void msgAssertedBadType[[noreturn]](int8_t type) {
-    msgasserted(10320, str::stream() << "BSONElement: bad type " << (int)type);
+MONGO_COMPILER_NOINLINE void msgAssertedBadType [[noreturn]] (const char* data) {
+    // We intentionally read memory that may be out of the allocated memory's boundary, so do not
+    // do this when the adress sanitizer is enabled. We do this in an attempt to log as much context
+    // about the failure, even if that risks undefined behavior or a segmentation fault.
+#if !__has_feature(address_sanitizer)
+    bool logMemory = true;
+#else
+    bool logMemory = false;
+#endif
+
+    str::stream output;
+    if (!logMemory) {
+        output << fmt::format("BSONElement: bad type {0:d} @ {1:p}", *data, data);
+    } else {
+        // To reduce the risk of a segmentation fault, only print the bytes in the 32-bit aligned
+        // block in which the address is located (i.e. round down to the lowest multiple of 32). The
+        // hope is that it's safe to read memory that may fall within the same cache line. Generate
+        // a mask to zero-out the last bits for a block-aligned address.
+        // Ex: Inverse of 0x1F (32 - 1) looks like 0xFFFFFFE0, and ANDed with the pointer, zeroes
+        // the lowest 5 bits, giving the starting address of a 32-bit block.
+        const size_t blockSize = 32;
+        const size_t mask = ~(blockSize - 1);
+        const char* startAddr =
+            reinterpret_cast<const char*>(reinterpret_cast<uintptr_t>(data) & mask);
+        const size_t offset = data - startAddr;
+
+        output << fmt::format(
+            "BSONElement: bad type {0:d} @ {1:p} at offset {2:d} in block: ", *data, data, offset);
+
+        for (size_t i = 0; i < blockSize; i++) {
+            output << fmt::format("{0:#x} ", static_cast<uint8_t>(startAddr[i]));
+        }
+    }
+    msgasserted(10320, output);
 }
 }  // namespace
-int BSONElement::computeSize() const {
+
+int BSONElement::computeSize(int8_t type, const char* elem, int fieldNameSize) {
     enum SizeStyle : uint8_t {
         kFixed,         // Total size is a fixed amount + key length.
         kIntPlusFixed,  // Like Fixed, but also add in the int32 immediately following the key.
-        kRegEx,         // Handled specially.
+        kSpecial,       // Handled specially: RegEx, MinKey, MaxKey.
     };
     struct SizeInfo {
         uint8_t style : 2;
@@ -607,8 +681,8 @@ int BSONElement::computeSize() const {
     };
     MONGO_STATIC_ASSERT(sizeof(SizeInfo) == 1);
 
-    // This table should take 20 bytes. Align to next power of 2 to avoid splitting across cache
-    // lines unnecessarily.
+    // This table should take 32 bytes. Align to that size to avoid splitting across cache lines
+    // unnecessarily.
     static constexpr SizeInfo kSizeInfoTable alignas(32)[] = {
         {SizeStyle::kFixed, 1},          // EOO
         {SizeStyle::kFixed, 9},          // NumberDouble
@@ -621,7 +695,7 @@ int BSONElement::computeSize() const {
         {SizeStyle::kFixed, 2},          // Bool
         {SizeStyle::kFixed, 9},          // Date
         {SizeStyle::kFixed, 1},          // Null
-        {SizeStyle::kRegEx},             // Regex
+        {SizeStyle::kSpecial},           // Regex
         {SizeStyle::kIntPlusFixed, 17},  // DBRef
         {SizeStyle::kIntPlusFixed, 5},   // Code
         {SizeStyle::kIntPlusFixed, 5},   // Symbol
@@ -630,38 +704,47 @@ int BSONElement::computeSize() const {
         {SizeStyle::kFixed, 9},          // Timestamp
         {SizeStyle::kFixed, 9},          // Long
         {SizeStyle::kFixed, 17},         // Decimal
+        {SizeStyle::kSpecial},           // reserved 20
+        {SizeStyle::kSpecial},           // reserved 21
+        {SizeStyle::kSpecial},           // reserved 22
+        {SizeStyle::kSpecial},           // reserved 23
+        {SizeStyle::kSpecial},           // reserved 24
+        {SizeStyle::kSpecial},           // reserved 25
+        {SizeStyle::kSpecial},           // reserved 26
+        {SizeStyle::kSpecial},           // reserved 27
+        {SizeStyle::kSpecial},           // reserved 28
+        {SizeStyle::kSpecial},           // reserved 29
+        {SizeStyle::kSpecial},           // reserved 30
+        {SizeStyle::kSpecial},           // MinKey,  MaxKey
     };
-    MONGO_STATIC_ASSERT((sizeof(kSizeInfoTable) / sizeof(kSizeInfoTable[0])) == JSTypeMax + 1);
+    MONGO_STATIC_ASSERT(sizeof(kSizeInfoTable) == 32);
 
-    // This is the start of the runtime code for this function. Everything above happens at compile
-    // time. This function attempts to push complex handling of unlikely events out-of-line to
-    // ensure that the common cases never need to spill any registers (at least on x64 with
-    // gcc-5.4), which reduces the function call overhead.
-    int8_t type = *data;
-    if (MONGO_unlikely(type < 0 || type > JSTypeMax)) {
-        if (MONGO_unlikely(type != MinKey && type != MaxKey)) {
-            msgAssertedBadType(type);
-        }
-
-        // MinKey and MaxKey should be treated the same as Null
-        type = jstNULL;
+    // This function attempts to push complex handling of unlikely events out-of-line to ensure that
+    // the common cases never need to spill any registers, which reduces the function call overhead.
+    // Most invalid types have type != sizeInfoIndex and fall through to the cold path, as do RegEx,
+    // MinKey, MaxKey and the remaining invalid types mapping to SizeStyle::kSpecial.
+    int sizeInfoIndex = type % sizeof(kSizeInfoTable);
+    const auto sizeInfo = kSizeInfoTable[sizeInfoIndex];
+    if (MONGO_likely(type == sizeInfoIndex)) {
+        if (sizeInfo.style == SizeStyle::kFixed)
+            return sizeInfo.bytes + fieldNameSize;
+        if (MONGO_likely(sizeInfo.style == SizeStyle::kIntPlusFixed))
+            return sizeInfo.bytes + fieldNameSize +
+                ConstDataView(elem + fieldNameSize + 1).read<LittleEndian<int32_t>>();
     }
 
-    const auto sizeInfo = kSizeInfoTable[type];
-    if (sizeInfo.style == SizeStyle::kFixed)
-        return sizeInfo.bytes + fieldNameSize();
-    if (MONGO_likely(sizeInfo.style == SizeStyle::kIntPlusFixed))
-        return sizeInfo.bytes + fieldNameSize() + valuestrsize();
+    // The following code handles all special cases: MinKey, MaxKey, RegEx and invalid types.
+    if (type == MaxKey || type == MinKey)
+        return fieldNameSize + 1;
+    if (type != BSONType::RegEx)
+        msgAssertedBadType(elem);
 
-    return [this, type]() NOINLINE_DECL {
-        // Regex is two c-strings back-to-back.
-        invariant(type == BSONType::RegEx);
-        const char* p = value();
-        size_t len1 = strlen(p);
-        p = p + len1 + 1;
-        size_t len2 = strlen(p);
-        return (len1 + 1 + len2 + 1) + fieldNameSize() + 1;
-    }();
+    // RegEx is two c-strings back-to-back.
+    const char* p = elem + fieldNameSize + 1;
+    size_t len1 = strlen(p);
+    p = p + len1 + 1;
+    size_t len2 = strlen(p);
+    return (len1 + 1 + len2 + 1) + fieldNameSize + 1;
 }
 
 std::string BSONElement::toString(bool includeFieldName, bool full) const {
@@ -818,7 +901,7 @@ std::string BSONElement::_asCode() const {
             return std::string(codeWScopeCode(),
                                ConstDataView(valuestr()).read<LittleEndian<int>>() - 1);
         default:
-            log() << "can't convert type: " << (int)(type()) << " to code" << std::endl;
+            LOGV2(20100, "can't convert type: {int_type} to code", "int_type"_attr = (int)(type()));
     }
     uassert(10062, "not code", 0);
     return "";
@@ -833,54 +916,47 @@ StringBuilder& operator<<(StringBuilder& s, const BSONElement& e) {
     return s;
 }
 
-template <>
-bool BSONElement::coerce<std::string>(std::string* out) const {
+bool BSONElement::coerce(std::string* out) const {
     if (type() != mongo::String)
         return false;
     *out = String();
     return true;
 }
 
-template <>
-bool BSONElement::coerce<int>(int* out) const {
+bool BSONElement::coerce(int* out) const {
     if (!isNumber())
         return false;
     *out = numberInt();
     return true;
 }
 
-template <>
-bool BSONElement::coerce<long long>(long long* out) const {
+bool BSONElement::coerce(long long* out) const {
     if (!isNumber())
         return false;
     *out = numberLong();
     return true;
 }
 
-template <>
-bool BSONElement::coerce<double>(double* out) const {
+bool BSONElement::coerce(double* out) const {
     if (!isNumber())
         return false;
     *out = numberDouble();
     return true;
 }
 
-template <>
-bool BSONElement::coerce<Decimal128>(Decimal128* out) const {
+bool BSONElement::coerce(Decimal128* out) const {
     if (!isNumber())
         return false;
     *out = numberDecimal();
     return true;
 }
 
-template <>
-bool BSONElement::coerce<bool>(bool* out) const {
+bool BSONElement::coerce(bool* out) const {
     *out = trueValue();
     return true;
 }
 
-template <>
-bool BSONElement::coerce<std::vector<std::string>>(std::vector<std::string>* out) const {
+bool BSONElement::coerce(std::vector<std::string>* out) const {
     if (type() != mongo::Array)
         return false;
     return Obj().coerceVector<std::string>(out);
@@ -892,7 +968,7 @@ bool BSONObj::coerceVector(std::vector<T>* out) const {
     while (i.more()) {
         BSONElement e = i.next();
         T t;
-        if (!e.coerce<T>(&t))
+        if (!e.coerce(&t))
             return false;
         out->push_back(t);
     }

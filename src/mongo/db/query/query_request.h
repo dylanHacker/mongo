@@ -1,29 +1,30 @@
 /**
- *    Copyright 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -35,6 +36,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/runtime_constants_gen.h"
 #include "mongo/db/query/tailable_mode.h"
 
 namespace mongo {
@@ -50,12 +52,44 @@ class StatusWith;
  */
 class QueryRequest {
 public:
-    static const char kFindCommandName[];
-    static const char kShardVersionField[];
+    // Find command field names.
+    static constexpr auto kFilterField = "filter";
+    static constexpr auto kProjectionField = "projection";
+    static constexpr auto kSortField = "sort";
+    static constexpr auto kHintField = "hint";
+    static constexpr auto kCollationField = "collation";
+    static constexpr auto kSkipField = "skip";
+    static constexpr auto kLimitField = "limit";
+    static constexpr auto kBatchSizeField = "batchSize";
+    static constexpr auto kNToReturnField = "ntoreturn";
+    static constexpr auto kSingleBatchField = "singleBatch";
+    static constexpr auto kMaxField = "max";
+    static constexpr auto kMinField = "min";
+    static constexpr auto kReturnKeyField = "returnKey";
+    static constexpr auto kShowRecordIdField = "showRecordId";
+    static constexpr auto kTailableField = "tailable";
+    static constexpr auto kOplogReplayField = "oplogReplay";
+    static constexpr auto kNoCursorTimeoutField = "noCursorTimeout";
+    static constexpr auto kAwaitDataField = "awaitData";
+    static constexpr auto kPartialResultsField = "allowPartialResults";
+    static constexpr auto kRuntimeConstantsField = "runtimeConstants";
+    static constexpr auto kLetField = "let";
+    static constexpr auto kTermField = "term";
+    static constexpr auto kOptionsField = "options";
+    static constexpr auto kReadOnceField = "readOnce";
+    static constexpr auto kAllowSpeculativeMajorityReadField = "allowSpeculativeMajorityRead";
+    static constexpr auto kRequestResumeTokenField = "$_requestResumeToken";
+    static constexpr auto kResumeAfterField = "$_resumeAfter";
+    static constexpr auto kUse44SortKeys = "_use44SortKeys";
+    static constexpr auto kMaxTimeMSOpOnlyField = "maxTimeMSOpOnly";
 
-    QueryRequest(NamespaceString nss);
+    // Field names for sorting options.
+    static constexpr auto kNaturalSortField = "$natural";
 
-    QueryRequest(CollectionUUID uuid);
+    static constexpr auto kFindCommandName = "find";
+    static constexpr auto kShardVersionField = "shardVersion";
+
+    explicit QueryRequest(NamespaceStringOrUUID nss);
 
     /**
      * Returns a non-OK status if any property of the QR has a bad value (e.g. a negative skip
@@ -78,16 +112,19 @@ public:
 
     /**
      * If _uuid exists for this QueryRequest, use it to update the value of _nss via the
-     * UUIDCatalog associated with opCtx. This should only be called when we hold a DBLock
-     * on the database to which _uuid belongs, if the _uuid is present in the UUIDCatalog.
+     * CollectionCatalog associated with opCtx. This should only be called when we hold a DBLock
+     * on the database to which _uuid belongs, if the _uuid is present in the CollectionCatalog.
      */
     void refreshNSS(OperationContext* opCtx);
 
     /**
      * Converts this QR into a find command.
+     * The withUuid variants make a UUID-based find command instead of a namespace-based ones.
      */
     BSONObj asFindCommand() const;
+    BSONObj asFindCommandWithUuid() const;
     void asFindCommand(BSONObjBuilder* cmdBuilder) const;
+    void asFindCommandWithUuid(BSONObjBuilder* cmdBuilder) const;
 
     /**
      * Converts this QR into an aggregation using $match. If this QR has options that cannot be
@@ -106,39 +143,31 @@ public:
      */
     static bool isTextScoreMeta(BSONElement elt);
 
-    /**
-     * Helper function to validate a sort object.
-     * Returns true if each element satisfies one of:
-     * 1. a number with value 1
-     * 2. a number with value -1
-     * 3. isTextScoreMeta
-     */
-    static bool isValidSortOrder(const BSONObj& sortObj);
-
     // Read preference is attached to commands in "wrapped" form, e.g.
     //   { $query: { <cmd>: ... } , <kWrappedReadPrefField>: { ... } }
     //
     // However, mongos internally "unwraps" the read preference and adds it as a parameter to the
     // command, e.g.
     //  { <cmd>: ... , <kUnwrappedReadPrefField>: { <kWrappedReadPrefField>: { ... } } }
-    static const std::string kWrappedReadPrefField;
-    static const std::string kUnwrappedReadPrefField;
+    static constexpr auto kWrappedReadPrefField = "$readPreference";
+    static constexpr auto kUnwrappedReadPrefField = "$queryOptions";
 
     // Names of the maxTimeMS command and query option.
     // Char arrays because they are used in static initialization.
-    static const char cmdOptionMaxTimeMS[];
-    static const char queryOptionMaxTimeMS[];
+    static constexpr auto cmdOptionMaxTimeMS = "maxTimeMS";
+    static constexpr auto queryOptionMaxTimeMS = "$maxTimeMS";
 
     // Names of the $meta projection values.
-    static const std::string metaGeoNearDistance;
-    static const std::string metaGeoNearPoint;
-    static const std::string metaIndexKey;
-    static const std::string metaRecordId;
-    static const std::string metaSortKey;
-    static const std::string metaTextScore;
+    static constexpr auto metaGeoNearDistance = "geoNearDistance";
+    static constexpr auto metaGeoNearPoint = "geoNearPoint";
+    static constexpr auto metaRecordId = "recordId";
+    static constexpr auto metaSortKey = "sortKey";
+    static constexpr auto metaTextScore = "textScore";
+
+    // Allow using disk during the find command.
+    static constexpr auto kAllowDiskUseField = "allowDiskUse";
 
     const NamespaceString& nss() const {
-        invariant(!_nss.isEmpty());
         return _nss;
     }
 
@@ -175,7 +204,12 @@ public:
     }
 
     const BSONObj& getReadConcern() const {
-        return _readConcern;
+        if (_readConcern) {
+            return *_readConcern;
+        } else {
+            static const auto empty = BSONObj();
+            return empty;
+        }
     }
 
     void setReadConcern(BSONObj readConcern) {
@@ -190,7 +224,7 @@ public:
         _collation = collation.getOwned();
     }
 
-    static const long long kDefaultBatchSize;
+    static constexpr auto kDefaultBatchSize = 101ll;
 
     boost::optional<long long> getSkip() const {
         return _skip;
@@ -238,6 +272,14 @@ public:
         _wantMore = wantMore;
     }
 
+    bool allowDiskUse() const {
+        return _allowDiskUse;
+    }
+
+    void setAllowDiskUse(bool allowDiskUse) {
+        _allowDiskUse = allowDiskUse;
+    }
+
     bool isExplain() const {
         return _explain;
     }
@@ -246,28 +288,12 @@ public:
         _explain = explain;
     }
 
-    const std::string& getComment() const {
-        return _comment;
-    }
-
-    void setComment(const std::string& comment) {
-        _comment = comment;
-    }
-
     const BSONObj& getUnwrappedReadPref() const {
         return _unwrappedReadPref;
     }
 
     void setUnwrappedReadPref(BSONObj unwrappedReadPref) {
         _unwrappedReadPref = unwrappedReadPref.getOwned();
-    }
-
-    int getMaxScan() const {
-        return _maxScan;
-    }
-
-    void setMaxScan(int maxScan) {
-        _maxScan = maxScan;
     }
 
     int getMaxTimeMS() const {
@@ -335,20 +361,28 @@ public:
         return _tailableMode;
     }
 
+    void setRuntimeConstants(RuntimeConstants runtimeConstants) {
+        _runtimeConstants = std::move(runtimeConstants);
+    }
+
+    const boost::optional<RuntimeConstants>& getRuntimeConstants() const {
+        return _runtimeConstants;
+    }
+
+    void setLetParameters(BSONObj letParams) {
+        _letParameters = std::move(letParams);
+    }
+
+    const boost::optional<BSONObj>& getLetParameters() const {
+        return _letParameters;
+    }
+
     bool isSlaveOk() const {
         return _slaveOk;
     }
 
     void setSlaveOk(bool slaveOk) {
         _slaveOk = slaveOk;
-    }
-
-    bool isOplogReplay() const {
-        return _oplogReplay;
-    }
-
-    void setOplogReplay(bool oplogReplay) {
-        _oplogReplay = oplogReplay;
     }
 
     bool isNoCursorTimeout() const {
@@ -383,6 +417,38 @@ public:
         _replicationTerm = replicationTerm;
     }
 
+    bool isReadOnce() const {
+        return _readOnce;
+    }
+
+    void setReadOnce(bool readOnce) {
+        _readOnce = readOnce;
+    }
+
+    void setAllowSpeculativeMajorityRead(bool allowSpeculativeMajorityRead) {
+        _allowSpeculativeMajorityRead = allowSpeculativeMajorityRead;
+    }
+
+    bool allowSpeculativeMajorityRead() const {
+        return _allowSpeculativeMajorityRead;
+    }
+
+    bool getRequestResumeToken() const {
+        return _requestResumeToken;
+    }
+
+    void setRequestResumeToken(bool requestResumeToken) {
+        _requestResumeToken = requestResumeToken;
+    }
+
+    const BSONObj& getResumeAfter() const {
+        return _resumeAfter;
+    }
+
+    void setResumeAfter(BSONObj resumeAfter) {
+        _resumeAfter = resumeAfter;
+    }
+
     /**
      * Return options as a bit vector.
      */
@@ -401,7 +467,7 @@ public:
     /**
      * Parse the provided legacy query object and parameters to construct a QueryRequest.
      */
-    static StatusWith<std::unique_ptr<QueryRequest>> fromLegacyQuery(NamespaceString nss,
+    static StatusWith<std::unique_ptr<QueryRequest>> fromLegacyQuery(NamespaceStringOrUUID nsOrUuid,
                                                                      const BSONObj& queryObj,
                                                                      const BSONObj& proj,
                                                                      int ntoskip,
@@ -421,11 +487,6 @@ private:
     Status initFullQuery(const BSONObj& top);
 
     /**
-     * Updates the projection object with a $meta projection for the returnKey option.
-     */
-    void addReturnKeyMetaProj();
-
-    /**
      * Updates the projection object with a $meta projection for the showRecordId option.
      */
     void addShowRecordIdMetaProj();
@@ -442,6 +503,11 @@ private:
      */
     void addMetaProjection();
 
+    /**
+     * Common code for UUID and namespace-based find commands.
+     */
+    void asFindCommandInternal(BSONObjBuilder* cmdBuilder) const;
+
     NamespaceString _nss;
     OptionalCollectionUUID _uuid;
 
@@ -453,7 +519,7 @@ private:
     // {$hint: <String>}, where <String> is the index name hinted.
     BSONObj _hint;
     // The read concern is parsed elsewhere.
-    BSONObj _readConcern;
+    boost::optional<BSONObj> _readConcern;
     // The collation is parsed elsewhere.
     BSONObj _collation;
 
@@ -461,6 +527,13 @@ private:
     // This object will be empty when no readPreference is specified or if the request does not
     // originate from mongos.
     BSONObj _unwrappedReadPref;
+
+    // If true, each cursor response will include a 'postBatchResumeToken' field containing the
+    // RecordID of the last observed document.
+    bool _requestResumeToken = false;
+    // If non-empty, instructs the query to resume from the RecordId given by the object's $recordId
+    // field.
+    BSONObj _resumeAfter;
 
     bool _wantMore = true;
 
@@ -476,16 +549,14 @@ private:
     // allowed.
     boost::optional<long long> _batchSize;
 
+    bool _allowDiskUse = false;
+
     // Set only when parsed from an OP_QUERY find message. The value is computed by driver or shell
     // and is set to be a min of batchSize and limit provided by user. QR can have set either
     // ntoreturn or batchSize / limit.
     boost::optional<long long> _ntoreturn;
 
     bool _explain = false;
-
-    std::string _comment;
-
-    int _maxScan = 0;
 
     // A user-specified maxTimeMS limit, or a value of '0' if not specified.
     int _maxTimeMS = 0;
@@ -497,13 +568,21 @@ private:
     bool _showRecordId = false;
     bool _hasReadPref = false;
 
+    // Runtime constants which may be referenced by $expr, if present.
+    boost::optional<RuntimeConstants> _runtimeConstants;
+
+    // A document containing user-specified constants. For a find query, these are accessed only
+    // inside $expr.
+    boost::optional<BSONObj> _letParameters;
+
     // Options that can be specified in the OP_QUERY 'flags' header.
     TailableModeEnum _tailableMode = TailableModeEnum::kNormal;
     bool _slaveOk = false;
-    bool _oplogReplay = false;
     bool _noCursorTimeout = false;
     bool _exhaust = false;
     bool _allowPartialResults = false;
+    bool _readOnce = false;
+    bool _allowSpeculativeMajorityRead = false;
 
     boost::optional<long long> _replicationTerm;
 };

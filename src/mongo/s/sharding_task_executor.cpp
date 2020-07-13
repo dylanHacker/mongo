@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,25 +27,25 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/sharding_task_executor.h"
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/operation_time_tracker.h"
 #include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/sharding_metadata.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_last_error_info.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/is_mongos.h"
-#include "mongo/util/log.h"
+#include "mongo/s/transaction_router.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -69,6 +70,10 @@ void ShardingTaskExecutor::join() {
     _executor->join();
 }
 
+SharedSemiFuture<void> ShardingTaskExecutor::joinAsync() {
+    return _executor->joinAsync();
+}
+
 void ShardingTaskExecutor::appendDiagnosticBSON(mongo::BSONObjBuilder* builder) const {
     _executor->appendDiagnosticBSON(builder);
 }
@@ -86,8 +91,8 @@ void ShardingTaskExecutor::signalEvent(const EventHandle& event) {
 }
 
 StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::onEvent(const EventHandle& event,
-                                                                       const CallbackFn& work) {
-    return _executor->onEvent(event, work);
+                                                                       CallbackFn&& work) {
+    return _executor->onEvent(event, std::move(work));
 }
 
 void ShardingTaskExecutor::waitForEvent(const EventHandle& event) {
@@ -100,80 +105,125 @@ StatusWith<stdx::cv_status> ShardingTaskExecutor::waitForEvent(OperationContext*
     return _executor->waitForEvent(opCtx, event, deadline);
 }
 
-StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleWork(
-    const CallbackFn& work) {
-    return _executor->scheduleWork(work);
+StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleWork(CallbackFn&& work) {
+    return _executor->scheduleWork(std::move(work));
 }
 
-StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleWorkAt(
-    Date_t when, const CallbackFn& work) {
-    return _executor->scheduleWorkAt(when, work);
+StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleWorkAt(Date_t when,
+                                                                              CallbackFn&& work) {
+    return _executor->scheduleWorkAt(when, std::move(work));
 }
 
-StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleRemoteCommand(
-    const RemoteCommandRequest& request, const RemoteCommandCallbackFn& cb) {
+StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleRemoteCommandOnAny(
+    const RemoteCommandRequestOnAny& request,
+    const RemoteCommandOnAnyCallbackFn& cb,
+    const BatonHandle& baton) {
 
     // schedule the user's callback if there is not opCtx
     if (!request.opCtx) {
-        return _executor->scheduleRemoteCommand(request, cb);
+        return _executor->scheduleRemoteCommandOnAny(request, cb, baton);
     }
 
-    boost::optional<RemoteCommandRequest> newRequest;
+    boost::optional<RemoteCommandRequestOnAny> requestWithFixedLsid = [&] {
+        boost::optional<RemoteCommandRequestOnAny> newRequest;
 
-    if (request.opCtx->getLogicalSessionId() && !request.cmdObj.hasField("lsid")) {
-        newRequest.emplace(request);
+        if (!request.opCtx->getLogicalSessionId()) {
+            return newRequest;
+        }
+
+        if (request.cmdObj.hasField("lsid")) {
+            auto cmdObjLsid =
+                LogicalSessionFromClient::parse("lsid"_sd, request.cmdObj["lsid"].Obj());
+
+            if (cmdObjLsid.getUid()) {
+                invariant(*cmdObjLsid.getUid() == request.opCtx->getLogicalSessionId()->getUid());
+                return newRequest;
+            }
+
+            newRequest.emplace(request);
+            newRequest->cmdObj = newRequest->cmdObj.removeField("lsid");
+        }
+
+        if (!newRequest) {
+            newRequest.emplace(request);
+        }
 
         BSONObjBuilder bob(std::move(newRequest->cmdObj));
         {
-            // TODO SERVER-33702.
             BSONObjBuilder subbob(bob.subobjStart("lsid"));
             request.opCtx->getLogicalSessionId()->serialize(&subbob);
-        }
-
-        // TODO SERVER-33991.
-        if (request.opCtx->getTxnNumber() && request.cmdObj.hasField("getMore") &&
-            !request.cmdObj.hasField(OperationSessionInfo::kTxnNumberFieldName)) {
-            bob.append(OperationSessionInfo::kTxnNumberFieldName, *(request.opCtx->getTxnNumber()));
+            subbob.done();
         }
 
         newRequest->cmdObj = bob.obj();
-    }
+
+        return newRequest;
+    }();
+
     std::shared_ptr<OperationTimeTracker> timeTracker = OperationTimeTracker::get(request.opCtx);
 
     auto clusterGLE = ClusterLastErrorInfo::get(request.opCtx->getClient());
 
-    auto shardingCb = [timeTracker, clusterGLE, cb](
-        const TaskExecutor::RemoteCommandCallbackArgs& args) {
+    auto shardingCb = [timeTracker,
+                       clusterGLE,
+                       cb,
+                       grid = Grid::get(request.opCtx),
+                       hosts = request.target](
+                          const TaskExecutor::RemoteCommandOnAnyCallbackArgs& args) {
         ON_BLOCK_EXIT([&cb, &args]() { cb(args); });
 
-        // Update replica set monitor info.
-        auto shard = grid.shardRegistry()->getShardForHostNoReload(args.request.target);
-        if (!shard) {
-            LOG(1) << "Could not find shard containing host: " << args.request.target.toString();
-        }
-
         if (!args.response.isOK()) {
+            HostAndPort target;
+
+            if (args.response.target) {
+                target = *args.response.target;
+            } else {
+                target = hosts.front();
+            }
+
+            auto shard = grid->shardRegistry()->getShardForHostNoReload(target);
+
+            if (!shard) {
+                LOGV2_DEBUG(22870,
+                            1,
+                            "Could not find shard containing host: {host}",
+                            "Could not find shard containing host",
+                            "host"_attr = target);
+            }
+
             if (isMongos() && args.response.status == ErrorCodes::IncompatibleWithUpgradedServer) {
-                severe()
-                    << "This mongos server must be upgraded. It is attempting to communicate with "
-                       "an upgraded cluster with which it is incompatible. Error: '"
-                    << args.response.status.toString()
-                    << "' Crashing in order to bring attention to the incompatibility, rather "
-                       "than erroring endlessly.";
-                fassertNoTrace(50710, false);
+                LOGV2_FATAL_NOTRACE(
+                    50710,
+                    "This mongos server must be upgraded. It is attempting to communicate "
+                    "with an upgraded cluster with which it is incompatible. Error: {error} "
+                    "Crashing in order to bring attention to the incompatibility, rather than "
+                    "erroring endlessly.",
+                    "This mongos is attempting to communicate with an upgraded cluster with which "
+                    "it is incompatible, so this mongos should be upgraded. Crashing in order to "
+                    "bring attention to the incompatibility rather than erroring endlessly.",
+                    "error"_attr = args.response.status);
             }
 
             if (shard) {
-                shard->updateReplSetMonitor(args.request.target, args.response.status);
+                shard->updateReplSetMonitor(target, args.response.status);
             }
 
-            LOG(1) << "Error processing the remote request, not updating operationTime or gLE";
+            LOGV2_DEBUG(22871,
+                        1,
+                        "Error processing the remote request, not updating operationTime or gLE",
+                        "error"_attr = args.response.status);
+
             return;
         }
 
+        invariant(args.response.target);
+
+        auto target = *args.response.target;
+
+        auto shard = grid->shardRegistry()->getShardForHostNoReload(target);
+
         if (shard) {
-            shard->updateReplSetMonitor(args.request.target,
-                                        getStatusFromCommandResult(args.response.data));
+            shard->updateReplSetMonitor(target, getStatusFromCommandResult(args.response.data));
         }
 
         // Update the logical clock.
@@ -186,36 +236,54 @@ StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleRemoteCom
 
         // Update getLastError info for the client if we're tracking it.
         if (clusterGLE) {
-            auto swShardingMetadata =
-                rpc::ShardingMetadata::readFromMetadata(args.response.metadata);
+            auto swShardingMetadata = rpc::ShardingMetadata::readFromMetadata(args.response.data);
             if (swShardingMetadata.isOK()) {
                 auto shardingMetadata = std::move(swShardingMetadata.getValue());
 
-                auto shardConn = ConnectionString::parse(args.request.target.toString());
+                auto shardConn = ConnectionString::parse(target.toString());
                 if (!shardConn.isOK()) {
-                    severe() << "got bad host string in saveGLEStats: " << args.request.target;
+                    LOGV2_ERROR(22874,
+                                "Could not parse connection string to update getLastError stats: "
+                                "{connectionString}",
+                                "Could not parse connection string to update getLastError stats",
+                                "connectionString"_attr = target);
                 }
 
                 clusterGLE->addHostOpTime(shardConn.getValue(),
                                           HostOpTime(shardingMetadata.getLastOpTime(),
                                                      shardingMetadata.getLastElectionId()));
             } else if (swShardingMetadata.getStatus() != ErrorCodes::NoSuchKey) {
-                warning() << "Got invalid sharding metadata "
-                          << redact(swShardingMetadata.getStatus()) << " metadata object was '"
-                          << redact(args.response.metadata) << "'";
+                LOGV2_WARNING(22872,
+                              "Got invalid sharding metadata {error} "
+                              "metadata object was '{response}'",
+                              "Could not parse sharding metadata from response",
+                              "error"_attr = redact(swShardingMetadata.getStatus()),
+                              "response"_attr = redact(args.response.data));
             }
         }
     };
 
-    return _executor->scheduleRemoteCommand(newRequest ? *newRequest : request, shardingCb);
+    return _executor->scheduleRemoteCommandOnAny(
+        requestWithFixedLsid ? *requestWithFixedLsid : request, shardingCb, baton);
+}
+
+StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleExhaustRemoteCommandOnAny(
+    const RemoteCommandRequestOnAny& request,
+    const RemoteCommandOnAnyCallbackFn& cb,
+    const BatonHandle& baton) {
+    MONGO_UNREACHABLE;
+}
+
+bool ShardingTaskExecutor::hasTasks() {
+    MONGO_UNREACHABLE;
 }
 
 void ShardingTaskExecutor::cancel(const CallbackHandle& cbHandle) {
     _executor->cancel(cbHandle);
 }
 
-void ShardingTaskExecutor::wait(const CallbackHandle& cbHandle) {
-    _executor->wait(cbHandle);
+void ShardingTaskExecutor::wait(const CallbackHandle& cbHandle, Interruptible* interruptible) {
+    _executor->wait(cbHandle, interruptible);
 }
 
 void ShardingTaskExecutor::appendConnectionStats(ConnectionPoolStats* stats) const {

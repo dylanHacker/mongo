@@ -1,32 +1,31 @@
 /**
-*    Copyright (C) 2012 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
-
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #include "mongo/platform/basic.h"
 
@@ -35,8 +34,7 @@
 #include <string>
 #include <vector>
 
-#include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/authorization_manager_global.h"
+#include "mongo/base/shim.h"
 #include "mongo/db/auth/authz_session_external_state_s.h"
 #include "mongo/db/auth/user_document_parser.h"
 #include "mongo/db/auth/user_management_commands_parser.h"
@@ -45,11 +43,11 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/grid.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/net/ssl_types.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
+
 namespace {
 
 /**
@@ -89,16 +87,14 @@ Status AuthzManagerExternalStateMongos::initialize(OperationContext* opCtx) {
 
 std::unique_ptr<AuthzSessionExternalState>
 AuthzManagerExternalStateMongos::makeAuthzSessionExternalState(AuthorizationManager* authzManager) {
-    return stdx::make_unique<AuthzSessionExternalStateMongos>(authzManager);
+    return std::make_unique<AuthzSessionExternalStateMongos>(authzManager);
 }
 
 Status AuthzManagerExternalStateMongos::getStoredAuthorizationVersion(OperationContext* opCtx,
                                                                       int* outVersion) {
-    // Note: we are treating
-    // { 'getParameter' : 1, <authSchemaVersionServerParameter> : 1 }
-    // as a user management command since this is the *only* part of mongos
-    // that runs this command
-    BSONObj getParameterCmd = BSON("getParameter" << 1 << authSchemaVersionServerParameter << 1);
+    // NOTE: We are treating the command "{ 'getParameter' : 1, 'authSchemaVersion' : 1 }" as a user
+    // management command since this is the *only* part of mongos that runs this command.
+    BSONObj getParameterCmd = BSON("getParameter" << 1 << "authSchemaVersion" << 1);
     BSONObjBuilder builder;
     const bool ok = Grid::get(opCtx)->catalogClient()->runUserManagementReadCommand(
         opCtx, "admin", getParameterCmd, &builder);
@@ -107,7 +103,7 @@ Status AuthzManagerExternalStateMongos::getStoredAuthorizationVersion(OperationC
         return getStatusFromCommandResult(cmdResult);
     }
 
-    BSONElement versionElement = cmdResult[authSchemaVersionServerParameter];
+    BSONElement versionElement = cmdResult["authSchemaVersion"];
     if (versionElement.eoo()) {
         return Status(ErrorCodes::UnknownError, "getParameter misbehaved.");
     }
@@ -117,20 +113,17 @@ Status AuthzManagerExternalStateMongos::getStoredAuthorizationVersion(OperationC
 }
 
 Status AuthzManagerExternalStateMongos::getUserDescription(OperationContext* opCtx,
-                                                           const UserName& userName,
+                                                           const UserRequest& user,
                                                            BSONObj* result) {
-    if (!shouldUseRolesFromConnection(opCtx, userName)) {
+    const UserName& userName = user.name;
+    if (!user.roles) {
         BSONObj usersInfoCmd =
             BSON("usersInfo" << BSON_ARRAY(BSON(AuthorizationManager::USER_NAME_FIELD_NAME
                                                 << userName.getUser()
                                                 << AuthorizationManager::USER_DB_FIELD_NAME
                                                 << userName.getDB()))
-                             << "showPrivileges"
-                             << true
-                             << "showCredentials"
-                             << true
-                             << "showAuthenticationRestrictions"
-                             << true);
+                             << "showPrivileges" << true << "showCredentials" << true
+                             << "showAuthenticationRestrictions" << true);
         BSONObjBuilder builder;
         const bool ok = Grid::get(opCtx)->catalogClient()->runUserManagementReadCommand(
             opCtx, "admin", usersInfoCmd, &builder);
@@ -147,10 +140,9 @@ Status AuthzManagerExternalStateMongos::getUserDescription(OperationContext* opC
 
         if (foundUsers.size() > 1) {
             return Status(ErrorCodes::UserDataInconsistent,
-                          str::stream() << "Found multiple users on the \"" << userName.getDB()
-                                        << "\" database with name \""
-                                        << userName.getUser()
-                                        << "\"");
+                          str::stream()
+                              << "Found multiple users on the \"" << userName.getDB()
+                              << "\" database with name \"" << userName.getUser() << "\"");
         }
         *result = foundUsers[0].Obj().getOwned();
         return Status::OK();
@@ -158,12 +150,10 @@ Status AuthzManagerExternalStateMongos::getUserDescription(OperationContext* opC
         // Obtain privilege information from the config servers for all roles acquired from the X509
         // certificate.
         BSONArrayBuilder userRolesBuilder;
-        auto& sslPeerInfo = SSLPeerInfo::forSession(opCtx->getClient()->session());
-        for (const RoleName& role : sslPeerInfo.roles) {
-            userRolesBuilder.append(BSON(AuthorizationManager::ROLE_NAME_FIELD_NAME
-                                         << role.getRole()
-                                         << AuthorizationManager::ROLE_DB_FIELD_NAME
-                                         << role.getDB()));
+        for (const RoleName& role : *user.roles) {
+            userRolesBuilder.append(BSON(
+                AuthorizationManager::ROLE_NAME_FIELD_NAME
+                << role.getRole() << AuthorizationManager::ROLE_DB_FIELD_NAME << role.getDB()));
         }
         BSONArray providedRoles = userRolesBuilder.arr();
 
@@ -192,16 +182,12 @@ Status AuthzManagerExternalStateMongos::getUserDescription(OperationContext* opC
                 "Recieved malformed response to request for X509 roles from config server");
         }
 
-        *result = BSON("_id" << userName.getUser() << "user" << userName.getUser() << "db"
-                             << userName.getDB()
-                             << "credentials"
-                             << BSON("external" << true)
-                             << "roles"
-                             << BSONArray(cmdResult["roles"].Obj())
-                             << "inheritedRoles"
-                             << BSONArray(cmdResult["inheritedRoles"].Obj())
-                             << "inheritedPrivileges"
-                             << BSONArray(cmdResult["inheritedPrivileges"].Obj()));
+        *result =
+            BSON("_id" << userName.getUser() << "user" << userName.getUser() << "db"
+                       << userName.getDB() << "credentials" << BSON("external" << true) << "roles"
+                       << BSONArray(cmdResult["roles"].Obj()) << "inheritedRoles"
+                       << BSONArray(cmdResult["inheritedRoles"].Obj()) << "inheritedPrivileges"
+                       << BSONArray(cmdResult["inheritedPrivileges"].Obj()));
         return Status::OK();
     }
 }
@@ -213,11 +199,11 @@ Status AuthzManagerExternalStateMongos::getRoleDescription(
     AuthenticationRestrictionsFormat showRestrictions,
     BSONObj* result) {
     BSONObjBuilder rolesInfoCmd;
-    rolesInfoCmd.append("rolesInfo",
-                        BSON_ARRAY(BSON(AuthorizationManager::ROLE_NAME_FIELD_NAME
-                                        << roleName.getRole()
-                                        << AuthorizationManager::ROLE_DB_FIELD_NAME
-                                        << roleName.getDB())));
+    rolesInfoCmd.append(
+        "rolesInfo",
+        BSON_ARRAY(BSON(AuthorizationManager::ROLE_NAME_FIELD_NAME
+                        << roleName.getRole() << AuthorizationManager::ROLE_DB_FIELD_NAME
+                        << roleName.getDB())));
     addShowToBuilder(&rolesInfoCmd, showPrivileges, showRestrictions);
 
     BSONObjBuilder builder;
@@ -236,9 +222,7 @@ Status AuthzManagerExternalStateMongos::getRoleDescription(
     if (foundRoles.size() > 1) {
         return Status(ErrorCodes::RoleDataInconsistent,
                       str::stream() << "Found multiple roles on the \"" << roleName.getDB()
-                                    << "\" database with name \""
-                                    << roleName.getRole()
-                                    << "\"");
+                                    << "\" database with name \"" << roleName.getRole() << "\"");
     }
     *result = foundRoles[0].Obj().getOwned();
     return Status::OK();
@@ -253,8 +237,7 @@ Status AuthzManagerExternalStateMongos::getRolesDescription(
 
     for (const RoleName& roleName : roles) {
         rolesInfoCmdArray << BSON(AuthorizationManager::ROLE_NAME_FIELD_NAME
-                                  << roleName.getRole()
-                                  << AuthorizationManager::ROLE_DB_FIELD_NAME
+                                  << roleName.getRole() << AuthorizationManager::ROLE_DB_FIELD_NAME
                                   << roleName.getDB());
     }
 
@@ -281,7 +264,7 @@ Status AuthzManagerExternalStateMongos::getRolesDescription(
 }
 Status AuthzManagerExternalStateMongos::getRoleDescriptionsForDB(
     OperationContext* opCtx,
-    const std::string& dbname,
+    StringData dbname,
     PrivilegeFormat showPrivileges,
     AuthenticationRestrictionsFormat showRestrictions,
     bool showBuiltinRoles,
@@ -292,7 +275,7 @@ Status AuthzManagerExternalStateMongos::getRoleDescriptionsForDB(
 
     BSONObjBuilder builder;
     const bool ok = Grid::get(opCtx)->catalogClient()->runUserManagementReadCommand(
-        opCtx, dbname, rolesInfoCmd.obj(), &builder);
+        opCtx, dbname.toString(), rolesInfoCmd.obj(), &builder);
     BSONObj cmdResult = builder.obj();
     if (!ok) {
         return getStatusFromCommandResult(cmdResult);
@@ -335,5 +318,16 @@ bool AuthzManagerExternalStateMongos::hasAnyPrivilegeDocuments(OperationContext*
     std::vector<BSONElement> foundRoles = cmdResult["roles"].Array();
     return foundRoles.size() > 0;
 }
+
+namespace {
+
+std::unique_ptr<AuthzManagerExternalState> authzManagerExternalStateCreateImpl() {
+    return std::make_unique<AuthzManagerExternalStateMongos>();
+}
+
+auto authzManagerExternalStateCreateRegistration = MONGO_WEAK_FUNCTION_REGISTRATION(
+    AuthzManagerExternalState::create, authzManagerExternalStateCreateImpl);
+
+}  // namespace
 
 }  // namespace mongo

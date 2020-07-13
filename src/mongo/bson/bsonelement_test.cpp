@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -106,6 +107,232 @@ TEST(BSONElement, TimestampToString) {
     ASSERT_EQ(obj["ts1"].toString(false, false), "Timestamp(50000, 25)");
     ASSERT_EQ(obj["ts2"].toString(false, false), "Timestamp(100000, 1)");
     ASSERT_EQ(obj["ts3"].toString(false, false), "Timestamp(4294967295, 4294967295)");
+}
+
+TEST(BSONElement, ExtractLargeSubObject) {
+    std::int32_t size = 17 * 1024 * 1024;
+    std::vector<char> buffer(size);
+    DataRange bufferRange(&buffer.front(), &buffer.back());
+    ASSERT_OK(bufferRange.writeNoThrow(LittleEndian<int32_t>(size)));
+
+    BSONObj obj(buffer.data(), BSONObj::LargeSizeTrait{});
+
+    BSONObjBuilder bigObjectBuilder;
+    bigObjectBuilder.append("a", obj);
+    BSONObj bigObj = bigObjectBuilder.obj<BSONObj::LargeSizeTrait>();
+
+    BSONElement element = bigObj["a"];
+    ASSERT_EQ(BSONType::Object, element.type());
+
+    BSONObj subObj = element.Obj();
+}
+
+TEST(BSONElement, SafeNumberLongPositiveBound) {
+    BSONObj obj =
+        BSON("kLongLongMaxPlusOneAsDouble"
+             << BSONElement::kLongLongMaxPlusOneAsDouble << "towardsZero"
+             << std::nextafter(BSONElement::kLongLongMaxPlusOneAsDouble, 0.0) << "towardsInfinity"
+             << std::nextafter(BSONElement::kLongLongMaxPlusOneAsDouble,
+                               std::numeric_limits<double>::max())
+             << "positiveInfinity" << std::numeric_limits<double>::infinity());
+
+    // kLongLongMaxPlusOneAsDouble is the least double value that will overflow a 64-bit signed
+    // two's-complement integer. Historically, converting this value with safeNumberLong() would
+    // return the result of casting to double with a C-style cast. That operation is undefined
+    // because of the overflow, but on most platforms we support, it returned the min 64-bit value
+    // (-2^63). The safeNumberLongForHash() function should preserve that behavior indefinitely for
+    // compatibility with on-disk data.
+    ASSERT_EQ(obj["kLongLongMaxPlusOneAsDouble"].safeNumberLongForHash(),
+              std::numeric_limits<long long>::lowest());
+
+    // The safeNumberLong() function clamps kLongLongMaxPlusOneAsDouble to the max 64-bit value
+    // (2^63 - 1).
+    ASSERT_EQ(obj["kLongLongMaxPlusOneAsDouble"].safeNumberLong(),
+              std::numeric_limits<long long>::max());
+
+    // One quantum below kLongLongMaxPlusOneAsDouble is the largest double that safely converts to a
+    // 64-bit signed two-s complement integer. Both safeNumberLong() and safeNumberLongForHash()
+    // convert this using a C or C-style cast, an operation with defined behavior. This conversion
+    // is exact.
+    ASSERT_EQ(obj["towardsZero"].safeNumberLongForHash(), 0x7ffffffffffffc00ll);
+    ASSERT_EQ(obj["towardsZero"].safeNumberLong(), 0x7ffffffffffffc00ll);
+
+    // One quantum above kLongLongMaxPlusOneAsDouble is another number that that is too large to
+    // convert. The safeNumberLong() function has always clamped this value to the max 64-bit value
+    // (2^63 - 1), and that should continue to be the behavior for both safeNumberLong() and
+    // safeNumberLongForHash().
+    ASSERT_EQ(obj["towardsInfinity"].safeNumberLongForHash(),
+              std::numeric_limits<long long>::max());
+    ASSERT_EQ(obj["towardsInfinity"].safeNumberLong(), std::numeric_limits<long long>::max());
+
+    // Both safeNumberLong() and safeNumberLongForHash() also clamp positive infinity to the max
+    // 64-bit value (2^63 - 1).
+    ASSERT_EQ(obj["positiveInfinity"].safeNumberLongForHash(),
+              std::numeric_limits<long long>::max());
+    ASSERT_EQ(obj["positiveInfinity"].safeNumberLong(), std::numeric_limits<long long>::max());
+}
+
+TEST(BSONElement, SafeNumberLongNegativeBound) {
+    // Unlike the max long long value, the least long long value (-2^63) converts exactly to a
+    // double value and can safely be used as a bound to check which double values are in the range
+    // of long long.
+    const double lowestLongLongAsDouble =
+        static_cast<double>(std::numeric_limits<long long>::lowest());
+    BSONObj obj =
+        BSON("lowestLongLongAsDouble"  // This comment forces clang-format to break here.
+             << lowestLongLongAsDouble << "towardsZero"
+             << std::nextafter(lowestLongLongAsDouble, 0.0) << "towardsNegativeInfinity"
+             << std::nextafter(lowestLongLongAsDouble, std::numeric_limits<double>::lowest())
+             << "negativeInfinity" << -std::numeric_limits<double>::infinity());
+
+    ASSERT_EQ(obj["lowestLongLongAsDouble"].safeNumberLongForHash(),
+              std::numeric_limits<long long>::lowest());
+    ASSERT_EQ(obj["lowestLongLongAsDouble"].safeNumberLong(),
+              std::numeric_limits<long long>::lowest());
+
+    ASSERT_EQ(obj["towardsZero"].safeNumberLongForHash(), -0x7ffffffffffffc00);
+    ASSERT_EQ(obj["towardsZero"].safeNumberLong(), -0x7ffffffffffffc00);
+
+    ASSERT_EQ(obj["towardsNegativeInfinity"].safeNumberLongForHash(),
+              std::numeric_limits<long long>::lowest());
+    ASSERT_EQ(obj["towardsNegativeInfinity"].safeNumberLong(),
+              std::numeric_limits<long long>::lowest());
+
+    ASSERT_EQ(obj["negativeInfinity"].safeNumberLongForHash(),
+              std::numeric_limits<long long>::lowest());
+    ASSERT_EQ(obj["negativeInfinity"].safeNumberLong(), std::numeric_limits<long long>::lowest());
+}
+
+TEST(BSONElement, SafeNumberDoublePositiveBound) {
+    BSONObj obj = BSON("kLargestSafeLongLongAsDouble"
+                       << BSONElement::kLargestSafeLongLongAsDouble << "towardsZero"
+                       << BSONElement::kLargestSafeLongLongAsDouble - 1 << "towardsInfinity"
+                       << BSONElement::kLargestSafeLongLongAsDouble + 1 << "positiveInfinity"
+                       << std::numeric_limits<long long>::max());
+
+    ASSERT_EQ(obj["kLargestSafeLongLongAsDouble"].safeNumberDouble(),
+              (double)BSONElement::kLargestSafeLongLongAsDouble);
+    ASSERT_EQ(obj["towardsZero"].safeNumberDouble(),
+              (double)(BSONElement::kLargestSafeLongLongAsDouble - 1));
+    ASSERT_EQ(obj["towardsInfinity"].safeNumberDouble(),
+              (double)BSONElement::kLargestSafeLongLongAsDouble);
+    ASSERT_EQ(obj["positiveInfinity"].safeNumberDouble(),
+              (double)BSONElement::kLargestSafeLongLongAsDouble);
+}
+
+TEST(BSONElement, SafeNumberDoubleNegativeBound) {
+    BSONObj obj =
+        BSON("kSmallestSafeLongLongAsDouble"
+             << BSONElement::kSmallestSafeLongLongAsDouble << "towardsZero"
+             << BSONElement::kSmallestSafeLongLongAsDouble + 1 << "towardsNegativeInfinity"
+             << BSONElement::kSmallestSafeLongLongAsDouble - 1 << "negativeInfinity"
+             << std::numeric_limits<long long>::min());
+
+    ASSERT_EQ(obj["kSmallestSafeLongLongAsDouble"].safeNumberDouble(),
+              (double)BSONElement::kSmallestSafeLongLongAsDouble);
+    ASSERT_EQ(obj["towardsZero"].safeNumberDouble(),
+              (double)(BSONElement::kSmallestSafeLongLongAsDouble + 1));
+    ASSERT_EQ(obj["towardsNegativeInfinity"].safeNumberDouble(),
+              (double)BSONElement::kSmallestSafeLongLongAsDouble);
+    ASSERT_EQ(obj["negativeInfinity"].safeNumberDouble(),
+              (double)BSONElement::kSmallestSafeLongLongAsDouble);
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToNonNegativeLongRejectsNegative) {
+    BSONObj query = BSON("" << -2LL);
+    ASSERT_NOT_OK(query.firstElement().parseIntegerElementToNonNegativeLong());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToLongAcceptsNegative) {
+    BSONObj query = BSON("" << -2LL);
+    auto result = query.firstElement().parseIntegerElementToLong();
+    ASSERT_OK(result.getStatus());
+    ASSERT_EQ(-2LL, result.getValue());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToNonNegativeLongRejectsTooLargeDouble) {
+    BSONObj query = BSON("" << BSONElement::kLongLongMaxPlusOneAsDouble);
+    ASSERT_NOT_OK(query.firstElement().parseIntegerElementToNonNegativeLong());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToLongRejectsTooLargeDouble) {
+    BSONObj query = BSON("" << BSONElement::kLongLongMaxPlusOneAsDouble);
+    ASSERT_NOT_OK(query.firstElement().parseIntegerElementToLong());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToLongRejectsTooLargeNegativeDouble) {
+    BSONObj query = BSON("" << std::numeric_limits<double>::min());
+    ASSERT_NOT_OK(query.firstElement().parseIntegerElementToLong());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToNonNegativeLongRejectsString) {
+    BSONObj query = BSON(""
+                         << "1");
+    ASSERT_NOT_OK(query.firstElement().parseIntegerElementToNonNegativeLong());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToLongRejectsString) {
+    BSONObj query = BSON(""
+                         << "1");
+    ASSERT_NOT_OK(query.firstElement().parseIntegerElementToLong());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToNonNegativeLongRejectsNonIntegralDouble) {
+    BSONObj query = BSON("" << 2.5);
+    ASSERT_NOT_OK(query.firstElement().parseIntegerElementToNonNegativeLong());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToLongRejectsNonIntegralDouble) {
+    BSONObj query = BSON("" << 2.5);
+    ASSERT_NOT_OK(query.firstElement().parseIntegerElementToLong());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToNonNegativeLongRejectsNonIntegralDecimal) {
+    BSONObj query = BSON("" << Decimal128("2.5"));
+    ASSERT_NOT_OK(query.firstElement().parseIntegerElementToNonNegativeLong());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToLongRejectsNonIntegralDecimal) {
+    BSONObj query = BSON("" << Decimal128("2.5"));
+    ASSERT_NOT_OK(query.firstElement().parseIntegerElementToLong());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToNonNegativeLongRejectsLargestDecimal) {
+    BSONObj query = BSON("" << Decimal128(Decimal128::kLargestPositive));
+    ASSERT_NOT_OK(query.firstElement().parseIntegerElementToNonNegativeLong());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToLongRejectsLargestDecimal) {
+    BSONObj query = BSON("" << Decimal128(Decimal128::kLargestPositive));
+    ASSERT_NOT_OK(query.firstElement().parseIntegerElementToLong());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToNonNegativeLongAcceptsZero) {
+    BSONObj query = BSON("" << 0);
+    auto result = query.firstElement().parseIntegerElementToNonNegativeLong();
+    ASSERT_OK(result.getStatus());
+    ASSERT_EQ(result.getValue(), 0LL);
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToLongAcceptsZero) {
+    BSONObj query = BSON("" << 0);
+    auto result = query.firstElement().parseIntegerElementToLong();
+    ASSERT_OK(result.getStatus());
+    ASSERT_EQ(result.getValue(), 0LL);
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToNonNegativeLongAcceptsThree) {
+    BSONObj query = BSON("" << 3.0);
+    auto result = query.firstElement().parseIntegerElementToNonNegativeLong();
+    ASSERT_OK(result.getStatus());
+    ASSERT_EQ(result.getValue(), 3LL);
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToLongAcceptsThree) {
+    BSONObj query = BSON("" << 3.0);
+    auto result = query.firstElement().parseIntegerElementToLong();
+    ASSERT_OK(result.getStatus());
+    ASSERT_EQ(result.getValue(), 3LL);
 }
 
 }  // namespace

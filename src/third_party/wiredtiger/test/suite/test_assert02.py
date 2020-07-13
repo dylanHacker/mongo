@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-2020 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -37,11 +37,11 @@ def timestamp_str(t):
     return '%x' % t
 
 class test_assert02(wttest.WiredTigerTestCase, suite_subprocess):
+    session_config = 'isolation=snapshot'
+
     def test_read_timestamp(self):
-        #if not wiredtiger.timestamp_build() or not wiredtiger.diagnostic_build():
-        #    self.skipTest('requires a timestamp and diagnostic build')
-        if not wiredtiger.timestamp_build():
-            self.skipTest('requires a timestamp build')
+        #if not wiredtiger.diagnostic_build():
+        #    self.skipTest('requires a diagnostic build')
 
         base = 'assert02.'
         base_uri = 'file:' + base
@@ -68,8 +68,7 @@ class test_assert02(wttest.WiredTigerTestCase, suite_subprocess):
         c_never = self.session.open_cursor(uri_never)
         c_none = self.session.open_cursor(uri_none)
         self.session.begin_transaction()
-        self.session.timestamp_transaction(
-            'commit_timestamp=' + timestamp_str(1))
+        self.session.timestamp_transaction('commit_timestamp=' + timestamp_str(1))
         c_always['key1'] = 'value1'
         c_def['key1'] = 'value1'
         c_never['key1'] = 'value1'
@@ -103,7 +102,7 @@ class test_assert02(wttest.WiredTigerTestCase, suite_subprocess):
         msg = "/timestamp set on this transaction/"
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda:self.assertEquals(c_never.search(), 0), msg)
-        self.session.commit_transaction()
+        self.session.rollback_transaction()
         c_always.close()
         c_def.close()
         c_never.close()
@@ -131,7 +130,7 @@ class test_assert02(wttest.WiredTigerTestCase, suite_subprocess):
         msg = "/none set on this transaction/"
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda:self.assertEquals(c_always.search(), 0), msg)
-        self.session.commit_transaction()
+        self.session.rollback_transaction()
         c_always.close()
         c_def.close()
         c_never.close()

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2012-2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -36,6 +37,7 @@
 #include "mongo/s/catalog/type_chunk_base_gen.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/shard_id.h"
+#include "mongo/s/shard_key_pattern.h"
 
 namespace mongo {
 
@@ -50,12 +52,22 @@ class StatusWith;
  */
 class ChunkRange {
 public:
+    static constexpr char kMinKey[] = "min";
+    static constexpr char kMaxKey[] = "max";
+
     ChunkRange(BSONObj minKey, BSONObj maxKey);
 
     /**
      * Parses a chunk range using the format { min: <min bound>, max: <max bound> }.
      */
     static StatusWith<ChunkRange> fromBSON(const BSONObj& obj);
+
+    /**
+     * A throwing version of 'fromBSON'.
+     */
+    static ChunkRange fromBSONThrowing(const BSONObj& obj) {
+        return uassertStatusOK(fromBSON(obj));
+    }
 
     const BSONObj& getMin() const {
         return _minKey;
@@ -64,6 +76,8 @@ public:
     const BSONObj& getMax() const {
         return _maxKey;
     }
+
+    const Status extractKeyPattern(KeyPattern* shardKeyPatternOut) const;
 
     /**
      * Checks whether the specified key is within the bounds of this chunk range.
@@ -74,6 +88,8 @@ public:
      * Writes the contents of this chunk range as { min: <min bound>, max: <max bound> }.
      */
     void append(BSONObjBuilder* builder) const;
+
+    BSONObj toBSON() const;
 
     std::string toString() const;
 
@@ -95,12 +111,24 @@ public:
     boost::optional<ChunkRange> overlapWith(ChunkRange const& other) const;
 
     /**
+     * Returns true if there is any overlap between the two ranges.
+     */
+    bool overlaps(const ChunkRange& other) const;
+
+    /**
      * Returns a range that includes *this and other. If the ranges do not overlap, it includes
      * all the space between, as well.
      */
     ChunkRange unionWith(ChunkRange const& other) const;
 
 private:
+    // For use with IDL parsing - limited to friend access only.
+    ChunkRange() = default;
+
+    // Make the IDL generated parser a friend
+    friend class RangeDeletionTask;
+    friend class MigrationCoordinatorDocument;
+
     BSONObj _minKey;
     BSONObj _maxKey;
 };
@@ -170,7 +198,7 @@ public:
     static const std::string ShardNSPrefix;
 
     // Field names and types in the chunks collections.
-    static const BSONField<std::string> name;
+    static const BSONField<OID> name;
     static const BSONField<BSONObj> minShardID;
     static const BSONField<std::string> ns;
     static const BSONField<BSONObj> min;
@@ -188,8 +216,10 @@ public:
      * Constructs a new ChunkType object from BSON that has the config server's config.chunks
      * collection format.
      *
-     * Also does validation of the contents.
+     * Also does validation of the contents. Note that 'parseFromConfigBSONCommand' does not return
+     * ErrorCodes::NoSuchKey if the '_id' field is missing while 'fromConfigBSON' does.
      */
+    static StatusWith<ChunkType> parseFromConfigBSONCommand(const BSONObj& source);
     static StatusWith<ChunkType> fromConfigBSON(const BSONObj& source);
 
     /**
@@ -212,7 +242,8 @@ public:
      */
     BSONObj toShardBSON() const;
 
-    std::string getName() const;
+    const OID& getName() const;
+    void setName(const OID& id);
 
     /**
      * Getters and setters.
@@ -254,7 +285,7 @@ public:
     }
     void setJumbo(bool jumbo);
 
-    void setHistory(std::vector<ChunkHistory>&& history) {
+    void setHistory(std::vector<ChunkHistory> history) {
         _history = std::move(history);
         if (!_history.empty()) {
             invariant(_shard == _history.front().getShard());
@@ -265,11 +296,6 @@ public:
     }
 
     void addHistoryToBSON(BSONObjBuilder& builder) const;
-
-    /**
-     * Generates chunk id based on the namespace name and the lower bound of the chunk.
-     */
-    static std::string genID(const NamespaceString& nss, const BSONObj& min);
 
     /**
      * Returns OK if all the mandatory fields have been set. Otherwise returns NoSuchKey and
@@ -285,6 +311,8 @@ public:
 private:
     // Convention: (M)andatory, (O)ptional, (S)pecial; (C)onfig, (S)hard.
 
+    // (M)(C)     auto-generated object id
+    boost::optional<OID> _id;
     // (O)(C)     collection this chunk is in
     boost::optional<NamespaceString> _nss;
     // (M)(C)(S)  first key of the range, inclusive

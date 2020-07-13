@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -35,21 +36,23 @@
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
 #include "mongo/db/pipeline/document_source_lookup_change_post_image.h"
 #include "mongo/db/pipeline/document_source_mock.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/field_path.h"
-#include "mongo/db/pipeline/stub_mongo_process_interface.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/pipeline/process_interface/stub_lookup_single_document_process_interface.h"
 
 namespace mongo {
 namespace {
 using boost::intrusive_ptr;
 using std::deque;
 using std::vector;
+
+using MockMongoInterface = StubLookupSingleDocumentProcessInterface;
 
 // This provides access to getExpCtx(), but we'll use a different name for this test suite.
 class DocumentSourceLookupChangePostImageTest : public AggregationContextFixture {
@@ -70,81 +73,9 @@ public:
             tokenData.clusterTime = ts;
             return ResumeToken(tokenData).toDocument();
         }
-        return ResumeToken(ResumeTokenData(ts, Value(Document{{"_id", id}}), testUuid()))
+        return ResumeToken(ResumeTokenData(ts, 0, 0, testUuid(), Value(Document{{"_id", id}})))
             .toDocument();
     }
-};
-
-/**
- * A mock MongoProcessInterface which allows mocking a foreign pipeline.
- */
-class MockMongoInterface final : public StubMongoProcessInterface {
-public:
-    MockMongoInterface(deque<DocumentSource::GetNextResult> mockResults)
-        : _mockResults(std::move(mockResults)) {}
-
-    bool isSharded(OperationContext* opCtx, const NamespaceString& ns) final {
-        return false;
-    }
-
-    StatusWith<std::unique_ptr<Pipeline, PipelineDeleter>> makePipeline(
-        const std::vector<BSONObj>& rawPipeline,
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        const MakePipelineOptions opts = MakePipelineOptions{}) final {
-        auto pipeline = Pipeline::parse(rawPipeline, expCtx);
-        if (!pipeline.isOK()) {
-            return pipeline.getStatus();
-        }
-
-        if (opts.optimize) {
-            pipeline.getValue()->optimizePipeline();
-        }
-
-        if (opts.attachCursorSource) {
-            uassertStatusOK(attachCursorSourceToPipeline(expCtx, pipeline.getValue().get()));
-        }
-
-        return pipeline;
-    }
-
-    Status attachCursorSourceToPipeline(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                        Pipeline* pipeline) final {
-        pipeline->addInitialSource(DocumentSourceMock::create(_mockResults));
-        return Status::OK();
-    }
-
-    boost::optional<Document> lookupSingleDocument(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        const NamespaceString& nss,
-        UUID collectionUUID,
-        const Document& documentKey,
-        boost::optional<BSONObj> readConcern) {
-        // The namespace 'nss' may be different than the namespace on the ExpressionContext in the
-        // case of a change stream on a whole database so we need to make a copy of the
-        // ExpressionContext with the new namespace.
-        auto foreignExpCtx = expCtx->copyWith(nss, collectionUUID, boost::none);
-        auto swPipeline = makePipeline({BSON("$match" << documentKey)}, foreignExpCtx);
-        if (swPipeline == ErrorCodes::NamespaceNotFound) {
-            return boost::none;
-        }
-        auto pipeline = uassertStatusOK(std::move(swPipeline));
-
-        auto lookedUpDocument = pipeline->getNext();
-        if (auto next = pipeline->getNext()) {
-            uasserted(ErrorCodes::TooManyMatchingDocuments,
-                      str::stream() << "found more than one document matching "
-                                    << documentKey.toString()
-                                    << " ["
-                                    << lookedUpDocument->toString()
-                                    << ", "
-                                    << next->toString()
-                                    << "]");
-        }
-        return lookedUpDocument;
-    }
-
-private:
-    deque<DocumentSource::GetNextResult> _mockResults;
 };
 
 TEST_F(DocumentSourceLookupChangePostImageTest, ShouldErrorIfMissingDocumentKeyOnUpdate) {
@@ -154,17 +85,18 @@ TEST_F(DocumentSourceLookupChangePostImageTest, ShouldErrorIfMissingDocumentKeyO
     auto lookupChangeStage = DocumentSourceLookupChangePostImage::create(expCtx);
 
     // Mock its input with a document without a "documentKey" field.
-    auto mockLocalSource = DocumentSourceMock::create(
+    auto mockLocalSource = DocumentSourceMock::createForTest(
         Document{{"_id", makeResumeToken(0)},
                  {"operationType", "update"_sd},
                  {"fullDocument", Document{{"_id", 0}}},
-                 {"ns", Document{{"db", expCtx->ns.db()}, {"coll", expCtx->ns.coll()}}}});
+                 {"ns", Document{{"db", expCtx->ns.db()}, {"coll", expCtx->ns.coll()}}}},
+        expCtx);
 
     lookupChangeStage->setSource(mockLocalSource.get());
 
     // Mock out the foreign collection.
     getExpCtx()->mongoProcessInterface =
-        stdx::make_unique<MockMongoInterface>(deque<DocumentSource::GetNextResult>{});
+        std::make_unique<MockMongoInterface>(deque<DocumentSource::GetNextResult>{});
 
     ASSERT_THROWS_CODE(lookupChangeStage->getNext(), AssertionException, 40578);
 }
@@ -176,17 +108,18 @@ TEST_F(DocumentSourceLookupChangePostImageTest, ShouldErrorIfMissingOperationTyp
     auto lookupChangeStage = DocumentSourceLookupChangePostImage::create(expCtx);
 
     // Mock its input with a document without a "ns" field.
-    auto mockLocalSource = DocumentSourceMock::create(
+    auto mockLocalSource = DocumentSourceMock::createForTest(
         Document{{"_id", makeResumeToken(0)},
                  {"documentKey", Document{{"_id", 0}}},
                  {"fullDocument", Document{{"_id", 0}}},
-                 {"ns", Document{{"db", expCtx->ns.db()}, {"coll", expCtx->ns.coll()}}}});
+                 {"ns", Document{{"db", expCtx->ns.db()}, {"coll", expCtx->ns.coll()}}}},
+        expCtx);
 
     lookupChangeStage->setSource(mockLocalSource.get());
 
     // Mock out the foreign collection.
     getExpCtx()->mongoProcessInterface =
-        stdx::make_unique<MockMongoInterface>(deque<DocumentSource::GetNextResult>{});
+        std::make_unique<MockMongoInterface>(deque<DocumentSource::GetNextResult>{});
 
     ASSERT_THROWS_CODE(lookupChangeStage->getNext(), AssertionException, 40578);
 }
@@ -198,17 +131,19 @@ TEST_F(DocumentSourceLookupChangePostImageTest, ShouldErrorIfMissingNamespace) {
     auto lookupChangeStage = DocumentSourceLookupChangePostImage::create(expCtx);
 
     // Mock its input with a document without a "ns" field.
-    auto mockLocalSource = DocumentSourceMock::create(Document{
-        {"_id", makeResumeToken(0)},
-        {"documentKey", Document{{"_id", 0}}},
-        {"operationType", "update"_sd},
-    });
+    auto mockLocalSource = DocumentSourceMock::createForTest(
+        Document{
+            {"_id", makeResumeToken(0)},
+            {"documentKey", Document{{"_id", 0}}},
+            {"operationType", "update"_sd},
+        },
+        expCtx);
 
     lookupChangeStage->setSource(mockLocalSource.get());
 
     // Mock out the foreign collection.
     getExpCtx()->mongoProcessInterface =
-        stdx::make_unique<MockMongoInterface>(deque<DocumentSource::GetNextResult>{});
+        std::make_unique<MockMongoInterface>(deque<DocumentSource::GetNextResult>{});
 
     ASSERT_THROWS_CODE(lookupChangeStage->getNext(), AssertionException, 40578);
 }
@@ -221,16 +156,17 @@ TEST_F(DocumentSourceLookupChangePostImageTest, ShouldErrorIfNsFieldHasWrongType
 
     // Mock its input with a document without a "ns" field.
     auto mockLocalSource =
-        DocumentSourceMock::create(Document{{"_id", makeResumeToken(0)},
-                                            {"documentKey", Document{{"_id", 0}}},
-                                            {"operationType", "update"_sd},
-                                            {"ns", 4}});
+        DocumentSourceMock::createForTest(Document{{"_id", makeResumeToken(0)},
+                                                   {"documentKey", Document{{"_id", 0}}},
+                                                   {"operationType", "update"_sd},
+                                                   {"ns", 4}},
+                                          expCtx);
 
     lookupChangeStage->setSource(mockLocalSource.get());
 
     // Mock out the foreign collection.
     getExpCtx()->mongoProcessInterface =
-        stdx::make_unique<MockMongoInterface>(deque<DocumentSource::GetNextResult>{});
+        std::make_unique<MockMongoInterface>(deque<DocumentSource::GetNextResult>{});
 
     ASSERT_THROWS_CODE(lookupChangeStage->getNext(), AssertionException, 40578);
 }
@@ -242,17 +178,18 @@ TEST_F(DocumentSourceLookupChangePostImageTest, ShouldErrorIfNsFieldDoesNotMatch
     auto lookupChangeStage = DocumentSourceLookupChangePostImage::create(expCtx);
 
     // Mock its input with a document without a "ns" field.
-    auto mockLocalSource = DocumentSourceMock::create(
+    auto mockLocalSource = DocumentSourceMock::createForTest(
         Document{{"_id", makeResumeToken(0)},
                  {"documentKey", Document{{"_id", 0}}},
                  {"operationType", "update"_sd},
-                 {"ns", Document{{"db", "DIFFERENT"_sd}, {"coll", expCtx->ns.coll()}}}});
+                 {"ns", Document{{"db", "DIFFERENT"_sd}, {"coll", expCtx->ns.coll()}}}},
+        expCtx);
 
     lookupChangeStage->setSource(mockLocalSource.get());
 
     // Mock out the foreign collection.
     getExpCtx()->mongoProcessInterface =
-        stdx::make_unique<MockMongoInterface>(deque<DocumentSource::GetNextResult>{});
+        std::make_unique<MockMongoInterface>(deque<DocumentSource::GetNextResult>{});
 
     ASSERT_THROWS_CODE(lookupChangeStage->getNext(), AssertionException, 40579);
 }
@@ -266,17 +203,18 @@ TEST_F(DocumentSourceLookupChangePostImageTest, ShouldErrorIfDatabaseMismatchOnC
     auto lookupChangeStage = DocumentSourceLookupChangePostImage::create(expCtx);
 
     // Mock its input with a document without a "ns" field.
-    auto mockLocalSource = DocumentSourceMock::create(
+    auto mockLocalSource = DocumentSourceMock::createForTest(
         Document{{"_id", makeResumeToken(0)},
                  {"documentKey", Document{{"_id", 0}}},
                  {"operationType", "update"_sd},
-                 {"ns", Document{{"db", "DIFFERENT"_sd}, {"coll", "irrelevant"_sd}}}});
+                 {"ns", Document{{"db", "DIFFERENT"_sd}, {"coll", "irrelevant"_sd}}}},
+        expCtx);
 
     lookupChangeStage->setSource(mockLocalSource.get());
 
     // Mock out the foreign collection.
     deque<DocumentSource::GetNextResult> mockForeignContents{Document{{"_id", 0}}};
-    expCtx->mongoProcessInterface = stdx::make_unique<MockMongoInterface>(mockForeignContents);
+    expCtx->mongoProcessInterface = std::make_unique<MockMongoInterface>(mockForeignContents);
 
     ASSERT_THROWS_CODE(lookupChangeStage->getNext(), AssertionException, 40579);
 }
@@ -291,13 +229,14 @@ TEST_F(DocumentSourceLookupChangePostImageTest, ShouldPassIfDatabaseMatchesOnCol
 
     // Mock out the foreign collection.
     deque<DocumentSource::GetNextResult> mockForeignContents{Document{{"_id", 0}}};
-    expCtx->mongoProcessInterface = stdx::make_unique<MockMongoInterface>(mockForeignContents);
+    expCtx->mongoProcessInterface = std::make_unique<MockMongoInterface>(mockForeignContents);
 
-    auto mockLocalSource = DocumentSourceMock::create(
+    auto mockLocalSource = DocumentSourceMock::createForTest(
         Document{{"_id", makeResumeToken(0)},
                  {"documentKey", Document{{"_id", 0}}},
                  {"operationType", "update"_sd},
-                 {"ns", Document{{"db", expCtx->ns.db()}, {"coll", "irrelevant"_sd}}}});
+                 {"ns", Document{{"db", expCtx->ns.db()}, {"coll", "irrelevant"_sd}}}},
+        expCtx);
 
     lookupChangeStage->setSource(mockLocalSource.get());
 
@@ -319,11 +258,12 @@ TEST_F(DocumentSourceLookupChangePostImageTest, ShouldErrorIfDocumentKeyIsNotUni
     auto lookupChangeStage = DocumentSourceLookupChangePostImage::create(expCtx);
 
     // Mock its input with an update document.
-    auto mockLocalSource = DocumentSourceMock::create(
+    auto mockLocalSource = DocumentSourceMock::createForTest(
         Document{{"_id", makeResumeToken(0)},
                  {"documentKey", Document{{"_id", 0}}},
                  {"operationType", "update"_sd},
-                 {"ns", Document{{"db", expCtx->ns.db()}, {"coll", expCtx->ns.coll()}}}});
+                 {"ns", Document{{"db", expCtx->ns.db()}, {"coll", expCtx->ns.coll()}}}},
+        expCtx);
 
     lookupChangeStage->setSource(mockLocalSource.get());
 
@@ -331,7 +271,7 @@ TEST_F(DocumentSourceLookupChangePostImageTest, ShouldErrorIfDocumentKeyIsNotUni
     deque<DocumentSource::GetNextResult> foreignCollection = {Document{{"_id", 0}},
                                                               Document{{"_id", 0}}};
     getExpCtx()->mongoProcessInterface =
-        stdx::make_unique<MockMongoInterface>(std::move(foreignCollection));
+        std::make_unique<MockMongoInterface>(std::move(foreignCollection));
 
     ASSERT_THROWS_CODE(
         lookupChangeStage->getNext(), AssertionException, ErrorCodes::TooManyMatchingDocuments);
@@ -344,7 +284,7 @@ TEST_F(DocumentSourceLookupChangePostImageTest, ShouldPropagatePauses) {
     auto lookupChangeStage = DocumentSourceLookupChangePostImage::create(expCtx);
 
     // Mock its input, pausing every other result.
-    auto mockLocalSource = DocumentSourceMock::create(
+    auto mockLocalSource = DocumentSourceMock::createForTest(
         {Document{{"_id", makeResumeToken(0)},
                   {"documentKey", Document{{"_id", 0}}},
                   {"operationType", "insert"_sd},
@@ -355,7 +295,8 @@ TEST_F(DocumentSourceLookupChangePostImageTest, ShouldPropagatePauses) {
                   {"documentKey", Document{{"_id", 1}}},
                   {"operationType", "update"_sd},
                   {"ns", Document{{"db", expCtx->ns.db()}, {"coll", expCtx->ns.coll()}}}},
-         DocumentSource::GetNextResult::makePauseExecution()});
+         DocumentSource::GetNextResult::makePauseExecution()},
+        expCtx);
 
     lookupChangeStage->setSource(mockLocalSource.get());
 
@@ -363,7 +304,7 @@ TEST_F(DocumentSourceLookupChangePostImageTest, ShouldPropagatePauses) {
     deque<DocumentSource::GetNextResult> mockForeignContents{Document{{"_id", 0}},
                                                              Document{{"_id", 1}}};
     getExpCtx()->mongoProcessInterface =
-        stdx::make_unique<MockMongoInterface>(std::move(mockForeignContents));
+        std::make_unique<MockMongoInterface>(std::move(mockForeignContents));
 
     auto next = lookupChangeStage->getNext();
     ASSERT_TRUE(next.isAdvanced());

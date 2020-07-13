@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,8 +31,8 @@
 
 #include "mongo/client/connpool.h"
 #include "mongo/client/global_conn_pool.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/unittest/integration_test.h"
 #include "mongo/unittest/unittest.h"
 
@@ -45,7 +46,7 @@ TEST(ConnectionPoolTest, ConnectionPoolMaxInUseConnectionsTest) {
     auto host = fixture.getServers()[0].toString();
 
     stdx::condition_variable cv;
-    stdx::mutex mutex;
+    auto mutex = MONGO_MAKE_LATCH();
     int counter = 0;
 
     pool.setMaxInUse(2);
@@ -59,7 +60,7 @@ TEST(ConnectionPoolTest, ConnectionPoolMaxInUseConnectionsTest) {
     // Try creating a new one, should block until we release one.
     stdx::thread t([&] {
         {
-            stdx::lock_guard<stdx::mutex> lk(mutex);
+            stdx::lock_guard<Latch> lk(mutex);
             counter++;
         }
 
@@ -68,7 +69,7 @@ TEST(ConnectionPoolTest, ConnectionPoolMaxInUseConnectionsTest) {
         auto conn3 = pool.get(host);
 
         {
-            stdx::lock_guard<stdx::mutex> lk(mutex);
+            stdx::lock_guard<Latch> lk(mutex);
             counter++;
         }
 
@@ -78,7 +79,7 @@ TEST(ConnectionPoolTest, ConnectionPoolMaxInUseConnectionsTest) {
 
     // First thread should be blocked.
     {
-        stdx::unique_lock<stdx::mutex> lk(mutex);
+        stdx::unique_lock<Latch> lk(mutex);
         cv.wait(lk, [&] { return counter == 1; });
     }
 
@@ -86,7 +87,7 @@ TEST(ConnectionPoolTest, ConnectionPoolMaxInUseConnectionsTest) {
     pool.release(host, conn2);
 
     {
-        stdx::unique_lock<stdx::mutex> lk(mutex);
+        stdx::unique_lock<Latch> lk(mutex);
         cv.wait(lk, [&] { return counter == 2; });
     }
 
@@ -124,7 +125,7 @@ TEST(ConnectionPoolTest, ConnectionPoolShutdownLogicTest) {
     auto host = fixture.getServers()[0].toString();
 
     stdx::condition_variable cv;
-    stdx::mutex mutex;
+    auto mutex = MONGO_MAKE_LATCH();
     int counter = 0;
 
     pool.setMaxInUse(2);
@@ -138,7 +139,7 @@ TEST(ConnectionPoolTest, ConnectionPoolShutdownLogicTest) {
     // Attempt to open a new connection, should block.
     stdx::thread t([&] {
         {
-            stdx::lock_guard<stdx::mutex> lk(mutex);
+            stdx::lock_guard<Latch> lk(mutex);
             counter++;
         }
 
@@ -147,7 +148,7 @@ TEST(ConnectionPoolTest, ConnectionPoolShutdownLogicTest) {
         ASSERT_THROWS(pool.get(host), AssertionException);
 
         {
-            stdx::lock_guard<stdx::mutex> lk(mutex);
+            stdx::lock_guard<Latch> lk(mutex);
             counter++;
         }
 
@@ -156,14 +157,14 @@ TEST(ConnectionPoolTest, ConnectionPoolShutdownLogicTest) {
 
     // Wait for new thread to block.
     {
-        stdx::unique_lock<stdx::mutex> lk(mutex);
+        stdx::unique_lock<Latch> lk(mutex);
         cv.wait(lk, [&] { return counter == 1; });
     }
 
     // Shut down the pool, this should unblock our waiting connection.
     pool.shutdown();
     {
-        stdx::unique_lock<stdx::mutex> lk(mutex);
+        stdx::unique_lock<Latch> lk(mutex);
         cv.wait(lk, [&] { return counter == 2; });
     }
 

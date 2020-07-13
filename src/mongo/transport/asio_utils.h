@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,10 +31,12 @@
 
 #include "mongo/base/status.h"
 #include "mongo/base/system_error.h"
+#include "mongo/config.h"
 #include "mongo/util/errno_util.h"
 #include "mongo/util/future.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/sockaddr.h"
+#include "mongo/util/net/ssl_manager.h"
 
 #ifndef _WIN32
 #include <sys/poll.h>
@@ -45,15 +48,13 @@ namespace mongo {
 namespace transport {
 
 inline SockAddr endpointToSockAddr(const asio::generic::stream_protocol::endpoint& endPoint) {
-    struct sockaddr_storage sa = {};
-    memcpy(&sa, endPoint.data(), endPoint.size());
-    SockAddr wrappedAddr(sa, endPoint.size());
+    SockAddr wrappedAddr(endPoint.data(), endPoint.size());
     return wrappedAddr;
 }
 
 // Utility function to turn an ASIO endpoint into a mongo HostAndPort
 inline HostAndPort endpointToHostAndPort(const asio::generic::stream_protocol::endpoint& endPoint) {
-    return HostAndPort(endpointToSockAddr(endPoint));
+    return HostAndPort(endpointToSockAddr(endPoint).toString(true));
 }
 
 inline Status errorCodeToStatus(const std::error_code& ec) {
@@ -70,9 +71,12 @@ inline Status errorCodeToStatus(const std::error_code& ec) {
     if (ec == asio::error::try_again || ec == asio::error::would_block) {
 #endif
         return {ErrorCodes::NetworkTimeout, "Socket operation timed out"};
-    } else if (ec == asio::error::eof || ec == asio::error::connection_reset ||
-               ec == asio::error::network_reset) {
-        return {ErrorCodes::HostUnreachable, "Connection was closed"};
+    } else if (ec == asio::error::eof) {
+        return {ErrorCodes::HostUnreachable, "Connection closed by peer"};
+    } else if (ec == asio::error::connection_reset) {
+        return {ErrorCodes::HostUnreachable, "Connection reset by peer"};
+    } else if (ec == asio::error::network_reset) {
+        return {ErrorCodes::HostUnreachable, "Connection reset by network"};
     }
 
     // If the ec.category() is a mongoErrorCategory() then this error was propogated from
@@ -170,6 +174,153 @@ StatusWith<EventsMask> pollASIOSocket(Socket& socket, EventsMask mask, Milliseco
     }
 }
 
+#ifdef MONGO_CONFIG_SSL
+/**
+ * Peeks at a fragment of a client issued TLS handshake packet. Returns a TLS alert
+ * packet if the client has selected a protocol which has been disabled by the server.
+ */
+template <typename Buffer>
+boost::optional<std::array<std::uint8_t, 7>> checkTLSRequest(const Buffer& buffers) {
+    // This method's caller should have read in at least one MSGHEADER::Value's worth of data.
+    // The fragment we are about to examine must be strictly smaller.
+    static const size_t sizeOfTLSFragmentToRead = 11;
+    invariant(asio::buffer_size(buffers) >= sizeOfTLSFragmentToRead);
+
+    static_assert(sizeOfTLSFragmentToRead < sizeof(MSGHEADER::Value),
+                  "checkTLSRequest's caller read a MSGHEADER::Value, which must be larger than "
+                  "message containing the TLS version");
+
+    /**
+     * The fragment we are to examine is a record, containing a handshake, containing a
+     * ClientHello. We wish to examine the advertised protocol version in the ClientHello.
+     * The following roughly describes the contents of these structures. Note that we do not
+     * need, or wish to, examine the entire ClientHello, we're looking exclusively for the
+     * client_version.
+     *
+     * Below is a rough description of the payload we will be examining. We shall perform some
+     * basic checks to ensure the payload matches these expectations. If it does not, we should
+     * bail out, and not emit protocol version alerts.
+     *
+     * enum {alert(21), handshake(22)} ContentType;
+     * TLSPlaintext {
+     *   ContentType type = handshake(22),
+     *   ProtocolVersion version; // Irrelevant. Clients send the real version in ClientHello.
+     *   uint16 length;
+     *   fragment, see Handshake stuct for contents
+     * ...
+     * }
+     *
+     * enum {client_hello(1)} HandshakeType;
+     * Handshake {
+     *   HandshakeType msg_type = client_hello(1);
+     *   uint24_t length;
+     *   ClientHello body;
+     * }
+     *
+     * ClientHello {
+     *   ProtocolVersion client_version; // <- This is the value we want to extract.
+     * }
+     */
+
+    static const std::uint8_t ContentType_handshake = 22;
+    static const std::uint8_t HandshakeType_client_hello = 1;
+
+    using ProtocolVersion = std::array<std::uint8_t, 2>;
+    static const ProtocolVersion tls10VersionBytes{3, 1};
+    static const ProtocolVersion tls11VersionBytes{3, 2};
+
+    auto request = asio::buffer_cast<const char*>(buffers);
+    auto cdr = ConstDataRangeCursor(request, request + asio::buffer_size(buffers));
+
+    // Parse the record header.
+    // Extract the ContentType from the header, and ensure it is a handshake.
+    StatusWith<std::uint8_t> record_ContentType = cdr.readAndAdvanceNoThrow<std::uint8_t>();
+    if (!record_ContentType.isOK() || record_ContentType.getValue() != ContentType_handshake) {
+        return boost::none;
+    }
+    // Skip the record's ProtocolVersion. Clients tend to send TLS 1.0 in
+    // the record, but then their real protocol version in the enclosed ClientHello.
+    StatusWith<ProtocolVersion> record_protocol_version =
+        cdr.readAndAdvanceNoThrow<ProtocolVersion>();
+    if (!record_protocol_version.isOK()) {
+        return boost::none;
+    }
+    // Parse the record length. It should be be larger than the remaining expected payload.
+    auto record_length = cdr.readAndAdvanceNoThrow<BigEndian<std::uint16_t>>();
+    if (!record_length.isOK() || record_length.getValue() < cdr.length()) {
+        return boost::none;
+    }
+
+    // Parse the handshake header.
+    // Extract the HandshakeType, and ensure it is a ClientHello.
+    StatusWith<std::uint8_t> handshake_type = cdr.readAndAdvanceNoThrow<std::uint8_t>();
+    if (!handshake_type.isOK() || handshake_type.getValue() != HandshakeType_client_hello) {
+        return boost::none;
+    }
+    // Extract the handshake length, and ensure it is larger than the remaining expected
+    // payload. This requires a little work because the packet represents it with a uint24_t.
+    StatusWith<std::array<std::uint8_t, 3>> handshake_length_bytes =
+        cdr.readAndAdvanceNoThrow<std::array<std::uint8_t, 3>>();
+    if (!handshake_length_bytes.isOK()) {
+        return boost::none;
+    }
+    std::uint32_t handshake_length = 0;
+    for (std::uint8_t handshake_byte : handshake_length_bytes.getValue()) {
+        handshake_length <<= 8;
+        handshake_length |= handshake_byte;
+    }
+    if (handshake_length < cdr.length()) {
+        return boost::none;
+    }
+    StatusWith<ProtocolVersion> client_version = cdr.readAndAdvanceNoThrow<ProtocolVersion>();
+    if (!client_version.isOK()) {
+        return boost::none;
+    }
+
+    // Invariant: We read exactly as much data as expected.
+    invariant((cdr.data() - request) == sizeOfTLSFragmentToRead);
+
+    auto isProtocolDisabled = [](SSLParams::Protocols protocol) {
+        const auto& params = getSSLGlobalParams();
+        return std::find(params.sslDisabledProtocols.begin(),
+                         params.sslDisabledProtocols.end(),
+                         protocol) != params.sslDisabledProtocols.end();
+    };
+
+    auto makeTLSProtocolVersionAlert =
+        [](const std::array<std::uint8_t, 2>& versionBytes) -> std::array<std::uint8_t, 7> {
+        /**
+         * The structure for this alert packet is as follows:
+         * TLSPlaintext {
+         *   ContentType type = alert(21);
+         *   ProtocolVersion = versionBytes;
+         *   uint16_t length = 2
+         *   fragment = AlertDescription {
+         *     AlertLevel level = fatal(2);
+         *     AlertDescription = protocol_version(70);
+         *   }
+         *
+         */
+        return std::array<std::uint8_t, 7>{
+            0x15, versionBytes[0], versionBytes[1], 0x00, 0x02, 0x02, 0x46};
+    };
+
+    ProtocolVersion version = client_version.getValue();
+    if (version == tls10VersionBytes && isProtocolDisabled(SSLParams::Protocols::TLS1_0)) {
+        return makeTLSProtocolVersionAlert(version);
+    } else if (client_version == tls11VersionBytes &&
+               isProtocolDisabled(SSLParams::Protocols::TLS1_1)) {
+        return makeTLSProtocolVersionAlert(version);
+    }
+    // TLS1.2 cannot be distinguished from TLS1.3, just by looking at the ProtocolVersion bytes.
+    // TLS 1.3 compatible clients advertise a "supported_versions" extension, which we would
+    // have to extract here.
+    // Hopefully by the time this matters, OpenSSL will properly emit protocol_version alerts.
+
+    return boost::none;
+}
+#endif
+
 /**
  * Pass this to asio functions in place of a callback to have them return a Future<T>. This behaves
  * similarly to asio::use_future_t, however it returns a mongo::Future<T> rather than a
@@ -200,7 +351,7 @@ struct AsyncHandlerHelper {
 template <>
 struct AsyncHandlerHelper<> {
     using Result = void;
-    static void complete(SharedPromise<Result>* promise) {
+    static void complete(Promise<Result>* promise) {
         promise->emplaceValue();
     }
 };
@@ -208,7 +359,7 @@ struct AsyncHandlerHelper<> {
 template <typename Arg>
 struct AsyncHandlerHelper<Arg> {
     using Result = Arg;
-    static void complete(SharedPromise<Result>* promise, Arg arg) {
+    static void complete(Promise<Result>* promise, Arg arg) {
         promise->emplaceValue(arg);
     }
 };
@@ -219,7 +370,7 @@ struct AsyncHandlerHelper<std::error_code, Args...> {
     using Result = typename Helper::Result;
 
     template <typename... Args2>
-    static void complete(SharedPromise<Result>* promise, std::error_code ec, Args2&&... args) {
+    static void complete(Promise<Result>* promise, std::error_code ec, Args2&&... args) {
         if (ec) {
             promise->setError(errorCodeToStatus(ec));
         } else {
@@ -231,7 +382,7 @@ struct AsyncHandlerHelper<std::error_code, Args...> {
 template <>
 struct AsyncHandlerHelper<std::error_code> {
     using Result = void;
-    static void complete(SharedPromise<Result>* promise, std::error_code ec) {
+    static void complete(Promise<Result>* promise, std::error_code ec) {
         if (ec) {
             promise->setError(errorCodeToStatus(ec));
         } else {
@@ -252,7 +403,7 @@ struct AsyncHandler {
         Helper::complete(&promise, std::forward<Args2>(args)...);
     }
 
-    SharedPromise<Result> promise;
+    Promise<Result> promise;
 };
 
 template <typename... Args>
@@ -262,9 +413,9 @@ struct AsyncResult {
     using return_type = Future<RealResult>;
 
     explicit AsyncResult(completion_handler_type& handler) {
-        Promise<RealResult> promise;
-        fut = promise.getFuture();
-        handler.promise = promise.share();
+        auto pf = makePromiseFuture<RealResult>();
+        fut = std::move(pf.future);
+        handler.promise = std::move(pf.promise);
     }
 
     auto get() {

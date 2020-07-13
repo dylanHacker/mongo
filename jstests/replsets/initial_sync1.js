@@ -11,6 +11,11 @@
  * 9. Bring #2 back up
  * 10. Insert some stuff
  * 11. Everyone happy eventually
+ *
+ * This test assumes a 'newlyAdded' removal.
+ * @tags: [
+ *   requires_fcv_46,
+ * ]
  */
 
 load("jstests/replsets/rslib.js");
@@ -30,7 +35,7 @@ var master = replTest.getPrimary();
 var foo = master.getDB("foo");
 var admin = master.getDB("admin");
 
-var slave1 = replTest.liveNodes.slaves[0];
+var slave1 = replTest._slaves[0];
 var admin_s1 = slave1.getDB("admin");
 var local_s1 = slave1.getDB("local");
 
@@ -39,7 +44,7 @@ var bulk = foo.bar.initializeUnorderedBulkOp();
 for (var i = 0; i < 100; i++) {
     bulk.insert({date: new Date(), x: i, str: "all the talk on the market"});
 }
-assert.writeOK(bulk.execute());
+assert.commandWorked(bulk.execute());
 print("total in foo: " + foo.bar.find().itcount());
 
 print("4. Make sure synced");
@@ -66,16 +71,19 @@ try {
 }
 reconnect(slave1);
 reconnect(slave2);
+replTest.waitForAllNewlyAddedRemovals();
 
-wait(function() {
-    var config2 = local_s1.system.replset.findOne();
-    var config3 = local_s2.system.replset.findOne();
+print("Config 1: " + tojsononeline(config));
+var config2 = local_s1.system.replset.findOne();
+print("Config 2: " + tojsononeline(config2));
+assert(config2);
+// Add one to config.version to account for the 'newlyAdded' removal.
+assert.eq(config2.version, (config.version + 1));
 
-    printjson(config2);
-    printjson(config3);
-
-    return config2.version == config.version && (config3 && config3.version == config.version);
-});
+var config3 = local_s2.system.replset.findOne();
+print("Config 3: " + tojsononeline(config3));
+assert(config3);
+assert.eq(config3.version, (config.version + 1));
 
 replTest.waitForState(slave2, [ReplSetTest.State.SECONDARY, ReplSetTest.State.RECOVERING]);
 
@@ -97,7 +105,7 @@ bulk = foo.bar.initializeUnorderedBulkOp();
 for (var i = 0; i < 100; i++) {
     bulk.insert({date: new Date(), x: i, str: "all the talk on the market"});
 }
-assert.writeOK(bulk.execute());
+assert.commandWorked(bulk.execute());
 
 print("11. Everyone happy eventually");
 replTest.awaitReplication();

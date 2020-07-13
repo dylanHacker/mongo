@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,14 +29,16 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 
 #include "mongo/base/status_with.h"
 #include "mongo/db/key_generator.h"
 #include "mongo/db/keys_collection_cache.h"
 #include "mongo/db/keys_collection_document.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/db/keys_collection_manager_gen.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/notification.h"
 #include "mongo/util/duration.h"
@@ -47,8 +50,6 @@ class LogicalTime;
 class ServiceContext;
 class KeysCollectionClient;
 
-extern int KeysRotationIntervalSec;
-
 /**
  * The KeysCollectionManager queries the config servers for keys that can be used for
  * HMAC computation. It maintains an internal background thread that is used to periodically
@@ -56,7 +57,6 @@ extern int KeysRotationIntervalSec;
  */
 class KeysCollectionManager {
 public:
-    static const Seconds kKeyValidInterval;
     static const std::string kKeyManagerPurposeString;
 
     KeysCollectionManager(std::string purpose,
@@ -121,7 +121,7 @@ private:
      */
     class PeriodicRunner {
     public:
-        using RefreshFunc = stdx::function<StatusWith<KeysCollectionDocument>(OperationContext*)>;
+        using RefreshFunc = std::function<StatusWith<KeysCollectionDocument>(OperationContext*)>;
 
         /**
          * Preemptively inform the monitoring thread it needs to perform a refresh. Returns an
@@ -163,21 +163,23 @@ private:
         /**
          * Returns true if keys have ever successfully been returned from the config server.
          */
-        bool hasSeenKeys();
+        bool hasSeenKeys() const noexcept;
 
     private:
         void _doPeriodicRefresh(ServiceContext* service,
                                 std::string threadName,
                                 Milliseconds refreshInterval);
 
-        stdx::mutex _mutex;  // protects all the member variables below.
+        AtomicWord<bool> _hasSeenKeys{false};
+
+        // protects all the member variables below.
+        Mutex _mutex = MONGO_MAKE_LATCH("PeriodicRunner::_mutex");
         std::shared_ptr<Notification<void>> _refreshRequest;
         stdx::condition_variable _refreshNeededCV;
 
         stdx::thread _backgroundThread;
         std::shared_ptr<RefreshFunc> _doRefresh;
 
-        bool _hasSeenKeys = false;
         bool _inShutdown = false;
     };
 

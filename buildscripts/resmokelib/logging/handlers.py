@@ -1,14 +1,12 @@
 """Additional handlers that are used as the base classes of the buildlogger handler."""
 
-from __future__ import absolute_import
-
 import json
 import logging
-import sys
 import threading
 import warnings
 
 import requests
+import requests.adapters
 import requests.auth
 
 try:
@@ -17,10 +15,12 @@ except ImportError:
     # Versions of the requests package prior to 1.2.0 did not vendor the urllib3 package.
     urllib3_exceptions = None
 
-from . import flush
-from .. import utils
+import urllib3.util.retry as urllib3_retry
 
-_TIMEOUT_SECS = 10
+from buildscripts.resmokelib.logging import flush
+from buildscripts.resmokelib import utils
+
+_TIMEOUT_SECS = 65
 
 
 class BufferedHandler(logging.Handler):
@@ -29,6 +29,8 @@ class BufferedHandler(logging.Handler):
     Whenever each record is added to the buffer, a check is made to see if the buffer
     should be flushed. If it should, then flush() is expected to do what's needed.
     """
+
+    # pylint: disable=too-many-instance-attributes
 
     def __init__(self, capacity, interval_secs):
         """Initialize the handler with the buffer size and timeout.
@@ -57,6 +59,7 @@ class BufferedHandler(logging.Handler):
         self.__emit_buffer = []
         self.__flush_event = None  # A handle to the event that calls self.flush().
         self.__flush_scheduled_by_emit = False
+        self.__close_called = False
 
         self.__flush_lock = threading.Lock()  # Serializes callers of self.flush().
 
@@ -118,7 +121,7 @@ class BufferedHandler(logging.Handler):
         self.__flush(close_called=False)
 
         with self.__emit_lock:
-            if self.__flush_event is not None:
+            if self.__flush_event is not None and not self.__close_called:
                 # We cancel 'self.__flush_event' in case flush() was called by someone other than
                 # the flush thread to avoid having multiple flush() events scheduled.
                 flush.cancel(self.__flush_event)
@@ -148,6 +151,8 @@ class BufferedHandler(logging.Handler):
         """Flush the buffer and tidies up any resources used by this handler."""
 
         with self.__emit_lock:
+            self.__close_called = True
+
             if self.__flush_event is not None:
                 flush.cancel(self.__flush_event)
 
@@ -159,10 +164,23 @@ class BufferedHandler(logging.Handler):
 class HTTPHandler(object):
     """A class which sends data to a web server using POST requests."""
 
-    def __init__(self, url_root, username, password):
+    def __init__(self, url_root, username, password, should_retry=False):
         """Initialize the handler with the necessary authentication credentials."""
 
         self.auth_handler = requests.auth.HTTPBasicAuth(username, password)
+
+        self.session = requests.Session()
+
+        if should_retry:
+            retry_status = [500, 502, 503, 504]  # Retry for these statuses.
+            retry = urllib3_retry.Retry(
+                backoff_factor=0.1,  # Enable backoff starting at 0.1s.
+                method_whitelist=False,  # Support all HTTP verbs.
+                status_forcelist=retry_status)
+
+            adapter = requests.adapters.HTTPAdapter(max_retries=retry)
+            self.session.mount('http://', adapter)
+            self.session.mount('https://', adapter)
 
         self.url_root = url_root
 
@@ -177,18 +195,15 @@ class HTTPHandler(object):
         """
 
         data = utils.default_if_none(data, [])
-        data = json.dumps(data, encoding="utf-8")
+        data = json.dumps(data)
 
         headers = utils.default_if_none(headers, {})
         headers["Content-Type"] = "application/json; charset=utf-8"
 
         url = self._make_url(endpoint)
 
-        # Versions of Python earlier than 2.7.9 do not support certificate validation. So we
-        # disable certificate validation for older Python versions.
-        should_validate_certificates = sys.version_info >= (2, 7, 9)
         with warnings.catch_warnings():
-            if urllib3_exceptions is not None and not should_validate_certificates:
+            if urllib3_exceptions is not None:
                 try:
                     warnings.simplefilter("ignore", urllib3_exceptions.InsecurePlatformWarning)
                 except AttributeError:
@@ -205,8 +220,8 @@ class HTTPHandler(object):
                     # that defined InsecureRequestWarning.
                     pass
 
-            response = requests.post(url, data=data, headers=headers, timeout=timeout_secs,
-                                     auth=self.auth_handler, verify=should_validate_certificates)
+            response = self.session.post(url, data=data, headers=headers, timeout=timeout_secs,
+                                         auth=self.auth_handler, verify=True)
 
         response.raise_for_status()
 

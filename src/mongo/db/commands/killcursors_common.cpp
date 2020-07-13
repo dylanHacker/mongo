@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -34,7 +35,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/query/killcursors_request.h"
+#include "mongo/db/query/kill_cursors_gen.h"
 #include "mongo/db/query/killcursors_response.h"
 
 namespace mongo {
@@ -42,14 +43,12 @@ namespace mongo {
 Status KillCursorsCmdBase::checkAuthForCommand(Client* client,
                                                const std::string& dbname,
                                                const BSONObj& cmdObj) const {
-    const auto statusWithRequest = KillCursorsRequest::parseFromBSON(dbname, cmdObj);
-    if (!statusWithRequest.isOK()) {
-        return statusWithRequest.getStatus();
-    }
-    const auto killCursorsRequest = statusWithRequest.getValue();
 
-    const auto& nss = killCursorsRequest.nss;
-    for (CursorId id : killCursorsRequest.cursorIds) {
+    const auto killCursorsRequest =
+        KillCursorsRequest::parse(IDLParserErrorContext("killCursors"), cmdObj);
+
+    const auto& nss = killCursorsRequest.getNamespace();
+    for (CursorId id : killCursorsRequest.getCursorIds()) {
         const auto status = _checkAuth(client, nss, id);
         if (!status.isOK()) {
             if (status.code() == ErrorCodes::CursorNotFound) {
@@ -65,23 +64,20 @@ Status KillCursorsCmdBase::checkAuthForCommand(Client* client,
     return Status::OK();
 }
 
-bool KillCursorsCmdBase::run(OperationContext* opCtx,
-                             const std::string& dbname,
-                             const BSONObj& cmdObj,
-                             BSONObjBuilder& result) {
-    auto statusWithRequest = KillCursorsRequest::parseFromBSON(dbname, cmdObj);
-    if (!statusWithRequest.isOK()) {
-        return CommandHelpers::appendCommandStatus(result, statusWithRequest.getStatus());
-    }
-    auto killCursorsRequest = std::move(statusWithRequest.getValue());
+bool KillCursorsCmdBase::runImpl(OperationContext* opCtx,
+                                 const std::string& dbname,
+                                 const BSONObj& cmdObj,
+                                 BSONObjBuilder& result) {
+    auto killCursorsRequest =
+        KillCursorsRequest::parse(IDLParserErrorContext("killCursors"), cmdObj);
 
     std::vector<CursorId> cursorsKilled;
     std::vector<CursorId> cursorsNotFound;
     std::vector<CursorId> cursorsAlive;
     std::vector<CursorId> cursorsUnknown;
 
-    for (CursorId id : killCursorsRequest.cursorIds) {
-        Status status = _killCursor(opCtx, killCursorsRequest.nss, id);
+    for (CursorId id : killCursorsRequest.getCursorIds()) {
+        Status status = _killCursor(opCtx, killCursorsRequest.getNamespace(), id);
         if (status.isOK()) {
             cursorsKilled.push_back(id);
         } else if (status.code() == ErrorCodes::CursorNotFound) {
@@ -91,7 +87,7 @@ bool KillCursorsCmdBase::run(OperationContext* opCtx,
         }
 
         audit::logKillCursorsAuthzCheck(
-            opCtx->getClient(), killCursorsRequest.nss, id, status.code());
+            opCtx->getClient(), killCursorsRequest.getNamespace(), id, status.code());
     }
 
     KillCursorsResponse killCursorsResponse(

@@ -2,10 +2,6 @@
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi" xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
 	<Fragment>
     <DirectoryRef Id="BIN">
-      <Component Id="c_bsondump" Guid="DEEA45CA-5175-453B-9D0B-6168B4C0C891">
-        <File Id="f_bsondump" Name="bsondump.exe" Source="$(var.ToolBinarySource)\bsondump.exe"
-              DiskId ="1" KeyPath="yes"/>
-      </Component>
       <Component Id="InstallCompass" Guid="FDB7B7C4-B78F-4A85-8F98-E8E49F6027B2">
         <File Id="InstallCompassScript" Name="InstallCompass.ps1" Source="$(var.CompassDir)\Install-Compass.ps1" />
       </Component>
@@ -21,17 +17,17 @@
         <File Id="f_mongodWithService" Name="mongod.exe" Source="$(var.BinarySource)\mongod.exe"
               DiskId ="1" KeyPath="yes"/>
         <ServiceInstall Id='MyServiceInstall'
-              Description="MongoDB Database Server"
+              Description="MongoDB Database Server ([MONGO_SERVICE_NAME])"
               Arguments='--config "[BIN]mongod.cfg" --service'
-              DisplayName='MongoDB Server'
-              Name='MongoDB'
+              DisplayName='MongoDB Server ([MONGO_SERVICE_NAME])'
+              Name='[MONGO_SERVICE_NAME]'
               ErrorControl='normal'
               Start='auto'
               Type='ownProcess'
               Account='[MONGO_SERVICE_FULL_ACCOUNT_NAME]'
               Password='[MONGO_SERVICE_ACCOUNT_PASSWORD]'
               Vital='yes' />
-        <ServiceControl Id="StartStopService" Name="MongoDB" Start="install" Stop="both" Remove="uninstall" Wait="no" />
+        <ServiceControl Id="StartStopService" Name="[MONGO_SERVICE_NAME]" Start="install" Stop="both" Remove="uninstall" Wait="no" />
       </Component>
       <Component Id="c_mongodWithServiceUser" Guid="961B0579-4074-4437-B168-9B6C5E3C9E6A" KeyPath="yes">
         <Condition><![CDATA[MONGO_SERVICE_INSTALL AND MONGO_SERVICE_ACCOUNT_TYPE <> "ServiceLocalNetwork"]]></Condition>
@@ -51,44 +47,12 @@
         <File Id="f_mongodCfg" Name="mongod.cfg" Source="$(var.ProjectDir)mongod.yaml"
               DiskId ="1" KeyPath="yes"/>
       </Component>
-      <Component Id="c_mongodump" Guid="FFE32884-ACAD-4EC6-AF84-6BC94F55819E">
-        <File Id="f_mongodump" Name="mongodump.exe" Source="$(var.ToolBinarySource)\mongodump.exe"
-              DiskId ="1" KeyPath="yes"/>
-      </Component>
-      <Component Id="c_mongoexport" Guid="FD5FFDE2-53A1-45F3-9CCA-3AC311DF647C">
-        <File Id="f_mongoexport" Name="mongoexport.exe" Source="$(var.ToolBinarySource)\mongoexport.exe"
-              DiskId ="1" KeyPath="yes"/>
-      </Component>
-      <Component Id="c_mongofiles" Guid="CF8696D3-92B4-4CB9-B4D0-16155D726FE6">
-        <File Id="f_mongofiles" Name="mongofiles.exe" Source="$(var.ToolBinarySource)\mongofiles.exe"
-              DiskId ="1" KeyPath="yes"/>
-      </Component>
-      <Component Id="c_mongoimport" Guid="A4C06F69-2BB3-4068-A7E7-25347CCF01DE">
-        <File Id="f_mongoimport" Name="mongoimport.exe" Source="$(var.ToolBinarySource)\mongoimport.exe"
-              DiskId ="1" KeyPath="yes"/>
-      </Component>
-      <Component Id="c_mongoperf" Guid="B046CCD2-39DC-4CB4-8A58-A7790148C41E">
-        <File Id="f_mongoperf" Name="mongoperf.exe" Source="$(var.BinarySource)\mongoperf.exe"
-              DiskId ="1" KeyPath="yes"/>
-      </Component>
-      <Component Id="c_mongorestore" Guid="72A16D11-242E-4368-93C9-5F6162C548FC">
-        <File Id="f_mongorestore" Name="mongorestore.exe" Source="$(var.ToolBinarySource)\mongorestore.exe"
-              DiskId ="1" KeyPath="yes"/>
-      </Component>
       <Component Id="c_mongos" Guid="3CA63864-9FA0-4DAE-A664-2BE9A157FB60">
         <File Id="f_mongos" Name="mongos.exe" Source="$(var.BinarySource)\mongos.exe"
               DiskId ="1" KeyPath="yes"/>
       </Component>
       <Component Id="c_mongosPdb" Guid="F1694AB8-4B0D-4096-AD67-948063FF2A6C">
         <File Id="f_mongosPdb" Name="mongos.pdb" Source="$(var.BinarySource)\mongos.pdb"
-              DiskId ="1" KeyPath="yes"/>
-      </Component>
-      <Component Id="c_mongostat" Guid="0A881C85-AB39-4247-BADD-C8191F2FFF0C">
-        <File Id="f_mongostat" Name="mongostat.exe" Source="$(var.ToolBinarySource)\mongostat.exe"
-              DiskId ="1" KeyPath="yes"/>
-      </Component>
-      <Component Id="c_mongotop" Guid="616C562D-0504-4F2D-A6E7-CC21A58F9F81">
-        <File Id="f_mongotop" Name="mongotop.exe" Source="$(var.ToolBinarySource)\mongotop.exe"
               DiskId ="1" KeyPath="yes"/>
       </Component>
       <?if $(var.Edition) = Enterprise ?>
@@ -116,15 +80,13 @@
           <File Id="f_snmpPdb" Name="netsnmp.pdb" Source="$(var.SnmpSource)\netsnmp.pdb"
                 DiskId="1" KeyPath="yes" />
         </Component>
-      <?endif ?>
-      <?if $(var.Edition) = Enterprise Or $(var.Edition) = SSL ?>
-        <Component Id="c_ssleay" Guid="8879033A-F4F7-4879-A7F8-4D81355A47E3">
-          <File Id="f_ssleay" Name="ssleay32.dll" Source="$(var.SslSource)\ssleay32.dll"
-                DiskId="1" KeyPath="yes" />
+        <Component Id="c_mongocryptd" Guid="D243D194-B765-4DF8-BC67-8F4C329AD1B5">
+          <File Id="f_mongocryptd" Name="mongocryptd.exe" Source="$(var.EnterpriseToolBinarySource)\mongocryptd.exe"
+                DiskId ="1" KeyPath="yes"/>
         </Component>
-        <Component Id="c_libeay" Guid="E6CC6AA5-AC71-45EC-803C-71F816E33135">
-          <File Id="f_libeay" Name="libeay32.dll" Source="$(var.SslSource)\libeay32.dll"
-                DiskId="1" KeyPath="yes" />
+        <Component Id="c_mongocryptdPdb" Guid="49950D1E-55B0-4146-AEDE-C60C6B086ABF">
+          <File Id="f_mongocryptdPdb" Name="mongocryptd.pdb" Source="$(var.EnterpriseToolBinarySource)\mongocryptd.pdb"
+                DiskId ="1" KeyPath="yes"/>
         </Component>
       <?endif ?>
     </DirectoryRef>
@@ -170,7 +132,7 @@
 
     <?if $(var.Edition) = Enterprise or $(var.Edition) = SSL ?>
       <DirectoryRef Id="TARGETDIR">
-        <Merge Id="m_vcredist" SourceFile="$(var.MergeModulesBasePath)\Microsoft_VC140_CRT_x64.msm" DiskId="1" Language="0"/>
+        <Merge Id="m_vcredist" SourceFile="$(var.MergeModulesBasePath)\$(var.MergeModuleFileCRT)" DiskId="1" Language="0"/>
       </DirectoryRef>
     <?endif ?>
 
@@ -178,8 +140,6 @@
       <ComponentGroup Id="cg_EnterpriseBase">
         <ComponentRef Id="c_sasl" />
         <ComponentRef Id="c_saslPdb" />
-        <ComponentRef Id="c_ssleay" />
-        <ComponentRef Id="c_libeay" />
       </ComponentGroup>
       <ComponentGroup Id="cg_EnterpriseServer">
         <ComponentGroupRef Id="cg_EnterpriseBase" />
@@ -190,13 +150,6 @@
         <ComponentRef Id="c_snmpConfSubagent" />
         <ComponentRef Id="c_snmpMongodMib" />
         <ComponentRef Id="c_snmpMongodbincMib" />
-      </ComponentGroup>
-    <?endif ?>
-
-    <?if $(var.Edition) = SSL ?>
-      <ComponentGroup Id="cg_SSLBase">
-        <ComponentRef Id="c_ssleay" />
-        <ComponentRef Id="c_libeay" />
       </ComponentGroup>
     <?endif ?>
   </Fragment>

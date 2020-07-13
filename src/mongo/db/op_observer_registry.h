@@ -1,23 +1,24 @@
 /**
- *    Copyright 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -44,7 +45,8 @@ namespace mongo {
  * handler with the recovery unit.
  */
 class OpObserverRegistry final : public OpObserver {
-    MONGO_DISALLOW_COPYING(OpObserverRegistry);
+    OpObserverRegistry(const OpObserverRegistry&) = delete;
+    OpObserverRegistry& operator=(const OpObserverRegistry&) = delete;
 
 public:
     OpObserverRegistry() = default;
@@ -58,12 +60,57 @@ public:
 
     void onCreateIndex(OperationContext* const opCtx,
                        const NamespaceString& nss,
-                       OptionalCollectionUUID uuid,
+                       CollectionUUID uuid,
                        BSONObj indexDoc,
                        bool fromMigrate) override {
         ReservedTimes times{opCtx};
         for (auto& o : _observers)
             o->onCreateIndex(opCtx, nss, uuid, indexDoc, fromMigrate);
+    }
+
+    virtual void onStartIndexBuild(OperationContext* opCtx,
+                                   const NamespaceString& nss,
+                                   CollectionUUID collUUID,
+                                   const UUID& indexBuildUUID,
+                                   const std::vector<BSONObj>& indexes,
+                                   bool fromMigrate) override {
+        ReservedTimes times{opCtx};
+        for (auto& o : _observers) {
+            o->onStartIndexBuild(opCtx, nss, collUUID, indexBuildUUID, indexes, fromMigrate);
+        }
+    }
+
+    virtual void onStartIndexBuildSinglePhase(OperationContext* opCtx,
+                                              const NamespaceString& nss) override {
+        ReservedTimes times{opCtx};
+        for (auto& o : _observers) {
+            o->onStartIndexBuildSinglePhase(opCtx, nss);
+        }
+    }
+
+    virtual void onCommitIndexBuild(OperationContext* opCtx,
+                                    const NamespaceString& nss,
+                                    CollectionUUID collUUID,
+                                    const UUID& indexBuildUUID,
+                                    const std::vector<BSONObj>& indexes,
+                                    bool fromMigrate) override {
+        ReservedTimes times{opCtx};
+        for (auto& o : _observers) {
+            o->onCommitIndexBuild(opCtx, nss, collUUID, indexBuildUUID, indexes, fromMigrate);
+        }
+    }
+
+    virtual void onAbortIndexBuild(OperationContext* opCtx,
+                                   const NamespaceString& nss,
+                                   CollectionUUID collUUID,
+                                   const UUID& indexBuildUUID,
+                                   const std::vector<BSONObj>& indexes,
+                                   const Status& cause,
+                                   bool fromMigrate) override {
+        ReservedTimes times{opCtx};
+        for (auto& o : _observers) {
+            o->onAbortIndexBuild(opCtx, nss, collUUID, indexBuildUUID, indexes, cause, fromMigrate);
+        }
     }
 
     void onInserts(OperationContext* const opCtx,
@@ -116,10 +163,11 @@ public:
                             Collection* coll,
                             const NamespaceString& collectionName,
                             const CollectionOptions& options,
-                            const BSONObj& idIndex) override {
+                            const BSONObj& idIndex,
+                            const OplogSlot& createOpTime) override {
         ReservedTimes times{opCtx};
         for (auto& o : _observers)
-            o->onCreateCollection(opCtx, coll, collectionName, options, idIndex);
+            o->onCreateCollection(opCtx, coll, collectionName, options, idIndex, createOpTime);
     }
 
     void onCollMod(OperationContext* const opCtx,
@@ -127,10 +175,10 @@ public:
                    OptionalCollectionUUID uuid,
                    const BSONObj& collModCmd,
                    const CollectionOptions& oldCollOptions,
-                   boost::optional<TTLCollModInfo> ttlInfo) override {
+                   boost::optional<IndexCollModInfo> indexInfo) override {
         ReservedTimes times{opCtx};
         for (auto& o : _observers)
-            o->onCollMod(opCtx, nss, uuid, collModCmd, oldCollOptions, ttlInfo);
+            o->onCollMod(opCtx, nss, uuid, collModCmd, oldCollOptions, indexInfo);
     }
 
     void onDropDatabase(OperationContext* const opCtx, const std::string& dbName) override {
@@ -141,10 +189,13 @@ public:
 
     repl::OpTime onDropCollection(OperationContext* const opCtx,
                                   const NamespaceString& collectionName,
-                                  const OptionalCollectionUUID uuid) override {
+                                  const OptionalCollectionUUID uuid,
+                                  std::uint64_t numRecords,
+                                  const CollectionDropType dropType) override {
         ReservedTimes times{opCtx};
         for (auto& observer : this->_observers) {
-            auto time = observer->onDropCollection(opCtx, collectionName, uuid);
+            auto time =
+                observer->onDropCollection(opCtx, collectionName, uuid, numRecords, dropType);
             invariant(time.isNull());
         }
         return _getOpTimeToReturn(times.get().reservedOpTimes);
@@ -160,22 +211,47 @@ public:
             o->onDropIndex(opCtx, nss, uuid, indexName, idxDescriptor);
     }
 
-    repl::OpTime onRenameCollection(OperationContext* const opCtx,
-                                    const NamespaceString& fromCollection,
-                                    const NamespaceString& toCollection,
-                                    OptionalCollectionUUID uuid,
-                                    OptionalCollectionUUID dropTargetUUID,
-                                    bool stayTemp) override {
+
+    void onRenameCollection(OperationContext* const opCtx,
+                            const NamespaceString& fromCollection,
+                            const NamespaceString& toCollection,
+                            OptionalCollectionUUID uuid,
+                            OptionalCollectionUUID dropTargetUUID,
+                            std::uint64_t numRecords,
+                            bool stayTemp) override {
+        ReservedTimes times{opCtx};
+        for (auto& o : _observers)
+            o->onRenameCollection(
+                opCtx, fromCollection, toCollection, uuid, dropTargetUUID, numRecords, stayTemp);
+    }
+
+    repl::OpTime preRenameCollection(OperationContext* const opCtx,
+                                     const NamespaceString& fromCollection,
+                                     const NamespaceString& toCollection,
+                                     OptionalCollectionUUID uuid,
+                                     OptionalCollectionUUID dropTargetUUID,
+                                     std::uint64_t numRecords,
+                                     bool stayTemp) override {
         ReservedTimes times{opCtx};
         for (auto& observer : this->_observers) {
-            const auto time = observer->onRenameCollection(
-                opCtx, fromCollection, toCollection, uuid, dropTargetUUID, stayTemp);
+            const auto time = observer->preRenameCollection(
+                opCtx, fromCollection, toCollection, uuid, dropTargetUUID, numRecords, stayTemp);
             invariant(time.isNull());
         }
-
         return _getOpTimeToReturn(times.get().reservedOpTimes);
     }
 
+    void postRenameCollection(OperationContext* const opCtx,
+                              const NamespaceString& fromCollection,
+                              const NamespaceString& toCollection,
+                              OptionalCollectionUUID uuid,
+                              OptionalCollectionUUID dropTargetUUID,
+                              bool stayTemp) override {
+        ReservedTimes times{opCtx};
+        for (auto& o : _observers)
+            o->postRenameCollection(
+                opCtx, fromCollection, toCollection, uuid, dropTargetUUID, stayTemp);
+    }
     void onApplyOps(OperationContext* const opCtx,
                     const std::string& dbName,
                     const BSONObj& applyOpCmd) override {
@@ -192,29 +268,53 @@ public:
             o->onEmptyCapped(opCtx, collectionName, uuid);
     }
 
-    void onTransactionCommit(OperationContext* opCtx) override {
+    void onUnpreparedTransactionCommit(OperationContext* opCtx,
+                                       std::vector<repl::ReplOperation>* statements,
+                                       size_t numberOfPreImagesToWrite) override {
         ReservedTimes times{opCtx};
         for (auto& o : _observers)
-            o->onTransactionCommit(opCtx);
+            o->onUnpreparedTransactionCommit(opCtx, statements, numberOfPreImagesToWrite);
     }
 
-    void onTransactionPrepare(OperationContext* opCtx) override {
+    void onPreparedTransactionCommit(
+        OperationContext* opCtx,
+        OplogSlot commitOplogEntryOpTime,
+        Timestamp commitTimestamp,
+        const std::vector<repl::ReplOperation>& statements) noexcept override {
+        ReservedTimes times{opCtx};
+        for (auto& o : _observers)
+            o->onPreparedTransactionCommit(
+                opCtx, commitOplogEntryOpTime, commitTimestamp, statements);
+    }
+
+    void onTransactionPrepare(OperationContext* opCtx,
+                              const std::vector<OplogSlot>& reservedSlots,
+                              std::vector<repl::ReplOperation>* statements,
+                              size_t numberOfPreImagesToWrite) override {
         ReservedTimes times{opCtx};
         for (auto& observer : _observers) {
-            observer->onTransactionPrepare(opCtx);
+            observer->onTransactionPrepare(
+                opCtx, reservedSlots, statements, numberOfPreImagesToWrite);
         }
     }
 
-    void onTransactionAbort(OperationContext* opCtx) override {
+    void onTransactionAbort(OperationContext* opCtx,
+                            boost::optional<OplogSlot> abortOplogEntryOpTime) override {
         ReservedTimes times{opCtx};
         for (auto& o : _observers)
-            o->onTransactionAbort(opCtx);
+            o->onTransactionAbort(opCtx, abortOplogEntryOpTime);
     }
 
     void onReplicationRollback(OperationContext* opCtx,
                                const RollbackObserverInfo& rbInfo) override {
         for (auto& o : _observers)
             o->onReplicationRollback(opCtx, rbInfo);
+    }
+
+    void onMajorityCommitPointUpdate(ServiceContext* service,
+                                     const repl::OpTime& newCommitPoint) override {
+        for (auto& o : _observers)
+            o->onMajorityCommitPointUpdate(service, newCommitPoint);
     }
 
 private:

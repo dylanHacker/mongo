@@ -1,92 +1,122 @@
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/collection_metadata.h"
 
+#include <memory>
+
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 CollectionMetadata::CollectionMetadata(std::shared_ptr<ChunkManager> cm, const ShardId& thisShardId)
-    : _cm(std::move(cm)), _thisShardId(thisShardId) {
+    : _cm(std::move(cm)), _thisShardId(thisShardId) {}
 
-    invariant(_cm->getVersion().isSet());
-    invariant(_cm->getVersion() >= getShardVersion());
+BSONObj CollectionMetadata::extractDocumentKey(const BSONObj& doc) const {
+    BSONObj key;
+
+    if (isSharded()) {
+        auto const& pattern = _cm->getShardKeyPattern();
+        key = dotted_path_support::extractElementsBasedOnTemplate(doc, pattern.toBSON());
+        if (pattern.hasId()) {
+            return key;
+        }
+        // else, try to append an _id field from the document.
+    }
+
+    if (auto id = doc["_id"]) {
+        return key.isEmpty() ? id.wrap() : BSONObjBuilder(std::move(key)).append(id).obj();
+    }
+
+    // For legacy documents that lack an _id, use the document itself as its key.
+    return doc;
+}
+
+void CollectionMetadata::toBSONBasic(BSONObjBuilder& bb) const {
+    if (isSharded()) {
+        _cm->getVersion().appendLegacyWithField(&bb, "collVersion");
+        getShardVersionForLogging().appendLegacyWithField(&bb, "shardVersion");
+        bb.append("keyPattern", _cm->getShardKeyPattern().toBSON());
+    } else {
+        ChunkVersion::UNSHARDED().appendLegacyWithField(&bb, "collVersion");
+        ChunkVersion::UNSHARDED().appendLegacyWithField(&bb, "shardVersion");
+    }
+}
+
+std::string CollectionMetadata::toStringBasic() const {
+    if (isSharded()) {
+        return str::stream() << "collection version: " << _cm->getVersion().toString()
+                             << ", shard version: " << getShardVersionForLogging().toString();
+    } else {
+        return "collection version: <unsharded>";
+    }
 }
 
 RangeMap CollectionMetadata::getChunks() const {
+    invariant(isSharded());
+
     RangeMap chunksMap(SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<BSONObj>());
 
-    for (const auto& chunk : _cm->chunks()) {
-        if (chunk->getShardId() != _thisShardId)
-            continue;
+    _cm->forEachChunk([this, &chunksMap](const auto& chunk) {
+        if (chunk.getShardId() == _thisShardId)
+            chunksMap.emplace_hint(chunksMap.end(), chunk.getMin(), chunk.getMax());
 
-        chunksMap.emplace_hint(chunksMap.end(), chunk->getMin(), chunk->getMax());
-    }
+        return true;
+    });
 
     return chunksMap;
 }
 
 bool CollectionMetadata::getNextChunk(const BSONObj& lookupKey, ChunkType* chunk) const {
-    auto foundIt = _cm->getNextChunkOnShard(lookupKey, _thisShardId);
-    if (foundIt.begin() == foundIt.end())
+    invariant(isSharded());
+
+    auto nextChunk = _cm->getNextChunkOnShard(lookupKey, _thisShardId);
+    if (!nextChunk)
         return false;
 
-    const auto& nextChunk = *foundIt.begin();
     chunk->setMin(nextChunk->getMin());
     chunk->setMax(nextChunk->getMax());
+
     return true;
 }
 
-bool CollectionMetadata::getDifferentChunk(const BSONObj& chunkMinKey,
-                                           ChunkType* differentChunk) const {
-    for (const auto& found : _cm->chunks()) {
-        if (found->getShardId() == _thisShardId) {
-            if (found->getMin().woCompare(chunkMinKey) != 0) {
-                differentChunk->setMin(found->getMin());
-                differentChunk->setMax(found->getMax());
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
 Status CollectionMetadata::checkChunkIsValid(const ChunkType& chunk) const {
+    invariant(isSharded());
+
     ChunkType existingChunk;
 
     if (!getNextChunk(chunk.getMin(), &existingChunk)) {
@@ -100,38 +130,18 @@ Status CollectionMetadata::checkChunkIsValid(const ChunkType& chunk) const {
         existingChunk.getMax().woCompare(chunk.getMax())) {
         return {ErrorCodes::StaleShardVersion,
                 str::stream() << "Unable to find chunk with the exact bounds "
-                              << ChunkRange(chunk.getMin(), chunk.getMax()).toString()
-                              << " at collection version "
-                              << getCollVersion().toString()};
+                              << chunk.getRange().toString() << " at collection version "
+                              << getCollVersion().toString()
+                              << " found existing chunk: " << existingChunk.toString()};
     }
 
     return Status::OK();
 }
 
-void CollectionMetadata::toBSONBasic(BSONObjBuilder& bb) const {
-    _cm->getVersion().addToBSON(bb, "collVersion");
-    getShardVersion().addToBSON(bb, "shardVersion");
-    bb.append("keyPattern", _cm->getShardKeyPattern().toBSON());
-}
-
-void CollectionMetadata::toBSONChunks(BSONArrayBuilder& bb) const {
-    for (const auto& chunk : _cm->chunks()) {
-        if (chunk->getShardId() == _thisShardId) {
-            BSONArrayBuilder chunkBB(bb.subarrayStart());
-            chunkBB.append(chunk->getMin());
-            chunkBB.append(chunk->getMax());
-            chunkBB.done();
-        }
-    }
-}
-
-std::string CollectionMetadata::toStringBasic() const {
-    return str::stream() << "collection version: " << _cm->getVersion().toString()
-                         << ", shard version: " << getShardVersion().toString();
-}
-
 boost::optional<ChunkRange> CollectionMetadata::getNextOrphanRange(
-    RangeMap const& receivingChunks, BSONObj const& origLookupKey) const {
+    const RangeMap& receivingChunks, const BSONObj& origLookupKey) const {
+    invariant(isSharded());
+
     const BSONObj maxKey = getMaxKey();
     BSONObj lookupKey = origLookupKey;
 
@@ -195,6 +205,22 @@ boost::optional<ChunkRange> CollectionMetadata::getNextOrphanRange(
     }
 
     return boost::none;
+}
+
+void CollectionMetadata::toBSONChunks(BSONArrayBuilder* builder) const {
+    if (!isSharded())
+        return;
+
+    _cm->forEachChunk([this, &builder](const auto& chunk) {
+        if (chunk.getShardId() == _thisShardId) {
+            BSONArrayBuilder chunkBB(builder->subarrayStart());
+            chunkBB.append(chunk.getMin());
+            chunkBB.append(chunk.getMax());
+            chunkBB.done();
+        }
+
+        return true;
+    });
 }
 
 }  // namespace mongo

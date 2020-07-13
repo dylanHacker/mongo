@@ -1,42 +1,40 @@
-// collection_to_capped.cpp
-
 /**
-*    Copyright (C) 2013-2014 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #include "mongo/platform/basic.h"
 
 
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/capped_utils.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/index_builder.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/query/find.h"
 #include "mongo/db/query/internal_plans.h"
@@ -44,10 +42,7 @@
 #include "mongo/db/service_context.h"
 
 namespace mongo {
-
-using std::unique_ptr;
-using std::string;
-using std::stringstream;
+namespace {
 
 class CmdCloneCollectionAsCapped : public ErrmsgCommandDeprecated {
 public:
@@ -85,9 +80,9 @@ public:
         out->push_back(Privilege(ResourcePattern::forExactNamespace(nss), targetActions));
     }
     bool errmsgRun(OperationContext* opCtx,
-                   const string& dbname,
+                   const std::string& dbname,
                    const BSONObj& jsobj,
-                   string& errmsg,
+                   std::string& errmsg,
                    BSONObjBuilder& result) {
         const auto fromElt = jsobj["cloneCollectionAsCapped"];
         const auto toElt = jsobj["toCollection"];
@@ -117,37 +112,34 @@ public:
             return false;
         }
 
-        AutoGetDb autoDb(opCtx, dbname, MODE_X);
+        NamespaceString fromNs(dbname, from);
+        NamespaceString toNs(dbname, to);
 
-        NamespaceString nss(dbname, to);
-        if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss)) {
-            return CommandHelpers::appendCommandStatus(
-                result,
-                Status(ErrorCodes::NotMaster,
-                       str::stream() << "Not primary while cloning collection " << from << " to "
-                                     << to
-                                     << " (as capped)"));
+        AutoGetCollection autoColl(opCtx, fromNs, MODE_X);
+        Lock::CollectionLock collLock(opCtx, toNs, MODE_X);
+
+        if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, toNs)) {
+            uasserted(ErrorCodes::NotMaster,
+                      str::stream() << "Not primary while cloning collection " << from << " to "
+                                    << to << " (as capped)");
         }
 
-        Database* const db = autoDb.getDb();
+        Database* const db = autoColl.getDb();
         if (!db) {
-            return CommandHelpers::appendCommandStatus(
-                result,
-                Status(ErrorCodes::NamespaceNotFound,
-                       str::stream() << "database " << dbname << " not found"));
+            uasserted(ErrorCodes::NamespaceNotFound,
+                      str::stream() << "database " << dbname << " not found");
         }
 
-        Status status =
-            cloneCollectionAsCapped(opCtx, db, from.toString(), to.toString(), size, temp);
-        return CommandHelpers::appendCommandStatus(result, status);
+        cloneCollectionAsCapped(opCtx, db, fromNs, toNs, size, temp);
+        return true;
     }
+
 } cmdCloneCollectionAsCapped;
 
-/* jan2010:
-   Converts the given collection to a capped collection w/ the specified size.
-   This command is not highly used, and is not currently supported with sharded
-   environments.
-   */
+/**
+ * Converts the given collection to a capped collection w/ the specified size. This command is not
+ * highly used, and is not currently supported with sharded environments.
+ */
 class CmdConvertToCapped : public ErrmsgCommandDeprecated {
 public:
     CmdConvertToCapped() : ErrmsgCommandDeprecated("convertToCapped") {}
@@ -169,20 +161,23 @@ public:
     }
 
     bool errmsgRun(OperationContext* opCtx,
-                   const string& dbname,
+                   const std::string& dbname,
                    const BSONObj& jsobj,
-                   string& errmsg,
+                   std::string& errmsg,
                    BSONObjBuilder& result) {
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, jsobj));
-        double size = jsobj.getField("size").number();
+        long long size = jsobj.getField("size").safeNumberLong();
 
         if (size == 0) {
             errmsg = "invalid command spec";
             return false;
         }
 
-        return CommandHelpers::appendCommandStatus(result, convertToCapped(opCtx, nss, size));
+        convertToCapped(opCtx, nss, size);
+        return true;
     }
 
 } cmdConvertToCapped;
-}
+
+}  // namespace
+}  // namespace mongo

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,11 +31,11 @@
 
 #include "mongo/db/storage/devnull/devnull_kv_engine.h"
 
-#include "mongo/base/disallow_copying.h"
+#include <memory>
+
 #include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_record_store.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -66,6 +67,10 @@ public:
         return "devnull";
     }
 
+    const std::string& getIdent() const override {
+        return _ident;
+    }
+
     virtual void setCappedCallback(CappedCallback*) {}
 
     virtual long long dataSize(OperationContext* opCtx) const {
@@ -81,13 +86,9 @@ public:
     }
 
     virtual int64_t storageSize(OperationContext* opCtx,
-                                BSONObjBuilder* extraInfo = NULL,
+                                BSONObjBuilder* extraInfo = nullptr,
                                 int infoLevel = 0) const {
         return 0;
-    }
-
-    virtual RecordData dataFor(OperationContext* opCtx, const RecordId& loc) const {
-        return RecordData(_dummy.objdata(), _dummy.objsize());
     }
 
     virtual bool findRecord(OperationContext* opCtx, const RecordId& loc, RecordData* rd) const {
@@ -96,22 +97,12 @@ public:
 
     virtual void deleteRecord(OperationContext* opCtx, const RecordId& dl) {}
 
-    virtual StatusWith<RecordId> insertRecord(
-        OperationContext* opCtx, const char* data, int len, Timestamp, bool enforceQuota) {
-        _numInserts++;
-        return StatusWith<RecordId>(RecordId(6, 4));
-    }
-
-    virtual Status insertRecordsWithDocWriter(OperationContext* opCtx,
-                                              const DocWriter* const* docs,
-                                              const Timestamp*,
-                                              size_t nDocs,
-                                              RecordId* idsOut) {
-        _numInserts += nDocs;
-        if (idsOut) {
-            for (size_t i = 0; i < nDocs; i++) {
-                idsOut[i] = RecordId(6, 4);
-            }
+    virtual Status insertRecords(OperationContext* opCtx,
+                                 std::vector<Record>* inOutRecords,
+                                 const std::vector<Timestamp>& timestamps) {
+        _numInserts += inOutRecords->size();
+        for (auto& record : *inOutRecords) {
+            record.id = RecordId(6, 4);
         }
         return Status::OK();
     }
@@ -119,9 +110,7 @@ public:
     virtual Status updateRecord(OperationContext* opCtx,
                                 const RecordId& oldLocation,
                                 const char* data,
-                                int len,
-                                bool enforceQuota,
-                                UpdateNotifier* notifier) {
+                                int len) {
         return Status::OK();
     }
 
@@ -140,7 +129,7 @@ public:
 
     std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* opCtx,
                                                     bool forward) const final {
-        return stdx::make_unique<EmptyRecordCursor>();
+        return std::make_unique<EmptyRecordCursor>();
     }
 
     virtual Status truncate(OperationContext* opCtx) {
@@ -149,22 +138,10 @@ public:
 
     virtual void cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive) {}
 
-    virtual Status validate(OperationContext* opCtx,
-                            ValidateCmdLevel level,
-                            ValidateAdaptor* adaptor,
-                            ValidateResults* results,
-                            BSONObjBuilder* output) {
-        return Status::OK();
-    }
-
     virtual void appendCustomStats(OperationContext* opCtx,
                                    BSONObjBuilder* result,
                                    double scale) const {
         result->appendNumber("numInserts", _numInserts);
-    }
-
-    virtual Status touch(OperationContext* opCtx, BSONObjBuilder* output) const {
-        return Status::OK();
     }
 
     void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) const override {}
@@ -177,21 +154,26 @@ private:
     CollectionOptions _options;
     long long _numInserts;
     BSONObj _dummy;
+    std::string _ident;
 };
 
 class DevNullSortedDataBuilderInterface : public SortedDataBuilderInterface {
-    MONGO_DISALLOW_COPYING(DevNullSortedDataBuilderInterface);
+    DevNullSortedDataBuilderInterface(const DevNullSortedDataBuilderInterface&) = delete;
+    DevNullSortedDataBuilderInterface& operator=(const DevNullSortedDataBuilderInterface&) = delete;
 
 public:
     DevNullSortedDataBuilderInterface() {}
 
-    virtual Status addKey(const BSONObj& key, const RecordId& loc) {
+    virtual Status addKey(const KeyString::Value& keyString) {
         return Status::OK();
     }
 };
 
 class DevNullSortedDataInterface : public SortedDataInterface {
 public:
+    DevNullSortedDataInterface()
+        : SortedDataInterface(KeyString::Version::kLatestVersion, Ordering::make(BSONObj())) {}
+
     virtual ~DevNullSortedDataInterface() {}
 
     virtual SortedDataBuilderInterface* getBulkBuilder(OperationContext* opCtx, bool dupsAllowed) {
@@ -199,18 +181,16 @@ public:
     }
 
     virtual Status insert(OperationContext* opCtx,
-                          const BSONObj& key,
-                          const RecordId& loc,
+                          const KeyString::Value& keyString,
                           bool dupsAllowed) {
         return Status::OK();
     }
 
     virtual void unindex(OperationContext* opCtx,
-                         const BSONObj& key,
-                         const RecordId& loc,
+                         const KeyString::Value& keyString,
                          bool dupsAllowed) {}
 
-    virtual Status dupKeyCheck(OperationContext* opCtx, const BSONObj& key, const RecordId& loc) {
+    virtual Status dupKeyCheck(OperationContext* opCtx, const KeyString::Value& keyString) {
         return Status::OK();
     }
 
@@ -248,14 +228,62 @@ std::unique_ptr<RecordStore> DevNullKVEngine::getRecordStore(OperationContext* o
                                                              StringData ident,
                                                              const CollectionOptions& options) {
     if (ident == "_mdb_catalog") {
-        return stdx::make_unique<EphemeralForTestRecordStore>(ns, &_catalogInfo);
+        return std::make_unique<EphemeralForTestRecordStore>(ns, &_catalogInfo);
     }
-    return stdx::make_unique<DevNullRecordStore>(ns, options);
+    return std::make_unique<DevNullRecordStore>(ns, options);
 }
 
-SortedDataInterface* DevNullKVEngine::getSortedDataInterface(OperationContext* opCtx,
-                                                             StringData ident,
-                                                             const IndexDescriptor* desc) {
-    return new DevNullSortedDataInterface();
+std::unique_ptr<RecordStore> DevNullKVEngine::makeTemporaryRecordStore(OperationContext* opCtx,
+                                                                       StringData ident) {
+    return std::make_unique<DevNullRecordStore>("", CollectionOptions());
 }
+
+std::unique_ptr<SortedDataInterface> DevNullKVEngine::getSortedDataInterface(
+    OperationContext* opCtx, StringData ident, const IndexDescriptor* desc) {
+    return std::make_unique<DevNullSortedDataInterface>();
 }
+
+namespace {
+
+class StreamingCursorImpl : public StorageEngine::StreamingCursor {
+public:
+    StreamingCursorImpl() = delete;
+    StreamingCursorImpl(StorageEngine::BackupOptions options)
+        : StorageEngine::StreamingCursor(options) {
+        _backupBlocks = {{"filename.wt"}};
+        _exhaustCursor = false;
+    };
+
+    ~StreamingCursorImpl() = default;
+
+    BSONObj getMetadataObject(UUID backupId) {
+        return BSONObj();
+    }
+
+    StatusWith<std::vector<StorageEngine::BackupBlock>> getNextBatch(const std::size_t batchSize) {
+        if (_exhaustCursor) {
+            std::vector<StorageEngine::BackupBlock> emptyVector;
+            return emptyVector;
+        }
+        _exhaustCursor = true;
+        return _backupBlocks;
+    }
+
+private:
+    std::vector<StorageEngine::BackupBlock> _backupBlocks;
+    bool _exhaustCursor;
+};
+
+}  // namespace
+
+StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>> DevNullKVEngine::beginNonBlockingBackup(
+    OperationContext* opCtx, const StorageEngine::BackupOptions& options) {
+    return std::make_unique<StreamingCursorImpl>(options);
+}
+
+StatusWith<std::vector<std::string>> DevNullKVEngine::extendBackupCursor(OperationContext* opCtx) {
+    std::vector<std::string> filesToCopy = {"journal/WiredTigerLog.999"};
+    return filesToCopy;
+}
+
+}  // namespace mongo

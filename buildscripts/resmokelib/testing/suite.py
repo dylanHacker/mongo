@@ -1,19 +1,54 @@
 """Holder for the (test kind, list of tests) pair with additional metadata their execution."""
 
-from __future__ import absolute_import
-
 import itertools
 import threading
 import time
 
-from . import report as _report
-from . import summary as _summary
-from .. import config as _config
-from .. import selector as _selector
+from buildscripts.resmokelib import config as _config
+from buildscripts.resmokelib import selector as _selector
+from buildscripts.resmokelib.testing import report as _report
+from buildscripts.resmokelib.testing import summary as _summary
+
+# Map of error codes that could be seen. This is collected from:
+# * dbshell.cpp
+# * exit_code.h
+# * Unix signals
+# * Windows access violation
+EXIT_CODE_MAP = {
+    1: "DB Exception",
+    -6: "SIGABRT",
+    -9: "SIGKILL",
+    -11: "SIGSEGV",
+    -15: "SIGTERM",
+    14: "Exit Abrupt",
+    -3: "Failure executing JS file",
+    253: "Failure executing JS file",
+    -4: "Eval Error",
+    252: "Eval Error",
+    -5: "Mongorc Error",
+    251: "Mongorc Error",
+    250: "Unterminated Process",
+    -7: "Process Termination Error",
+    249: "Process Termination Error",
+    -1073741819: "Windows Access Violation",
+    3221225477: "Windows Access Violation",
+    -1073741571: "Stack Overflow",
+    3221225725: "Stack Overflow",
+}
+
+
+def translate_exit_code(exit_code):
+    """
+    Convert the given exit code into a human readable string.
+
+    :param exit_code: Exit code to translate.
+    :return: Human readable string.
+    """
+    return EXIT_CODE_MAP.get(exit_code, "UNKNOWN")
 
 
 def synchronized(method):
-    """Provide decorator to enfore instance lock ownership when calling the method."""
+    """Provide decorator to enforce instance lock ownership when calling the method."""
 
     def synced(self, *args, **kwargs):
         """Sync an instance lock."""
@@ -51,23 +86,23 @@ class Suite(object):  # pylint: disable=too-many-instance-attributes
         # report intermediate results.
         self._partial_reports = None
 
+    def __repr__(self):
+        """Create a string representation of object for debugging."""
+        return f"{self.test_kind}:{self._suite_name}"
+
     def _get_tests_for_kind(self, test_kind):
         """Return the tests to run based on the 'test_kind'-specific filtering policy."""
-        test_info = self.get_selector_config()
+        selector_config = self.get_selector_config()
 
-        # The mongos_test doesn't have to filter anything, the test_info is just the arguments to
-        # the mongos program to be used as the test case.
+        # The mongos_test doesn't have to filter anything, the selector_config is just the
+        # arguments to the mongos program to be used as the test case.
         if test_kind == "mongos_test":
-            mongos_options = test_info  # Just for easier reading.
+            mongos_options = selector_config  # Just for easier reading.
             if not isinstance(mongos_options, dict):
                 raise TypeError("Expected dictionary of arguments to mongos")
             return [mongos_options], []
 
-        tests, excluded = _selector.filter_tests(test_kind, test_info)
-        if _config.ORDER_TESTS_BY_NAME:
-            return sorted(tests, key=str.lower), sorted(excluded, key=str.lower)
-
-        return tests, excluded
+        return _selector.filter_tests(test_kind, selector_config)
 
     def get_name(self):
         """Return the name of the test suite."""
@@ -185,8 +220,6 @@ class Suite(object):  # pylint: disable=too-many-instance-attributes
         else:
             summary = self._summarize_repeated(sb)
 
-        summarized_group = "    %ss: %s" % (self.test_kind, "\n        ".join(sb))
-
         if summary.num_run == 0:
             sb.append("Suite did not run any tests.")
             return
@@ -196,11 +229,6 @@ class Suite(object):  # pylint: disable=too-many-instance-attributes
         if self._suite_start_time is not None and self._suite_end_time is not None:
             time_taken = self._suite_end_time - self._suite_start_time
             summary = summary._replace(time_taken=time_taken)
-
-        sb.append("%d test(s) ran in %0.2f seconds"
-                  " (%d succeeded, %d were skipped, %d failed, %d errored)" % summary)
-
-        sb.append(summarized_group)
 
     @synchronized
     def summarize_latest(self, sb):
@@ -238,7 +266,7 @@ class Suite(object):  # pylint: disable=too-many-instance-attributes
         sb.append("Executed %d times in %0.2f seconds:" % (num_iterations, total_time_taken))
 
         combined_summary = _summary.Summary(0, 0.0, 0, 0, 0, 0)
-        for iteration in xrange(num_iterations):
+        for iteration in range(num_iterations):
             # Summarize each execution as a bulleted list of results.
             bulleter_sb = []
             summary = self._summarize_report(reports[iteration], start_times[iteration],
@@ -275,7 +303,13 @@ class Suite(object):  # pylint: disable=too-many-instance-attributes
         # cannot be said to have succeeded.
         num_failed = report.num_failed + report.num_interrupted
         num_run = report.num_succeeded + report.num_errored + num_failed
-        num_skipped = len(self.tests) + report.num_dynamic - num_run
+        # The number of skipped tests is only known if self.options.time_repeat_tests_secs
+        # is not specified.
+        if self.options.time_repeat_tests_secs:
+            num_skipped = 0
+        else:
+            num_tests = len(self.tests) * self.options.num_repeat_tests
+            num_skipped = num_tests + report.num_dynamic - num_run
 
         if report.num_succeeded == num_run and num_skipped == 0:
             sb.append("All %d test(s) passed in %0.2f seconds." % (num_run, time_taken))
@@ -287,15 +321,27 @@ class Suite(object):  # pylint: disable=too-many-instance-attributes
         sb.append("%d test(s) ran in %0.2f seconds"
                   " (%d succeeded, %d were skipped, %d failed, %d errored)" % summary)
 
+        test_names = []
+
         if num_failed > 0:
             sb.append("The following tests failed (with exit code):")
             for test_info in itertools.chain(report.get_failed(), report.get_interrupted()):
-                sb.append("    %s (%d)" % (test_info.test_id, test_info.return_code))
+                test_names.append(test_info.test_file)
+                sb.append("    %s (%d %s)" % (test_info.test_file, test_info.return_code,
+                                              translate_exit_code(test_info.return_code)))
 
         if report.num_errored > 0:
             sb.append("The following tests had errors:")
             for test_info in report.get_errored():
-                sb.append("    %s" % (test_info.test_id))
+                test_names.append(test_info.test_file)
+                sb.append("    %s" % (test_info.test_file))
+
+        if num_failed > 0 or report.num_errored > 0:
+            test_names.sort(key=_report.test_order)
+            sb.append("If you're unsure where to begin investigating these errors, "
+                      "consider looking at tests in the following order:")
+            for test_name in test_names:
+                sb.append("    %s" % (test_name))
 
         return summary
 
@@ -303,8 +349,8 @@ class Suite(object):  # pylint: disable=too-many-instance-attributes
     def log_summaries(logger, suites, time_taken):
         """Log summary of all suites."""
         sb = []
-        sb.append("Summary of all suites: %d suites ran in %0.2f seconds" % (len(suites),
-                                                                             time_taken))
+        sb.append(
+            "Summary of all suites: %d suites ran in %0.2f seconds" % (len(suites), time_taken))
         for suite in suites:
             suite_sb = []
             suite.summarize(suite_sb)

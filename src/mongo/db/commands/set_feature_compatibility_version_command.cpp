@@ -1,30 +1,33 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -39,25 +42,59 @@
 #include "mongo/db/commands/feature_compatibility_version_parser.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/index_builds_coordinator.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/ops/write_ops.h"
+#include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/active_migrations_registry.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/migration_util.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/catalog/type_collection.h"
+#include "mongo/s/database_version_helpers.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/versioning.h"
 #include "mongo/util/exit.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
 namespace {
 
-MONGO_FP_DECLARE(featureCompatibilityDowngrade);
-MONGO_FP_DECLARE(featureCompatibilityUpgrade);
+MONGO_FAIL_POINT_DEFINE(featureCompatibilityDowngrade);
+MONGO_FAIL_POINT_DEFINE(featureCompatibilityUpgrade);
+MONGO_FAIL_POINT_DEFINE(failUpgrading);
+MONGO_FAIL_POINT_DEFINE(hangWhileUpgrading);
+MONGO_FAIL_POINT_DEFINE(failDowngrading);
+MONGO_FAIL_POINT_DEFINE(hangWhileDowngrading);
+
 /**
- * Sets the minimum allowed version for the cluster. If it is 3.4, then the node should not use 3.6
- * features.
+ * Deletes the persisted default read/write concern document.
+ */
+void deletePersistedDefaultRWConcernDocument(OperationContext* opCtx) {
+    DBDirectClient client(opCtx);
+    const auto commandResponse = client.runCommand([&] {
+        write_ops::Delete deleteOp(NamespaceString::kConfigSettingsNamespace);
+        deleteOp.setDeletes({[&] {
+            write_ops::DeleteOpEntry entry;
+            entry.setQ(BSON("_id" << ReadWriteConcernDefaults::kPersistedDocumentId));
+            entry.setMulti(false);
+            return entry;
+        }()});
+        return deleteOp.serialize({});
+    }());
+    uassertStatusOK(getStatusFromWriteCommandReply(commandResponse->getCommandReply()));
+}
+
+/**
+ * Sets the minimum allowed version for the cluster. If it is 4.4, then the node should not
+ * use 4.5.1 features.
  *
  * Format:
  * {
@@ -82,13 +119,14 @@ public:
     }
 
     std::string help() const override {
+        using FCVP = FeatureCompatibilityVersionParser;
         std::stringstream h;
-        h << "Set the API version exposed by this node. If set to \""
-          << FeatureCompatibilityVersionParser::kVersion36
-          << "\", then 4.0 features are disabled. If \""
-          << FeatureCompatibilityVersionParser::kVersion40
-          << "\", then 4.0 features are enabled, and all nodes in the cluster must be binary "
-             "version 4.0. See "
+        h << "Set the featureCompatibilityVersion exposed by this node. If set to '"
+          << FCVP::kVersion44 << "', then " << FCVP::kVersion451
+          << " features are disabled. If set to '" << FCVP::kVersion451 << "', then "
+          << FCVP::kVersion451
+          << " features are enabled, and all nodes in the cluster must be binary version "
+          << FCVP::kVersion451 << ". See "
           << feature_compatibility_version_documentation::kCompatibilityLink << ".";
         return h.str();
     }
@@ -122,11 +160,20 @@ public:
             auto waitForWCStatus = waitForWriteConcern(
                 opCtx,
                 repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp(),
-                WriteConcernOptions(
-                    WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, timeout),
+                WriteConcernOptions(repl::ReplSetConfig::kMajorityWriteConcernModeName,
+                                    WriteConcernOptions::SyncMode::UNSET,
+                                    timeout),
                 &res);
             CommandHelpers::appendCommandWCStatus(result, waitForWCStatus, res);
         });
+
+        {
+            // Acquire the global IX lock and then immediately release it to ensure this operation
+            // will be killed by the RstlKillOpThread during step-up or stepdown. Note that the
+            // RstlKillOpThread kills any operations on step-up or stepdown for which
+            // Locker::wasGlobalLockTakenInModeConflictingWithWrites() returns true.
+            Lock::GlobalLock lk(opCtx, MODE_IX);
+        }
 
         // Only allow one instance of setFeatureCompatibilityVersion to run at a time.
         invariant(!opCtx->lockState()->isLocked());
@@ -137,16 +184,15 @@ public:
         ServerGlobalParams::FeatureCompatibility::Version actualVersion =
             serverGlobalParams.featureCompatibility.getVersion();
 
-        if (requestedVersion == FeatureCompatibilityVersionParser::kVersion40) {
+        if (requestedVersion == FeatureCompatibilityVersionParser::kVersion451) {
             uassert(ErrorCodes::IllegalOperation,
-                    "cannot initiate featureCompatibilityVersion upgrade to 4.0 while a previous "
-                    "featureCompatibilityVersion downgrade to 3.6 has not completed. Finish "
-                    "downgrade to 3.6, then upgrade to 4.0.",
+                    "cannot initiate featureCompatibilityVersion upgrade to 4.5.1 while a previous "
+                    "featureCompatibilityVersion downgrade to 4.4 has not completed. Finish "
+                    "downgrade to 4.4, then upgrade to 4.5.1.",
                     actualVersion !=
-                        ServerGlobalParams::FeatureCompatibility::Version::kDowngradingTo36);
+                        ServerGlobalParams::FeatureCompatibility::Version::kDowngradingFrom451To44);
 
-            if (actualVersion ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40) {
+            if (actualVersion == ServerGlobalParams::FeatureCompatibility::Version::kVersion451) {
                 // Set the client's last opTime to the system last opTime so no-ops wait for
                 // writeConcern.
                 repl::ReplClientInfo::forClient(opCtx->getClient())
@@ -160,30 +206,26 @@ public:
                 // Take the global lock in S mode to create a barrier for operations taking the
                 // global IX or X locks. This ensures that either
                 //   - The global IX/X locked operation will start after the FCV change, see the
-                //     upgrading to 4.0 FCV and act accordingly.
+                //     upgrading to 4.5.1 FCV and act accordingly.
                 //   - The global IX/X locked operation began prior to the FCV change, is acting on
                 //     that assumption and will finish before upgrade procedures begin right after
                 //     this.
-                Lock::GlobalLock lk(opCtx, MODE_S, Date_t::max());
+                Lock::GlobalLock lk(opCtx, MODE_S);
+            }
+
+            if (failUpgrading.shouldFail())
+                return false;
+
+            if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+                const auto shardingState = ShardingState::get(opCtx);
+                if (shardingState->enabled()) {
+                    LOGV2(20500, "Upgrade: submitting orphaned ranges for cleanup");
+                    migrationutil::submitOrphanRangesForCleanup(opCtx);
+                }
             }
 
             // Upgrade shards before config finishes its upgrade.
             if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-                auto allDbs = uassertStatusOK(Grid::get(opCtx)->catalogClient()->getAllDBs(
-                    opCtx, repl::ReadConcernLevel::kLocalReadConcern));
-
-                for (const auto& db : allDbs.value) {
-                    const auto dbVersion = Versioning::newDatabaseVersion();
-
-                    uassertStatusOK(Grid::get(opCtx)->catalogClient()->updateConfigDocument(
-                        opCtx,
-                        DatabaseType::ConfigNS,
-                        BSON(DatabaseType::name(db.getName())),
-                        BSON("$set" << BSON(DatabaseType::version(dbVersion.toBSON()))),
-                        false,
-                        ShardingCatalogClient::kLocalWriteConcern));
-                }
-
                 uassertStatusOK(
                     ShardingCatalogManager::get(opCtx)->setFeatureCompatibilityVersionOnShards(
                         opCtx,
@@ -194,16 +236,17 @@ public:
                                      << requestedVersion)))));
             }
 
+            hangWhileUpgrading.pauseWhileSet(opCtx);
             FeatureCompatibilityVersion::unsetTargetUpgradeOrDowngrade(opCtx, requestedVersion);
-        } else if (requestedVersion == FeatureCompatibilityVersionParser::kVersion36) {
+        } else if (requestedVersion == FeatureCompatibilityVersionParser::kVersion44) {
             uassert(ErrorCodes::IllegalOperation,
-                    "cannot initiate setting featureCompatibilityVersion to 3.6 while a previous "
-                    "featureCompatibilityVersion upgrade to 4.0 has not completed.",
+                    "cannot initiate setting featureCompatibilityVersion to 4.4 while a previous "
+                    "featureCompatibilityVersion upgrade to 4.5.1 has not completed.",
                     actualVersion !=
-                        ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo40);
+                        ServerGlobalParams::FeatureCompatibility::Version::kUpgradingFrom44To451);
 
             if (actualVersion ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo36) {
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo44) {
                 // Set the client's last opTime to the system last opTime so no-ops wait for
                 // writeConcern.
                 repl::ReplClientInfo::forClient(opCtx->getClient())
@@ -211,17 +254,54 @@ public:
                 return true;
             }
 
+            auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+            const bool isReplSet =
+                replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
+
+            uassert(ErrorCodes::ConflictingOperationInProgress,
+                    str::stream() << "Cannot downgrade the cluster when the replica set config "
+                                  << "contains 'newlyAdded' members; wait for those members to "
+                                  << "finish its initial sync procedure",
+                    !(isReplSet && replCoord->replSetContainsNewlyAddedMembers()));
+
+            // We should make sure the current config w/o 'newlyAdded' members got replicated
+            // to all nodes.
+            LOGV2(4637904, "Waiting for the current replica set config to propagate to all nodes.");
+            // If a write concern is given, we'll use its wTimeout. It's kNoTimeout by default.
+            WriteConcernOptions writeConcern(repl::ReplSetConfig::kConfigAllWriteConcernName,
+                                             WriteConcernOptions::SyncMode::NONE,
+                                             opCtx->getWriteConcern().wTimeout);
+            writeConcern.checkCondition = WriteConcernOptions::CheckCondition::Config;
+            repl::OpTime fakeOpTime(Timestamp(1, 1), replCoord->getTerm());
+            uassertStatusOKWithContext(
+                replCoord->awaitReplication(opCtx, fakeOpTime, writeConcern).status,
+                "Failed to wait for the current replica set config to propagate to all "
+                "nodes");
+            LOGV2(4637905, "The current replica set config has been propagated to all nodes.");
+
             FeatureCompatibilityVersion::setTargetDowngrade(opCtx);
 
             {
                 // Take the global lock in S mode to create a barrier for operations taking the
                 // global IX or X locks. This ensures that either
                 //   - The global IX/X locked operation will start after the FCV change, see the
-                //     downgrading to 3.6 FCV and act accordingly.
+                //     downgrading to 4.4 FCV and act accordingly.
                 //   - The global IX/X locked operation began prior to the FCV change, is acting on
                 //     that assumption and will finish before downgrade procedures begin right after
                 //     this.
-                Lock::GlobalLock lk(opCtx, MODE_S, Date_t::max());
+                Lock::GlobalLock lk(opCtx, MODE_S);
+            }
+
+            if (failDowngrading.shouldFail())
+                return false;
+
+            if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+                LOGV2(20502, "Downgrade: dropping config.rangeDeletions collection");
+                migrationutil::dropRangeDeletionsCollection(opCtx);
+            } else if (isReplSet || serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+                // The default rwc document should only be deleted on plain replica sets and the
+                // config server replica set, not on shards or standalones.
+                deletePersistedDefaultRWConcernDocument(opCtx);
             }
 
             // Downgrade shards before config finishes its downgrade.
@@ -234,22 +314,9 @@ public:
                                 cmdObj,
                                 BSON(FeatureCompatibilityVersionCommandParser::kCommandName
                                      << requestedVersion)))));
-
-                const auto allDbs = uassertStatusOK(Grid::get(opCtx)->catalogClient()->getAllDBs(
-                    opCtx, repl::ReadConcernLevel::kLocalReadConcern));
-
-                for (const auto& db : allDbs.value) {
-                    uassertStatusOK(Grid::get(opCtx)->catalogClient()->updateConfigDocument(
-                        opCtx,
-                        DatabaseType::ConfigNS,
-                        BSON(DatabaseType::name(db.getName())),
-                        BSON("$unset" << BSON("version"
-                                              << "")),
-                        false,
-                        ShardingCatalogClient::kLocalWriteConcern));
-                }
             }
 
+            hangWhileDowngrading.pauseWhileSet(opCtx);
             FeatureCompatibilityVersion::unsetTargetUpgradeOrDowngrade(opCtx, requestedVersion);
         }
 

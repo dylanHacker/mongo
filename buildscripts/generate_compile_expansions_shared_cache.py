@@ -1,12 +1,10 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 Generate the compile expansions file used by Evergreen as part of the push/release process.
 
 Invoke by specifying an output file.
 $ python generate_compile_expansions.py --out compile_expansions.yml
 """
-
-from __future__ import print_function
 
 import argparse
 import json
@@ -64,9 +62,11 @@ def generate_version_expansions():
     if version_parts[0]:
         expansions["suffix"] = "latest"
         expansions["src_suffix"] = "latest"
+        expansions["is_release"] = "false"
     else:
         expansions["suffix"] = version_line
         expansions["src_suffix"] = "r{0}".format(version_line)
+        expansions["is_release"] = "true"
     expansions["version"] = version_line
 
     return expansions
@@ -93,11 +93,14 @@ def generate_scons_cache_expansions():
 
     # Global shared cache using EFS
     if os.getenv("SCONS_CACHE_SCOPE") == "shared":
-        default_cache_path = os.path.join("/efs", system_uuid, "scons-cache")
+        if sys.platform.startswith("win"):
+            shared_mount_root = 'X:\\'
+        else:
+            shared_mount_root = '/efs'
+        default_cache_path = os.path.join(shared_mount_root, system_uuid, "scons-cache")
         expansions["scons_cache_path"] = default_cache_path
-
-        # Patches are read only
-        if os.getenv("IS_PATCH"):
+        # Patches are read only, unless they are for a commit queue merge.
+        if os.getenv("IS_PATCH") and os.getenv("IS_COMMIT_QUEUE") != "true":
             expansions[
                 "scons_cache_args"] = "--cache={0} --cache-dir='{1}' --cache-readonly".format(
                     scons_cache_mode, default_cache_path)

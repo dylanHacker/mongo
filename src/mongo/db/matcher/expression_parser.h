@@ -1,25 +1,24 @@
-// expression_parser.h
-
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,6 +28,8 @@
  */
 
 #pragma once
+
+#include <functional>
 
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
@@ -42,7 +43,6 @@
 #include "mongo/db/matcher/schema/expression_internal_schema_allowed_properties.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -63,6 +63,8 @@ enum class PathAcceptingKeyword {
     GREATER_THAN_OR_EQUAL,
     INTERNAL_EXPR_EQ,
     INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX,
+    INTERNAL_SCHEMA_BIN_DATA_ENCRYPTED_TYPE,
+    INTERNAL_SCHEMA_BIN_DATA_SUBTYPE,
     INTERNAL_SCHEMA_EQ,
     INTERNAL_SCHEMA_FMOD,
     INTERNAL_SCHEMA_MATCH_ARRAY_INDEX,
@@ -97,18 +99,14 @@ public:
         kJavascript = 1 << 2,
         kExpr = 1 << 3,
         kJSONSchema = 1 << 4,
+        kEncryptKeywords = 1 << 5,
     };
     using AllowedFeatureSet = unsigned long long;
     static constexpr AllowedFeatureSet kBanAllSpecialFeatures = 0;
     static constexpr AllowedFeatureSet kAllowAllSpecialFeatures =
         std::numeric_limits<unsigned long long>::max();
     static constexpr AllowedFeatureSet kDefaultSpecialFeatures =
-        AllowedFeatures::kExpr | AllowedFeatures::kJSONSchema;
-
-    /**
-     * Constant double representation of 2^63.
-     */
-    static const double kLongLongMaxPlusOneAsDouble;
+        AllowedFeatures::kExpr | AllowedFeatures::kJSONSchema | AllowedFeatures::kEncryptKeywords;
 
     /**
      * Parses PathAcceptingKeyword from 'typeElem'. Returns 'defaultKeyword' if 'typeElem'
@@ -129,33 +127,13 @@ public:
         AllowedFeatureSet allowedFeatures = kDefaultSpecialFeatures);
 
     /**
-     * Parses a BSONElement of any numeric type into a positive long long, failing if the value
-     * is any of the following:
-     *
-     * - NaN.
-     * - Negative.
-     * - A floating point number which is not integral.
-     * - Too large to fit within a 64-bit signed integer.
+     * Parse the given MatchExpression and normalize the resulting tree by optimizing and then
+     * sorting it. Throws if the given BSONObj fails to parse.
      */
-    static StatusWith<long long> parseIntegerElementToNonNegativeLong(BSONElement elem);
-
-    /**
-     * Parses a BSONElement of any numeric type into a long long, failing if the value
-     * is any of the following:
-     *
-     * - NaN.
-     * - A floating point number which is not integral.
-     * - Too large in the positive or negative direction to fit within a 64-bit signed integer.
-     */
-    static StatusWith<long long> parseIntegerElementToLong(BSONElement elem);
-
-    /**
-     * Parses a BSONElement of any numeric type into an integer, failing if the value is:
-     *
-     * - NaN
-     * - a non-integral number
-     * - too large in the positive or negative direction to fit in an int
-     */
-    static StatusWith<int> parseIntegerElementToInt(BSONElement elem);
+    static std::unique_ptr<MatchExpression> parseAndNormalize(
+        const BSONObj& obj,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const ExtensionsCallback& extensionsCallback = ExtensionsCallbackNoop(),
+        AllowedFeatureSet allowedFeatures = kDefaultSpecialFeatures);
 };
 }  // namespace mongo

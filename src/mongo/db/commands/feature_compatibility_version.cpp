@@ -1,54 +1,62 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/commands/feature_compatibility_version.h"
 
 #include "mongo/base/status.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands/feature_compatibility_version_documentation.h"
+#include "mongo/db/commands/feature_compatibility_version_gen.h"
 #include "mongo/db/commands/feature_compatibility_version_parser.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/kill_sessions_local.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/db/server_parameters.h"
+#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/executor/egress_tag_closer_manager.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/grid.h"
 #include "mongo/transport/service_entry_point.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -56,13 +64,15 @@ using repl::UnreplicatedWritesBlock;
 
 Lock::ResourceMutex FeatureCompatibilityVersion::fcvLock("featureCompatibilityVersionLock");
 
+MONGO_FAIL_POINT_DEFINE(hangBeforeAbortingRunningTransactionsOnFCVDowngrade);
+
 void FeatureCompatibilityVersion::setTargetUpgrade(OperationContext* opCtx) {
     // Sets both 'version' and 'targetVersion' fields.
     _runUpdateCommand(opCtx, [](auto updateMods) {
         updateMods.append(FeatureCompatibilityVersionParser::kVersionField,
-                          FeatureCompatibilityVersionParser::kVersion36);
+                          FeatureCompatibilityVersionParser::kVersion44);
         updateMods.append(FeatureCompatibilityVersionParser::kTargetVersionField,
-                          FeatureCompatibilityVersionParser::kVersion40);
+                          FeatureCompatibilityVersionParser::kVersion451);
     });
 }
 
@@ -70,9 +80,9 @@ void FeatureCompatibilityVersion::setTargetDowngrade(OperationContext* opCtx) {
     // Sets both 'version' and 'targetVersion' fields.
     _runUpdateCommand(opCtx, [](auto updateMods) {
         updateMods.append(FeatureCompatibilityVersionParser::kVersionField,
-                          FeatureCompatibilityVersionParser::kVersion36);
+                          FeatureCompatibilityVersionParser::kVersion44);
         updateMods.append(FeatureCompatibilityVersionParser::kTargetVersionField,
-                          FeatureCompatibilityVersionParser::kVersion36);
+                          FeatureCompatibilityVersionParser::kVersion44);
     });
 }
 
@@ -115,17 +125,16 @@ void FeatureCompatibilityVersion::setIfCleanStartup(OperationContext* opCtx,
         repl::TimestampedBSONObj{
             BSON("_id" << FeatureCompatibilityVersionParser::kParameterName
                        << FeatureCompatibilityVersionParser::kVersionField
-                       << (storeUpgradeVersion ? FeatureCompatibilityVersionParser::kVersion40
-                                               : FeatureCompatibilityVersionParser::kVersion36)),
+                       << (storeUpgradeVersion ? FeatureCompatibilityVersionParser::kVersion451
+                                               : FeatureCompatibilityVersionParser::kVersion44)),
             Timestamp()},
         repl::OpTime::kUninitializedTerm));  // No timestamp or term because this write is not
                                              // replicated.
 }
 
 bool FeatureCompatibilityVersion::isCleanStartUp() {
-    std::vector<std::string> dbNames;
-    StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
-    storageEngine->listDatabases(&dbNames);
+    StorageEngine* storageEngine = getGlobalServiceContext()->getStorageEngine();
+    std::vector<std::string> dbNames = storageEngine->listDatabases();
 
     for (auto&& dbName : dbNames) {
         if (dbName != "local") {
@@ -145,64 +154,114 @@ void FeatureCompatibilityVersion::onInsertOrUpdate(OperationContext* opCtx, cons
 
     // To avoid extra log messages when the targetVersion is set/unset, only log when the version
     // changes.
-    bool isDifferent = serverGlobalParams.featureCompatibility.isVersionInitialized()
-        ? serverGlobalParams.featureCompatibility.getVersion() != newVersion
-        : true;
-    if (isDifferent) {
-        log() << "setting featureCompatibilityVersion to "
-              << FeatureCompatibilityVersionParser::toString(newVersion);
+    logv2::DynamicAttributes attrs;
+    bool isDifferent = true;
+    if (serverGlobalParams.featureCompatibility.isVersionInitialized()) {
+        const auto currentVersion = serverGlobalParams.featureCompatibility.getVersion();
+        attrs.add("currentVersion", FeatureCompatibilityVersionParser::toString(currentVersion));
+        isDifferent = currentVersion != newVersion;
     }
 
-    // On commit, update the server parameters, and close any connections with a wire version that
-    // is below the minimum.
-    opCtx->recoveryUnit()->onCommit([opCtx, newVersion]() {
-        serverGlobalParams.featureCompatibility.setVersion(newVersion);
-        updateMinWireVersion();
+    if (isDifferent) {
+        attrs.add("newVersion", FeatureCompatibilityVersionParser::toString(newVersion));
+        LOGV2(20459, "Setting featureCompatibilityVersion", attrs);
+    }
 
-        if (newVersion != ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo36) {
-            // Close all incoming connections from internal clients with binary versions lower than
-            // ours.
-            opCtx->getServiceContext()->getServiceEntryPoint()->endAllSessions(
-                transport::Session::kLatestVersionInternalClientKeepOpen |
-                transport::Session::kExternalClientKeepOpen);
-            // Close all outgoing connections to servers with binary versions lower than ours.
-            executor::EgressTagCloserManager::get(opCtx->getServiceContext())
-                .dropConnections(transport::Session::kKeepOpen);
-        }
-    });
+    opCtx->recoveryUnit()->onCommit(
+        [opCtx, newVersion](boost::optional<Timestamp>) { _setVersion(opCtx, newVersion); });
 }
 
 void FeatureCompatibilityVersion::updateMinWireVersion() {
     WireSpec& spec = WireSpec::instance();
 
     switch (serverGlobalParams.featureCompatibility.getVersion()) {
-        case ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40:
-        case ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo40:
-        case ServerGlobalParams::FeatureCompatibility::Version::kDowngradingTo36:
+        case ServerGlobalParams::FeatureCompatibility::kLatest:
+        case ServerGlobalParams::FeatureCompatibility::Version::kUpgradingFrom44To451:
+        case ServerGlobalParams::FeatureCompatibility::Version::kDowngradingFrom451To44:
             spec.incomingInternalClient.minWireVersion = LATEST_WIRE_VERSION;
             spec.outgoing.minWireVersion = LATEST_WIRE_VERSION;
             return;
-        case ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo36:
+        case ServerGlobalParams::FeatureCompatibility::kLastLTS:
             spec.incomingInternalClient.minWireVersion = LATEST_WIRE_VERSION - 1;
             spec.outgoing.minWireVersion = LATEST_WIRE_VERSION - 1;
             return;
-        case ServerGlobalParams::FeatureCompatibility::Version::kUnsetDefault36Behavior:
+        case ServerGlobalParams::FeatureCompatibility::Version::kUnsetDefault44Behavior:
             // getVersion() does not return this value.
             MONGO_UNREACHABLE;
+    }
+}
+
+void FeatureCompatibilityVersion::_setVersion(
+    OperationContext* opCtx, ServerGlobalParams::FeatureCompatibility::Version newVersion) {
+    serverGlobalParams.featureCompatibility.setVersion(newVersion);
+    updateMinWireVersion();
+
+    if (newVersion != ServerGlobalParams::FeatureCompatibility::kLastLTS) {
+        // Close all incoming connections from internal clients with binary versions lower than
+        // ours.
+        opCtx->getServiceContext()->getServiceEntryPoint()->endAllSessions(
+            transport::Session::kLatestVersionInternalClientKeepOpen |
+            transport::Session::kExternalClientKeepOpen);
+        // Close all outgoing connections to servers with binary versions lower than ours.
+        executor::EgressTagCloserManager::get(opCtx->getServiceContext())
+            .dropConnections(transport::Session::kKeepOpen);
+    }
+
+    if (newVersion != ServerGlobalParams::FeatureCompatibility::kLatest) {
+        if (MONGO_unlikely(hangBeforeAbortingRunningTransactionsOnFCVDowngrade.shouldFail())) {
+            LOGV2(20460,
+                  "FeatureCompatibilityVersion - "
+                  "hangBeforeAbortingRunningTransactionsOnFCVDowngrade fail point enabled, "
+                  "blocking until fail point is disabled");
+            hangBeforeAbortingRunningTransactionsOnFCVDowngrade.pauseWhileSet();
+        }
+        // Abort all open transactions when downgrading the featureCompatibilityVersion.
+        SessionKiller::Matcher matcherAllSessions(
+            KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
+        killSessionsAbortUnpreparedTransactions(opCtx, matcherAllSessions);
+    }
+    const auto replCoordinator = repl::ReplicationCoordinator::get(opCtx);
+    const bool isReplSet =
+        replCoordinator->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
+    // We only want to increment the server TopologyVersion when the minWireVersion has changed.
+    // This can only happen in two scenarios:
+    // 1. Setting featureCompatibilityVersion from downgrading to fullyDowngraded.
+    // 2. Setting featureCompatibilityVersion from fullyDowngraded to upgrading.
+    const auto shouldIncrementTopologyVersion =
+        newVersion == ServerGlobalParams::FeatureCompatibility::kLastLTS ||
+        newVersion == ServerGlobalParams::FeatureCompatibility::Version::kUpgradingFrom44To451;
+    if (isReplSet && shouldIncrementTopologyVersion) {
+        replCoordinator->incrementTopologyVersion();
+    }
+}
+
+void FeatureCompatibilityVersion::onReplicationRollback(OperationContext* opCtx) {
+    const auto query = BSON("_id" << FeatureCompatibilityVersionParser::kParameterName);
+    const auto swFcv = repl::StorageInterface::get(opCtx)->findById(
+        opCtx, NamespaceString::kServerConfigurationNamespace, query["_id"]);
+    if (swFcv.isOK()) {
+        const auto featureCompatibilityVersion = swFcv.getValue();
+        auto swVersion = FeatureCompatibilityVersionParser::parse(featureCompatibilityVersion);
+        const auto memoryFcv = serverGlobalParams.featureCompatibility.getVersion();
+        if (swVersion.isOK() && (swVersion.getValue() != memoryFcv)) {
+            auto diskFcv = swVersion.getValue();
+            LOGV2(4675801,
+                  "Setting featureCompatibilityVersion as part of rollback",
+                  "newVersion"_attr = FeatureCompatibilityVersionParser::toString(diskFcv),
+                  "oldVersion"_attr = FeatureCompatibilityVersionParser::toString(memoryFcv));
+            _setVersion(opCtx, diskFcv);
+        }
     }
 }
 
 void FeatureCompatibilityVersion::_validateVersion(StringData version) {
     uassert(40284,
             str::stream() << "featureCompatibilityVersion must be '"
-                          << FeatureCompatibilityVersionParser::kVersion40
-                          << "' or '"
-                          << FeatureCompatibilityVersionParser::kVersion36
-                          << "'. See "
-                          << feature_compatibility_version_documentation::kCompatibilityLink
-                          << ".",
-            version == FeatureCompatibilityVersionParser::kVersion40 ||
-                version == FeatureCompatibilityVersionParser::kVersion36);
+                          << FeatureCompatibilityVersionParser::kVersion451 << "' or '"
+                          << FeatureCompatibilityVersionParser::kVersion44 << "'. See "
+                          << feature_compatibility_version_documentation::kCompatibilityLink << ".",
+            version == FeatureCompatibilityVersionParser::kVersion451 ||
+                version == FeatureCompatibilityVersionParser::kVersion44);
 }
 
 void FeatureCompatibilityVersion::_runUpdateCommand(OperationContext* opCtx,
@@ -227,7 +286,11 @@ void FeatureCompatibilityVersion::_runUpdateCommand(OperationContext* opCtx,
             updateSpec.appendBool("upsert", true);
         }
     }
-    updateCmd.append(WriteConcernOptions::kWriteConcernField, WriteConcernOptions::Majority);
+    auto timeout = opCtx->getWriteConcern().usedDefault ? WriteConcernOptions::kNoTimeout
+                                                        : opCtx->getWriteConcern().wTimeout;
+    auto newWC = WriteConcernOptions(
+        WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, timeout);
+    updateCmd.append(WriteConcernOptions::kWriteConcernField, newWC.toBSON());
 
     // Update the featureCompatibilityVersion document stored in the server configuration
     // collection.
@@ -239,69 +302,58 @@ void FeatureCompatibilityVersion::_runUpdateCommand(OperationContext* opCtx,
 /**
  * Read-only server parameter for featureCompatibilityVersion.
  */
-class FeatureCompatibilityVersionParameter : public ServerParameter {
-public:
-    FeatureCompatibilityVersionParameter()
-        : ServerParameter(ServerParameterSet::getGlobal(),
-                          FeatureCompatibilityVersionParser::kParameterName.toString(),
-                          false,  // allowedToChangeAtStartup
-                          false   // allowedToChangeAtRuntime
-                          ) {}
+// No ability to specify 'none' as set_at type,
+// so use 'startup' in the IDL file, then override to none here.
+FeatureCompatibilityVersionParameter::FeatureCompatibilityVersionParameter(StringData name,
+                                                                           ServerParameterType)
+    : ServerParameter(ServerParameterSet::getGlobal(), name, false, false) {}
 
-    virtual void append(OperationContext* opCtx, BSONObjBuilder& b, const std::string& name) {
-        BSONObjBuilder featureCompatibilityVersionBuilder(b.subobjStart(name));
-        switch (serverGlobalParams.featureCompatibility.getVersion()) {
-            case ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40:
-                featureCompatibilityVersionBuilder.append(
-                    FeatureCompatibilityVersionParser::kVersionField,
-                    FeatureCompatibilityVersionParser::kVersion40);
-                return;
-            case ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo40:
-                featureCompatibilityVersionBuilder.append(
-                    FeatureCompatibilityVersionParser::kVersionField,
-                    FeatureCompatibilityVersionParser::kVersion36);
-                featureCompatibilityVersionBuilder.append(
-                    FeatureCompatibilityVersionParser::kTargetVersionField,
-                    FeatureCompatibilityVersionParser::kVersion40);
-                return;
-            case ServerGlobalParams::FeatureCompatibility::Version::kDowngradingTo36:
-                featureCompatibilityVersionBuilder.append(
-                    FeatureCompatibilityVersionParser::kVersionField,
-                    FeatureCompatibilityVersionParser::kVersion36);
-                featureCompatibilityVersionBuilder.append(
-                    FeatureCompatibilityVersionParser::kTargetVersionField,
-                    FeatureCompatibilityVersionParser::kVersion36);
-                return;
-            case ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo36:
-                featureCompatibilityVersionBuilder.append(
-                    FeatureCompatibilityVersionParser::kVersionField,
-                    FeatureCompatibilityVersionParser::kVersion36);
-                return;
-            case ServerGlobalParams::FeatureCompatibility::Version::kUnsetDefault36Behavior:
-                // getVersion() does not return this value.
-                MONGO_UNREACHABLE;
-        }
+void FeatureCompatibilityVersionParameter::append(OperationContext* opCtx,
+                                                  BSONObjBuilder& b,
+                                                  const std::string& name) {
+    uassert(ErrorCodes::UnknownFeatureCompatibilityVersion,
+            str::stream() << name << " is not yet known.",
+            serverGlobalParams.featureCompatibility.isVersionInitialized());
+
+    BSONObjBuilder featureCompatibilityVersionBuilder(b.subobjStart(name));
+    switch (serverGlobalParams.featureCompatibility.getVersion()) {
+        case ServerGlobalParams::FeatureCompatibility::kLatest:
+            featureCompatibilityVersionBuilder.append(
+                FeatureCompatibilityVersionParser::kVersionField,
+                FeatureCompatibilityVersionParser::kVersion451);
+            return;
+        case ServerGlobalParams::FeatureCompatibility::Version::kUpgradingFrom44To451:
+            featureCompatibilityVersionBuilder.append(
+                FeatureCompatibilityVersionParser::kVersionField,
+                FeatureCompatibilityVersionParser::kVersion44);
+            featureCompatibilityVersionBuilder.append(
+                FeatureCompatibilityVersionParser::kTargetVersionField,
+                FeatureCompatibilityVersionParser::kVersion451);
+            return;
+        case ServerGlobalParams::FeatureCompatibility::Version::kDowngradingFrom451To44:
+            featureCompatibilityVersionBuilder.append(
+                FeatureCompatibilityVersionParser::kVersionField,
+                FeatureCompatibilityVersionParser::kVersion44);
+            featureCompatibilityVersionBuilder.append(
+                FeatureCompatibilityVersionParser::kTargetVersionField,
+                FeatureCompatibilityVersionParser::kVersion44);
+            return;
+        case ServerGlobalParams::FeatureCompatibility::kLastLTS:
+            featureCompatibilityVersionBuilder.append(
+                FeatureCompatibilityVersionParser::kVersionField,
+                FeatureCompatibilityVersionParser::kVersion44);
+            return;
+        case ServerGlobalParams::FeatureCompatibility::Version::kUnsetDefault44Behavior:
+            // getVersion() does not return this value.
+            MONGO_UNREACHABLE;
     }
+}
 
-    virtual Status set(const BSONElement& newValueElement) {
-        return Status(ErrorCodes::IllegalOperation,
-                      str::stream()
-                          << FeatureCompatibilityVersionParser::kParameterName
-                          << " cannot be set via setParameter. See "
+Status FeatureCompatibilityVersionParameter::setFromString(const std::string&) {
+    return {ErrorCodes::IllegalOperation,
+            str::stream() << name() << " cannot be set via setParameter. See "
                           << feature_compatibility_version_documentation::kCompatibilityLink
-                          << ".");
-    }
-
-    virtual Status setFromString(const std::string& str) {
-        return Status(ErrorCodes::IllegalOperation,
-                      str::stream()
-                          << FeatureCompatibilityVersionParser::kParameterName
-                          << " cannot be set via setParameter. See "
-                          << feature_compatibility_version_documentation::kCompatibilityLink
-                          << ".");
-    }
-} featureCompatibilityVersionParameter;
-
-MONGO_EXPORT_STARTUP_SERVER_PARAMETER(internalValidateFeaturesAsMaster, bool, true);
+                          << "."};
+}
 
 }  // namespace mongo

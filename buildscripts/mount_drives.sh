@@ -99,16 +99,17 @@ function mount_drive {
       echo "Looking for drive '$drive' to mount $root_dir"
       if [ -d /cygdrive/$drive ]; then
         echo "Found drive"
-        rm -rf $root_dir
+        rm -rf /$root_dir
         rm -rf /cygdrive/$system_drive/$root_dir
+        mkdir $drive:\\$root_dir
         cmd.exe /c mklink /J $system_drive:\\$root_dir $drive:\\$root_dir
-        ln -s /cygdrive/$system_drive/$root_dir /$root_dir
-        setfacl -s user::rwx,group::rwx,other::rwx $drive:\\$root_dir
+        ln -s /cygdrive/$drive/$root_dir /$root_dir
+        setfacl -s user::rwx,group::rwx,other::rwx /cygdrive/$drive/$root_dir
         for sub_dir in $sub_dirs
         do
             mkdir -p /cygdrive/$drive/$root_dir/$sub_dir
         done
-        chown -R $user_group /$root_dir
+        chown -R $user_group /cygdrive/$system_drive/$root_dir
         break
       fi
       let drive_poll_retry=drive_poll_retry+1
@@ -146,15 +147,24 @@ function mount_drive {
       /sbin/mdadm --detail --scan > /etc/mdadm.conf
       /sbin/blockdev --setra 32 $device_name
     else
-      device_name=$devices
+      device_name="/dev/$device_names"
     fi
 
     # Mount the $root_dir drive(s)
     /sbin/mkfs.$fs_type $mount_options -f $device_name
-    echo "$device_name /$root_dir auto noatime 0 0" | tee -a /etc/fstab
+    # We add an entry for the device to /etc/fstab so it is automatically mounted following a
+    # machine reboot. The device is not guaranteed to be assigned the same name across restarts so
+    # we use its UUID in order to identify it.
+    #
+    # We also specify type=$fs_type in the /etc/fstab entry because specifying type=auto on
+    # Amazon Linux AMI 2018.03 leads to the drive not being mounted automatically following a
+    # machine reboot.
+    device_uuid=$(blkid -o value -s UUID "$device_name")
+    echo "Adding entry to /etc/fstab for device '$device_name' with UUID '$device_uuid'"
+    echo "UUID=$device_uuid /$root_dir $fs_type noatime 0 0" | tee -a /etc/fstab
     mkdir /$root_dir || true
     chmod 777 /$root_dir
-    mount -t $fs_type $device_name /$root_dir
+    mount -t $fs_type "UUID=$device_uuid" /$root_dir
     for sub_dir in $sub_dirs
     do
       mkdir -p /$root_dir/$sub_dir

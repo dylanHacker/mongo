@@ -1,29 +1,30 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -32,7 +33,7 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/logger/redaction.h"
+#include "mongo/logv2/redaction.h"
 
 namespace mongo {
 namespace {
@@ -46,9 +47,13 @@ const char kToShardId[] = "toShard";
 const char kMaxChunkSizeBytes[] = "maxChunkSizeBytes";
 const char kWaitForDelete[] = "waitForDelete";
 const char kWaitForDeleteDeprecated[] = "_waitForDelete";
-const char kTakeDistLock[] = "takeDistLock";  // TODO: delete in 3.8
+const char kForceJumbo[] = "forceJumbo";
 
 }  // namespace
+
+constexpr StringData MoveChunkRequest::kDoNotForce;
+constexpr StringData MoveChunkRequest::kForceManual;
+constexpr StringData MoveChunkRequest::kForceBalancer;
 
 MoveChunkRequest::MoveChunkRequest(NamespaceString nss,
                                    ChunkRange range,
@@ -56,6 +61,32 @@ MoveChunkRequest::MoveChunkRequest(NamespaceString nss,
     : _nss(std::move(nss)),
       _range(std::move(range)),
       _secondaryThrottle(std::move(secondaryThrottle)) {}
+
+std::string MoveChunkRequest::forceJumboToString(ForceJumbo forceJumboVal) {
+    switch (forceJumboVal) {
+        case ForceJumbo::kDoNotForce:
+            return kDoNotForce.toString();
+        case ForceJumbo::kForceManual:
+            return kForceManual.toString();
+        case ForceJumbo::kForceBalancer:
+            return kForceBalancer.toString();
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
+MoveChunkRequest::ForceJumbo MoveChunkRequest::parseForceJumbo(std::string forceJumbo) {
+    if (forceJumbo == kDoNotForce)
+        return ForceJumbo::kDoNotForce;
+
+    if (forceJumbo == kForceManual)
+        return ForceJumbo::kForceManual;
+
+    if (forceJumbo == kForceBalancer)
+        return ForceJumbo::kForceBalancer;
+
+    MONGO_UNREACHABLE;
+}
 
 StatusWith<MoveChunkRequest> MoveChunkRequest::createFromCommand(NamespaceString nss,
                                                                  const BSONObj& obj) {
@@ -117,6 +148,20 @@ StatusWith<MoveChunkRequest> MoveChunkRequest::createFromCommand(NamespaceString
     }
 
     {
+        long long forceJumboVal{0};
+        Status status = bsonExtractIntegerFieldWithDefault(obj, kForceJumbo, 0, &forceJumboVal);
+        if (!status.isOK()) {
+            return status;
+        }
+        auto forceJumbo = ForceJumbo{int(forceJumboVal)};
+        if (forceJumbo != ForceJumbo::kDoNotForce && forceJumbo != ForceJumbo::kForceManual &&
+            forceJumbo != ForceJumbo::kForceBalancer) {
+            return Status{ErrorCodes::BadValue, "Unknown value for forceJumbo"};
+        }
+        request._forceJumbo = forceJumboToString(forceJumbo);
+    }
+
+    {
         long long maxChunkSizeBytes;
         Status status = bsonExtractIntegerField(obj, kMaxChunkSizeBytes, &maxChunkSizeBytes);
         if (!status.isOK()) {
@@ -124,16 +169,6 @@ StatusWith<MoveChunkRequest> MoveChunkRequest::createFromCommand(NamespaceString
         }
 
         request._maxChunkSizeBytes = static_cast<int64_t>(maxChunkSizeBytes);
-    }
-
-    {  // TODO: delete this block in 3.8
-        bool takeDistLock = false;
-        Status status = bsonExtractBooleanField(obj, kTakeDistLock, &takeDistLock);
-        if (status.isOK() && takeDistLock) {
-            return Status{ErrorCodes::IncompatibleShardingConfigVersion,
-                          str::stream()
-                              << "Request received from an older, incompatible mongodb version"};
-        }
     }
 
     return request;
@@ -148,12 +183,13 @@ void MoveChunkRequest::appendAsCommand(BSONObjBuilder* builder,
                                        const ChunkRange& range,
                                        int64_t maxChunkSizeBytes,
                                        const MigrationSecondaryThrottleOptions& secondaryThrottle,
-                                       bool waitForDelete) {
+                                       bool waitForDelete,
+                                       ForceJumbo forceJumbo) {
     invariant(builder->asTempObj().isEmpty());
     invariant(nss.isValid());
 
     builder->append(kMoveChunk, nss.ns());
-    chunkVersion.appendForCommands(builder);  // 3.4 shard compatibility
+    chunkVersion.appendToCommand(builder);  // 3.4 shard compatibility
     builder->append(kEpoch, chunkVersion.epoch());
     // config connection string is included for 3.4 shard compatibility
     builder->append(kConfigServerConnectionString, configServerConnectionString.toString());
@@ -163,7 +199,7 @@ void MoveChunkRequest::appendAsCommand(BSONObjBuilder* builder,
     builder->append(kMaxChunkSizeBytes, static_cast<long long>(maxChunkSizeBytes));
     secondaryThrottle.append(builder);
     builder->append(kWaitForDelete, waitForDelete);
-    builder->append(kTakeDistLock, false);
+    builder->append(kForceJumbo, forceJumbo);
 }
 
 bool MoveChunkRequest::operator==(const MoveChunkRequest& other) const {
@@ -176,6 +212,8 @@ bool MoveChunkRequest::operator==(const MoveChunkRequest& other) const {
     if (_range != other._range)
         return false;
     if (_waitForDelete != other._waitForDelete)
+        return false;
+    if (_forceJumbo != other._forceJumbo)
         return false;
     return true;
 }

@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -31,8 +32,6 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
-#include "mongo/rpc/command_reply.h"
-#include "mongo/rpc/command_reply_builder.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/legacy_reply.h"
 #include "mongo/rpc/legacy_reply_builder.h"
@@ -55,11 +54,6 @@ TEST(LegacyReplyBuilder, RoundTrip) {
     testRoundTrip<rpc::LegacyReply>(r, true);
 }
 
-TEST(CommandReplyBuilder, RoundTrip) {
-    rpc::CommandReplyBuilder r;
-    testRoundTrip<rpc::CommandReply>(r, false);
-}
-
 TEST(OpMsgReplyBuilder, RoundTrip) {
     rpc::OpMsgReplyBuilder r;
     testRoundTrip<rpc::OpMsgReply>(r, true);
@@ -71,11 +65,6 @@ void testErrors(rpc::ReplyBuilderInterface& replyBuilder);
 TEST(LegacyReplyBuilder, Errors) {
     rpc::LegacyReplyBuilder r;
     testErrors<rpc::LegacyReply>(r);
-}
-
-TEST(CommandReplyBuilder, Errors) {
-    rpc::CommandReplyBuilder r;
-    testErrors<rpc::CommandReply>(r);
 }
 
 TEST(OpMsgReplyBuilder, Errors) {
@@ -128,20 +117,6 @@ BSONObj buildErrReply(const Status status, const BSONObj& extraInfo = {}) {
     return bob.obj();
 }
 
-TEST(CommandReplyBuilder, CommandError) {
-    const Status status(ErrorCodes::InvalidLength, "Response payload too long");
-    BSONObj metadata = buildMetadata();
-    rpc::CommandReplyBuilder replyBuilder;
-    replyBuilder.setCommandReply(status);
-    replyBuilder.setMetadata(metadata);
-    auto msg = replyBuilder.done();
-
-    rpc::CommandReply parsed(&msg);
-
-    ASSERT_BSONOBJ_EQ(parsed.getMetadata(), metadata);
-    ASSERT_BSONOBJ_EQ(parsed.getCommandReply(), buildErrReply(status));
-}
-
 TEST(LegacyReplyBuilder, CommandError) {
     const Status status(ErrorCodes::InvalidLength, "Response payload too long");
     BSONObj metadata = buildMetadata();
@@ -151,7 +126,7 @@ TEST(LegacyReplyBuilder, CommandError) {
     const BSONObj extraObj = extra.obj();
     rpc::LegacyReplyBuilder replyBuilder;
     replyBuilder.setCommandReply(status, extraObj);
-    replyBuilder.setMetadata(metadata);
+    replyBuilder.getBodyBuilder().appendElements(metadata);
     auto msg = replyBuilder.done();
 
     rpc::LegacyReply parsed(&msg);
@@ -162,7 +137,6 @@ TEST(LegacyReplyBuilder, CommandError) {
         return unifiedBuilder.obj();
     }());
 
-    ASSERT_BSONOBJ_EQ(parsed.getMetadata(), body);
     ASSERT_BSONOBJ_EQ(parsed.getCommandReply(), body);
 }
 
@@ -175,8 +149,11 @@ TEST(OpMsgReplyBuilder, CommandError) {
     const BSONObj extraObj = extra.obj();
     rpc::OpMsgReplyBuilder replyBuilder;
     replyBuilder.setCommandReply(status, extraObj);
-    replyBuilder.setMetadata(metadata);
+    replyBuilder.getBodyBuilder().appendElements(metadata);
     auto msg = replyBuilder.done();
+    msg.header().setId(124);
+    msg.header().setResponseToMsgId(123);
+    OpMsg::appendChecksum(&msg);
 
     rpc::OpMsgReply parsed(&msg);
 
@@ -186,8 +163,23 @@ TEST(OpMsgReplyBuilder, CommandError) {
         return unifiedBuilder.obj();
     }());
 
-    ASSERT_BSONOBJ_EQ(parsed.getMetadata(), body);
     ASSERT_BSONOBJ_EQ(parsed.getCommandReply(), body);
+}
+
+TEST(OpMsgReplyBuilder, MessageOverBSONSizeLimit) {
+    rpc::OpMsgReplyBuilder r;
+    std::string bigStr(1024 * 1024 * 16, 'a');
+
+    {
+        // 'builder' is an unowned BSONObjBuilder and thus does none of its own size checking,
+        // allowing us to grow the OpMsgReplyBuilder past the bson object size limit.
+        auto builder = r.getBodyBuilder();
+        for (auto i = 0; i < 2; i++) {
+            builder.append("field" + std::to_string(i), bigStr);
+        }
+    }
+
+    ASSERT_THROWS_CODE(r.done(), DBException, ErrorCodes::BSONObjectTooLarge);
 }
 
 template <typename T>
@@ -196,10 +188,12 @@ void testRoundTrip(rpc::ReplyBuilderInterface& replyBuilder, bool unifiedBodyAnd
     auto commandReply = buildEmptyCommand();
 
     replyBuilder.setCommandReply(commandReply);
-    replyBuilder.setMetadata(metadata);
+    replyBuilder.getBodyBuilder().appendElements(metadata);
 
     auto msg = replyBuilder.done();
-
+    msg.header().setId(124);
+    msg.header().setResponseToMsgId(123);
+    OpMsg::appendChecksum(&msg);
     T parsed(&msg);
 
     if (unifiedBodyAndMetadata) {
@@ -210,10 +204,8 @@ void testRoundTrip(rpc::ReplyBuilderInterface& replyBuilder, bool unifiedBodyAnd
         }());
 
         ASSERT_BSONOBJ_EQ(parsed.getCommandReply(), body);
-        ASSERT_BSONOBJ_EQ(parsed.getMetadata(), body);
     } else {
         ASSERT_BSONOBJ_EQ(parsed.getCommandReply(), commandReply);
-        ASSERT_BSONOBJ_EQ(parsed.getMetadata(), metadata);
     }
 }
 
@@ -224,9 +216,12 @@ void testErrors(rpc::ReplyBuilderInterface& replyBuilder) {
     const auto status = Status(ErrorExtraInfoExample(123), "Why does this keep failing!");
 
     replyBuilder.setCommandReply(status);
-    replyBuilder.setMetadata(buildMetadata());
+    replyBuilder.getBodyBuilder().appendElements(buildMetadata());
 
-    const auto msg = replyBuilder.done();
+    auto msg = replyBuilder.done();
+    msg.header().setId(124);
+    msg.header().setResponseToMsgId(123);
+    OpMsg::appendChecksum(&msg);
 
     T parsed(&msg);
     const Status result = getStatusFromCommandResult(parsed.getCommandReply());

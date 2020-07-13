@@ -1,14 +1,14 @@
 """Unit tests for the buildscripts.resmokelib.selector module."""
 
-from __future__ import absolute_import
-
 import fnmatch
+import os.path
+import sys
 import unittest
 
+import buildscripts.resmokelib.config
+import buildscripts.resmokelib.parser as parser
 import buildscripts.resmokelib.selector as selector
 import buildscripts.resmokelib.utils.globstar as globstar
-import buildscripts.resmokelib.config
-import buildscripts.resmokeconfig
 
 # pylint: disable=missing-docstring,protected-access
 
@@ -108,6 +108,10 @@ class TestTestFileExplorer(unittest.TestCase):
 class MockTestFileExplorer(object):
     """Component giving access to mock test files data."""
 
+    NUM_JS_FILES = 4  # Total number of JS files in self.files.
+
+    BINARY = "dbtest"
+
     def __init__(self):
         self.files = [
             "dir/subdir1/test11.js", "dir/subdir1/test12.js", "dir/subdir2/test21.js",
@@ -118,7 +122,7 @@ class MockTestFileExplorer(object):
             "dir/subdir1/test11.js": ["tag1", "tag2"], "dir/subdir1/test12.js": ["tag3"],
             "dir/subdir2/test21.js": ["tag2", "tag4"], "dir/subdir3/a/test3a1.js": ["tag4", "tag5"]
         }
-        self.binary = "dbtest"
+        self.binary = MockTestFileExplorer.BINARY
         self.jstest_tag_file = {"dir/subdir1/test11.js": "tagA", "dir/subdir3/a/test3a1.js": "tagB"}
 
     def is_glob_pattern(self, pattern):  # pylint: disable=no-self-use
@@ -165,6 +169,14 @@ class TestTestList(unittest.TestCase):
         self.assertEqual(roots, selected)
         self.assertEqual([], excluded)
 
+    def test_roots_normpath(self):
+        roots = ["dir/a/abc.js", "dir/b/xyz.js"]
+        test_list = selector._TestList(self.test_file_explorer, roots, tests_are_files=False)
+        selected, excluded = test_list.get_tests()
+        for root_file, selected_file in zip(roots, selected):
+            self.assertEqual(os.path.normpath(root_file), selected_file)
+        self.assertEqual([], excluded)
+
     def test_roots_with_glob(self):
         glob_roots = ["dir/subdir1/*.js"]
         expected_roots = ["dir/subdir1/test11.js", "dir/subdir1/test12.js"]
@@ -182,7 +194,7 @@ class TestTestList(unittest.TestCase):
 
     def test_roots_unknown_file(self):
         roots = ["dir/subdir1/unknown"]
-        with self.assertRaisesRegexp(ValueError, "Unrecognized test file: dir/subdir1/unknown"):
+        with self.assertRaisesRegex(ValueError, "Unrecognized test file: dir/subdir1/unknown"):
             selector._TestList(self.test_file_explorer, roots, tests_are_files=True)
 
     def test_include_files(self):
@@ -210,10 +222,11 @@ class TestTestList(unittest.TestCase):
         self.assertEqual(["dir/subdir1/test11.js", "dir/subdir1/test12.js"], selected)
         self.assertEqual(["dir/subdir2/test21.js"], excluded)
 
+    @unittest.skip("Known broken. SERVER-48969 tracks re-enabling.")
     def test_exclude_files_no_match(self):
         roots = ["dir/subdir1/*.js", "dir/subdir2/test21.*"]
         test_list = selector._TestList(self.test_file_explorer, roots)
-        with self.assertRaisesRegexp(ValueError, "Unrecognized test file: .*$"):
+        with self.assertRaisesRegex(ValueError, "Unrecognized test file: .*$"):
             test_list.exclude_files(["dir/subdir2/test26.js"])
 
     def test_exclude_files_glob(self):
@@ -318,6 +331,12 @@ class TestSelectorConfig(unittest.TestCase):
         with self.assertRaises(ValueError):
             selector._SelectorConfig(include_tags="tag1", exclude_tags="tag2")
 
+    def test_multi_jstest_selector_config(self):
+        sc = selector._MultiJSTestSelectorConfig(roots=["test1", "test2"], group_size=1234,
+                                                 group_count_multiplier=5678)
+        self.assertEqual(sc.group_size, 1234)
+        self.assertEqual(sc.group_count_multiplier, 5678)
+
 
 class TestSelector(unittest.TestCase):
     @classmethod
@@ -336,8 +355,8 @@ class TestSelector(unittest.TestCase):
 
     def test_select_exclude_files(self):
         config = selector._SelectorConfig(
-            roots=["dir/subdir1/*.js", "dir/subdir2/*.js",
-                   "dir/subdir3/a/*.js"], exclude_files=["dir/subdir2/test21.js"])
+            roots=["dir/subdir1/*.js", "dir/subdir2/*.js", "dir/subdir3/a/*.js"],
+            exclude_files=["dir/subdir2/test21.js"])
         selected, excluded = self.selector.select(config)
         self.assertEqual(
             ["dir/subdir1/test11.js", "dir/subdir1/test12.js", "dir/subdir3/a/test3a1.js"],
@@ -346,8 +365,8 @@ class TestSelector(unittest.TestCase):
 
     def test_select_include_files(self):
         config = selector._SelectorConfig(
-            roots=["dir/subdir1/*.js", "dir/subdir2/*.js",
-                   "dir/subdir3/a/*.js"], include_files=["dir/subdir2/test21.js"])
+            roots=["dir/subdir1/*.js", "dir/subdir2/*.js", "dir/subdir3/a/*.js"],
+            include_files=["dir/subdir2/test21.js"])
         selected, excluded = self.selector.select(config)
         self.assertEqual(["dir/subdir2/test21.js"], selected)
         self.assertEqual(
@@ -356,8 +375,8 @@ class TestSelector(unittest.TestCase):
 
     def test_select_include_tags(self):
         config = selector._SelectorConfig(
-            roots=["dir/subdir1/*.js", "dir/subdir2/*.js",
-                   "dir/subdir3/a/*.js"], include_tags="tag1")
+            roots=["dir/subdir1/*.js", "dir/subdir2/*.js", "dir/subdir3/a/*.js"],
+            include_tags="tag1")
         selected, excluded = self.selector.select(config)
         self.assertEqual([], selected)
         self.assertEqual([
@@ -367,14 +386,50 @@ class TestSelector(unittest.TestCase):
 
     def test_select_include_any_tags(self):
         config = selector._SelectorConfig(
-            roots=["dir/subdir1/*.js", "dir/subdir2/*.js",
-                   "dir/subdir3/a/*.js"], include_with_any_tags=["tag1"])
+            roots=["dir/subdir1/*.js", "dir/subdir2/*.js", "dir/subdir3/a/*.js"],
+            include_with_any_tags=["tag1"])
         selected, excluded = self.selector.select(config)
         self.assertEqual([], selected)
         self.assertEqual([
             "dir/subdir1/test11.js", "dir/subdir1/test12.js", "dir/subdir2/test21.js",
             "dir/subdir3/a/test3a1.js"
         ], excluded)
+
+
+class TestMultiJSSelector(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.selector = selector._MultiJSTestSelector(MockTestFileExplorer())
+
+    @unittest.skip("Known broken. SERVER-48969 tracks re-enabling.")
+    def test_multi_js_test_selector_normal(self):
+        config = selector._MultiJSTestSelectorConfig(roots=["dir/**/*.js"], group_size=3,
+                                                     group_count_multiplier=2)
+
+        selected, _ = self.selector.select(config)
+        total = 0
+
+        for group in selected[:-1]:
+            self.assertEqual(len(group), 3, "{} did not have 3 unique tests".format(group))
+            total += 3
+
+        self.assertLessEqual(
+            len(selected[-1]), 3,
+            "Last selected group did not have 3 or fewer tests: {}".format(selected[-1]))
+        total += len(selected[-1])
+
+        self.assertEqual(total, MockTestFileExplorer.NUM_JS_FILES * config.group_count_multiplier,
+                         "The total number of workloads is incorrect")
+
+    @unittest.skip("Known broken. SERVER-48969 tracks re-enabling.")
+    def test_multi_js_test_selector_one_group(self):
+        """Test we return only one group if the group size equals number of files"""
+        num_files = MockTestFileExplorer.NUM_JS_FILES
+        config = selector._MultiJSTestSelectorConfig(roots=["dir/**/*.js"], group_size=num_files,
+                                                     group_count_multiplier=9999999)
+        selected, _ = self.selector.select(config)
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(len(selected[0]), num_files)
 
 
 class TestFilterTests(unittest.TestCase):
@@ -449,6 +504,28 @@ class TestFilterTests(unittest.TestCase):
             selected)
         self.assertEqual(["dir/subdir1/test11.js"], excluded)
 
+    def test_jstest_exclude_with_any_tags(self):
+        config = {
+            "roots": ["dir/subdir1/*.js", "dir/subdir2/*.js", "dir/subdir3/a/*.js"],
+            "exclude_with_any_tags": ["tag2"]
+        }
+        selected, excluded = selector.filter_tests("js_test", config, self.test_file_explorer)
+        self.assertEqual(["dir/subdir1/test11.js", "dir/subdir2/test21.js"], excluded)
+        self.assertEqual(["dir/subdir1/test12.js", "dir/subdir3/a/test3a1.js"], selected)
+
+    @unittest.skip("Known broken. SERVER-48969 tracks re-enabling.")
+    def test_filter_temporarily_disabled_tests(self):
+        parser.parse_command_line(sys.argv[1:])
+        test_file_explorer = MockTestFileExplorer()
+        test_file_explorer.tags = {
+            "dir/subdir1/test11.js": ["tag1", "tag2", "__TEMPORARILY_DISABLED__"],
+            "dir/subdir1/test12.js": ["tag3"], "dir/subdir2/test21.js": ["tag2", "tag4"]
+        }
+        config = {"roots": ["dir/subdir1/*.js", "dir/subdir2/*.js"]}
+        selected, excluded = selector.filter_tests("js_test", config, test_file_explorer)
+        self.assertEqual(["dir/subdir1/test11.js"], excluded)
+        self.assertEqual(["dir/subdir1/test12.js", "dir/subdir2/test21.js"], selected)
+
     def test_jstest_force_include(self):
         config = {
             "roots": ["dir/subdir1/*.js", "dir/subdir2/*.js", "dir/subdir3/a/*.js"],
@@ -478,7 +555,7 @@ class TestFilterTests(unittest.TestCase):
 
     def test_jstest_unknown_file(self):
         config = {"roots": ["dir/subdir1/*.js", "dir/subdir1/unknown"]}
-        with self.assertRaisesRegexp(ValueError, "Unrecognized test file: dir/subdir1/unknown"):
+        with self.assertRaisesRegex(ValueError, "Unrecognized test file: dir/subdir1/unknown"):
             selector.filter_tests("js_test", config, self.test_file_explorer)
 
     def test_json_schema_exclude_files(self):
@@ -493,7 +570,7 @@ class TestFilterTests(unittest.TestCase):
             selected)
         self.assertEqual(["dir/subdir2/test21.js"], excluded)
 
-    def test_json_shcema_include_files(self):
+    def test_json_schema_include_files(self):
         config = {
             "roots": ["dir/subdir1/*.js", "dir/subdir2/*.js", "dir/subdir3/a/*.js"],
             "include_files": ["dir/subdir2/test21.js"]
@@ -505,6 +582,9 @@ class TestFilterTests(unittest.TestCase):
             ["dir/subdir1/test11.js", "dir/subdir1/test12.js", "dir/subdir3/a/test3a1.js"],
             excluded)
 
+    @unittest.skipUnless(
+        os.path.exists(MockTestFileExplorer.BINARY),
+        "{} not built".format(MockTestFileExplorer.BINARY))
     def test_db_tests_all(self):
         config = {"binary": self.test_file_explorer.binary}
         selected, excluded = selector.filter_tests("db_test", config, self.test_file_explorer)
@@ -522,6 +602,9 @@ class TestFilterTests(unittest.TestCase):
         self.assertEqual(["dbtestOverride"], selected)
         self.assertEqual([], excluded)
 
+    @unittest.skipUnless(
+        os.path.exists(MockTestFileExplorer.BINARY),
+        "{} not built".format(MockTestFileExplorer.BINARY))
     def test_db_tests_include_suites(self):
         config = {"binary": self.test_file_explorer.binary, "include_suites": ["dbtestB"]}
         selected, excluded = selector.filter_tests("db_test", config, self.test_file_explorer)

@@ -18,6 +18,7 @@
 #include "asio/detail/config.hpp"
 
 #include "asio/write.hpp"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/net/ssl/detail/engine.hpp"
 #include "mongo/util/net/ssl/detail/stream_core.hpp"
 
@@ -26,6 +27,9 @@
 namespace asio {
 namespace ssl {
 namespace detail {
+
+// Failpoint to force small reads of data to exercise the SChannel buffering code
+extern ::mongo::FailPoint smallTLSReads;
 
 template <typename Stream, typename Operation>
 std::size_t io(Stream& next_layer, stream_core& core, const Operation& op, asio::error_code& ec) {
@@ -36,9 +40,22 @@ std::size_t io(Stream& next_layer, stream_core& core, const Operation& op, asio:
 
                 // If the input buffer is empty then we need to read some more data from
                 // the underlying transport.
-                if (core.input_.size() == 0)
-                    core.input_ = asio::buffer(core.input_buffer_,
-                                               next_layer.read_some(core.input_buffer_, ec));
+                if (core.input_.size() == 0) {
+                    // Read tiny amounts of TLS data to test the SChannel buffering code
+                    if (MONGO_unlikely(smallTLSReads.shouldFail())) {
+                        core.input_ =
+                            asio::buffer(core.input_buffer_,
+                                         next_layer.read_some(
+                                             mutable_buffer(core.input_buffer_.data(),
+                                                            std::min(core.input_buffer_.size(),
+                                                                     static_cast<size_t>(10UL))),
+                                             ec));
+
+                    } else {
+                        core.input_ = asio::buffer(core.input_buffer_,
+                                                   next_layer.read_some(core.input_buffer_, ec));
+                    }
+                }
 
                 // Pass the new input data to the engine.
                 core.input_ = core.engine_.put_input(core.input_);
@@ -48,18 +65,24 @@ std::size_t io(Stream& next_layer, stream_core& core, const Operation& op, asio:
 
             case engine::want_output_and_retry:
 
+                core.output_ = core.engine_.get_output(core.output_buffer_);
                 // Get output data from the engine and write it to the underlying
                 // transport.
-                asio::write(next_layer, core.engine_.get_output(core.output_buffer_), ec);
+                while (!ec && core.output_.size()) {
+                    core.output_ += asio::write(next_layer, core.output_, ec);
+                }
 
                 // Try the operation again.
                 continue;
 
             case engine::want_output:
 
+                core.output_ = core.engine_.get_output(core.output_buffer_);
                 // Get output data from the engine and write it to the underlying
                 // transport.
-                asio::write(next_layer, core.engine_.get_output(core.output_buffer_), ec);
+                while (!ec && core.output_.size()) {
+                    core.output_ += asio::write(next_layer, core.output_, ec);
+                }
 
                 // Operation is complete. Return result to caller.
                 core.engine_.map_error_code(ec);
@@ -75,7 +98,7 @@ std::size_t io(Stream& next_layer, stream_core& core, const Operation& op, asio:
 
     // Operation failed. Return result to caller.
     core.engine_.map_error_code(ec);
-    return 0;
+    return bytes_transferred;
 }
 
 template <typename Stream, typename Operation, typename Handler>
@@ -224,7 +247,7 @@ public:
                                 // Release any waiting write operations.
                                 core_.pending_write_.expires_at(core_.neg_infin());
 
-                            // Fall through to call handler.
+                                // Fall through to call handler.
 
                             default:
 

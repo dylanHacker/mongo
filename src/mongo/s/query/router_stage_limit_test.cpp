@@ -1,23 +1,24 @@
 /**
- *    Copyright 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,10 +31,11 @@
 
 #include "mongo/s/query/router_stage_limit.h"
 
+#include <memory>
+
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/s/query/router_stage_mock.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -45,12 +47,12 @@ namespace {
 OperationContext* opCtx = nullptr;
 
 TEST(RouterStageLimitTest, LimitIsOne) {
-    auto mockStage = stdx::make_unique<RouterStageMock>(opCtx);
+    auto mockStage = std::make_unique<RouterStageMock>(opCtx);
     mockStage->queueResult({BSON("a" << 1)});
     mockStage->queueResult({BSON("a" << 2)});
     mockStage->queueResult({BSON("a" << 3)});
 
-    auto limitStage = stdx::make_unique<RouterStageLimit>(opCtx, std::move(mockStage), 1);
+    auto limitStage = std::make_unique<RouterStageLimit>(opCtx, std::move(mockStage), 1);
 
     auto firstResult = limitStage->next(RouterExecStage::ExecContext::kInitialFind);
     ASSERT_OK(firstResult.getStatus());
@@ -68,12 +70,12 @@ TEST(RouterStageLimitTest, LimitIsOne) {
 }
 
 TEST(RouterStageLimitTest, LimitIsTwo) {
-    auto mockStage = stdx::make_unique<RouterStageMock>(opCtx);
+    auto mockStage = std::make_unique<RouterStageMock>(opCtx);
     mockStage->queueResult(BSON("a" << 1));
     mockStage->queueResult(BSON("a" << 2));
     mockStage->queueError(Status(ErrorCodes::BadValue, "bad thing happened"));
 
-    auto limitStage = stdx::make_unique<RouterStageLimit>(opCtx, std::move(mockStage), 2);
+    auto limitStage = std::make_unique<RouterStageLimit>(opCtx, std::move(mockStage), 2);
 
     auto firstResult = limitStage->next(RouterExecStage::ExecContext::kInitialFind);
     ASSERT_OK(firstResult.getStatus());
@@ -91,13 +93,13 @@ TEST(RouterStageLimitTest, LimitIsTwo) {
 }
 
 TEST(RouterStageLimitTest, LimitStagePropagatesError) {
-    auto mockStage = stdx::make_unique<RouterStageMock>(opCtx);
+    auto mockStage = std::make_unique<RouterStageMock>(opCtx);
     mockStage->queueResult(BSON("a" << 1));
     mockStage->queueError(Status(ErrorCodes::BadValue, "bad thing happened"));
     mockStage->queueResult(BSON("a" << 2));
     mockStage->queueResult(BSON("a" << 3));
 
-    auto limitStage = stdx::make_unique<RouterStageLimit>(opCtx, std::move(mockStage), 3);
+    auto limitStage = std::make_unique<RouterStageLimit>(opCtx, std::move(mockStage), 3);
 
     auto firstResult = limitStage->next(RouterExecStage::ExecContext::kInitialFind);
     ASSERT_OK(firstResult.getStatus());
@@ -114,13 +116,13 @@ TEST(RouterStageLimitTest, LimitStageToleratesMidStreamEOF) {
     // Here we're mocking the tailable case, where there may be a boost::none returned before the
     // remote cursor is closed. Our goal is to make sure that the limit stage handles this properly,
     // not counting boost::none towards the limit.
-    auto mockStage = stdx::make_unique<RouterStageMock>(opCtx);
+    auto mockStage = std::make_unique<RouterStageMock>(opCtx);
     mockStage->queueResult(BSON("a" << 1));
     mockStage->queueEOF();
     mockStage->queueResult(BSON("a" << 2));
     mockStage->queueResult(BSON("a" << 3));
 
-    auto limitStage = stdx::make_unique<RouterStageLimit>(opCtx, std::move(mockStage), 2);
+    auto limitStage = std::make_unique<RouterStageLimit>(opCtx, std::move(mockStage), 2);
 
     auto firstResult = limitStage->next(RouterExecStage::ExecContext::kInitialFind);
     ASSERT_OK(firstResult.getStatus());
@@ -142,12 +144,12 @@ TEST(RouterStageLimitTest, LimitStageToleratesMidStreamEOF) {
 }
 
 TEST(RouterStageLimitTest, LimitStageRemotesExhausted) {
-    auto mockStage = stdx::make_unique<RouterStageMock>(opCtx);
+    auto mockStage = std::make_unique<RouterStageMock>(opCtx);
     mockStage->queueResult(BSON("a" << 1));
     mockStage->queueResult(BSON("a" << 2));
     mockStage->markRemotesExhausted();
 
-    auto limitStage = stdx::make_unique<RouterStageLimit>(opCtx, std::move(mockStage), 100);
+    auto limitStage = std::make_unique<RouterStageLimit>(opCtx, std::move(mockStage), 100);
     ASSERT_TRUE(limitStage->remotesExhausted());
 
     auto firstResult = limitStage->next(RouterExecStage::ExecContext::kInitialFind);
@@ -169,11 +171,11 @@ TEST(RouterStageLimitTest, LimitStageRemotesExhausted) {
 }
 
 TEST(RouterStageLimitTest, ForwardsAwaitDataTimeout) {
-    auto mockStage = stdx::make_unique<RouterStageMock>(opCtx);
+    auto mockStage = std::make_unique<RouterStageMock>(opCtx);
     auto mockStagePtr = mockStage.get();
     ASSERT_NOT_OK(mockStage->getAwaitDataTimeout().getStatus());
 
-    auto limitStage = stdx::make_unique<RouterStageLimit>(opCtx, std::move(mockStage), 100);
+    auto limitStage = std::make_unique<RouterStageLimit>(opCtx, std::move(mockStage), 100);
     ASSERT_OK(limitStage->setAwaitDataTimeout(Milliseconds(789)));
 
     auto awaitDataTimeout = mockStagePtr->getAwaitDataTimeout();

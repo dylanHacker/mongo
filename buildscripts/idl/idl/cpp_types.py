@@ -1,20 +1,31 @@
-# Copyright (C) 2017 MongoDB Inc.
+# Copyright (C) 2018-present MongoDB, Inc.
 #
-# This program is free software: you can redistribute it and/or  modify
-# it under the terms of the GNU Affero General Public License, version 3,
-# as published by the Free Software Foundation.
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the Server Side Public License, version 1,
+# as published by MongoDB, Inc.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Affero General Public License for more details.
+# Server Side Public License for more details.
 #
-# You should have received a copy of the GNU Affero General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# You should have received a copy of the Server Side Public License
+# along with this program. If not, see
+# <http://www.mongodb.com/licensing/server-side-public-license>.
+#
+# As a special exception, the copyright holders give permission to link the
+# code of portions of this program with the OpenSSL library under certain
+# conditions as described in each individual source file and distribute
+# linked combinations including the program with the OpenSSL library. You
+# must comply with the Server Side Public License in all respects for
+# all of the code used other than as permitted herein. If you modify file(s)
+# with this exception, you may extend this exception to your version of the
+# file(s), but you are not obligated to do so. If you do not wish to do so,
+# delete this exception statement from your version. If you delete this
+# exception statement from all source files in the program, then also delete
+# it in the license file.
 #
 """IDL C++ Code Generator."""
-
-from __future__ import absolute_import, print_function, unicode_literals
 
 from abc import ABCMeta, abstractmethod
 import string
@@ -30,7 +41,7 @@ _STD_ARRAY_UINT8_16 = 'std::array<std::uint8_t,16>'
 
 
 def is_primitive_scalar_type(cpp_type):
-    # type: (unicode) -> bool
+    # type: (str) -> bool
     """
     Return True if a cpp_type is a primitive scalar type.
 
@@ -43,7 +54,7 @@ def is_primitive_scalar_type(cpp_type):
 
 
 def get_primitive_scalar_type_default_value(cpp_type):
-    # type: (unicode) -> unicode
+    # type: (str) -> str
     """
     Return a default value for a primitive scalar type.
 
@@ -56,29 +67,36 @@ def get_primitive_scalar_type_default_value(cpp_type):
     return '-1'
 
 
-def _is_primitive_type(cpp_type):
-    # type: (unicode) -> bool
+def is_primitive_type(cpp_type):
+    # type: (str) -> bool
     """Return True if a cpp_type is a primitive type and should not be returned as reference."""
     cpp_type = cpp_type.replace(' ', '')
     return is_primitive_scalar_type(cpp_type) or cpp_type == _STD_ARRAY_UINT8_16
 
 
 def _qualify_optional_type(cpp_type):
-    # type: (unicode) -> unicode
+    # type: (str) -> str
     """Qualify the type as optional."""
     return 'boost::optional<%s>' % (cpp_type)
 
 
 def _qualify_array_type(cpp_type):
-    # type: (unicode) -> unicode
+    # type: (str) -> str
     """Qualify the type if the field is an array."""
     return "std::vector<%s>" % (cpp_type)
 
 
-class CppTypeBase(object):
-    """Base type for C++ Type information."""
+def _optionally_make_call(method_name, param):
+    # type: (str, str) -> str
+    """Return a call to method_name if it is not None, otherwise return an empty string."""
+    if not method_name:
+        return ''
 
-    __metaclass__ = ABCMeta
+    return "%s(%s);" % (method_name, param)
+
+
+class CppTypeBase(metaclass=ABCMeta):
+    """Base type for C++ Type information."""
 
     def __init__(self, field):
         # type: (ast.Field) -> None
@@ -87,19 +105,19 @@ class CppTypeBase(object):
 
     @abstractmethod
     def get_type_name(self):
-        # type: () -> unicode
+        # type: () -> str
         """Get the C++ type name for a field."""
         pass
 
     @abstractmethod
     def get_storage_type(self):
-        # type: () -> unicode
+        # type: () -> str
         """Get the C++ type name for the storage of class member for a field."""
         pass
 
     @abstractmethod
     def get_getter_setter_type(self):
-        # type: () -> unicode
+        # type: () -> str
         """Get the C++ type name for the getter/setter parameter for a field."""
         pass
 
@@ -129,25 +147,25 @@ class CppTypeBase(object):
 
     @abstractmethod
     def get_getter_body(self, member_name):
-        # type: (unicode) -> unicode
+        # type: (str) -> str
         """Get the body of the getter."""
         pass
 
     @abstractmethod
-    def get_setter_body(self, member_name):
-        # type: (unicode) -> unicode
+    def get_setter_body(self, member_name, validator_method_name):
+        # type: (str, str) -> str
         """Get the body of the setter."""
         pass
 
     @abstractmethod
     def get_transform_to_getter_type(self, expression):
-        # type: (unicode) -> Optional[unicode]
+        # type: (str) -> Optional[str]
         """Get the expression to transform the input expression into the getter type."""
         pass
 
     @abstractmethod
     def get_transform_to_storage_type(self, expression):
-        # type: (unicode) -> Optional[unicode]
+        # type: (str) -> Optional[str]
         """Get the expression to transform the input expression into the setter type."""
         pass
 
@@ -156,7 +174,7 @@ class _CppTypeBasic(CppTypeBase):
     """Default class for C++ Type information. Does not handle view types."""
 
     def get_type_name(self):
-        # type: () -> unicode
+        # type: () -> str
         if self._field.struct_type:
             cpp_type = common.title_case(self._field.struct_type)
         else:
@@ -165,11 +183,11 @@ class _CppTypeBasic(CppTypeBase):
         return cpp_type
 
     def get_storage_type(self):
-        # type: () -> unicode
+        # type: () -> str
         return self.get_type_name()
 
     def get_getter_setter_type(self):
-        # type: () -> unicode
+        # type: () -> str
         return self.get_type_name()
 
     def is_const_type(self):
@@ -181,7 +199,7 @@ class _CppTypeBasic(CppTypeBase):
         type_name = self.get_type_name().replace(' ', '')
 
         # If it is not a primitive type, then it is const.
-        if not _is_primitive_type(type_name):
+        if not is_primitive_type(type_name):
             return True
 
         # Arrays of bytes should also be const though.
@@ -192,7 +210,7 @@ class _CppTypeBasic(CppTypeBase):
 
     def return_by_reference(self):
         # type: () -> bool
-        return not _is_primitive_type(self.get_type_name()) and not self._field.enum_type
+        return not is_primitive_type(self.get_type_name()) and not self._field.enum_type
 
     def disable_xvalue(self):
         # type: () -> bool
@@ -203,19 +221,22 @@ class _CppTypeBasic(CppTypeBase):
         return False
 
     def get_getter_body(self, member_name):
-        # type: (unicode) -> unicode
+        # type: (str) -> str
         return common.template_args('return ${member_name};', member_name=member_name)
 
-    def get_setter_body(self, member_name):
-        # type: (unicode) -> unicode
-        return common.template_args('${member_name} = std::move(value);', member_name=member_name)
+    def get_setter_body(self, member_name, validator_method_name):
+        # type: (str, str) -> str
+        return common.template_args(
+            '${optionally_call_validator} ${member_name} = std::move(value);',
+            optionally_call_validator=_optionally_make_call(validator_method_name,
+                                                            'value'), member_name=member_name)
 
     def get_transform_to_getter_type(self, expression):
-        # type: (unicode) -> Optional[unicode]
+        # type: (str) -> Optional[str]
         return None
 
     def get_transform_to_storage_type(self, expression):
-        # type: (unicode) -> Optional[unicode]
+        # type: (str) -> Optional[str]
         return None
 
 
@@ -223,21 +244,21 @@ class _CppTypeView(CppTypeBase):
     """Base type for C++ View Types information."""
 
     def __init__(self, field, storage_type, view_type):
-        # type: (ast.Field, unicode, unicode) -> None
+        # type: (ast.Field, str, str) -> None
         self._storage_type = storage_type
         self._view_type = view_type
         super(_CppTypeView, self).__init__(field)
 
     def get_type_name(self):
-        # type: () -> unicode
+        # type: () -> str
         return self._storage_type
 
     def get_storage_type(self):
-        # type: () -> unicode
+        # type: () -> str
         return self._storage_type
 
     def get_getter_setter_type(self):
-        # type: () -> unicode
+        # type: () -> str
         return self._view_type
 
     def is_const_type(self):
@@ -257,20 +278,23 @@ class _CppTypeView(CppTypeBase):
         return True
 
     def get_getter_body(self, member_name):
-        # type: (unicode) -> unicode
+        # type: (str) -> str
         return common.template_args('return ${member_name};', member_name=member_name)
 
-    def get_setter_body(self, member_name):
-        # type: (unicode) -> unicode
-        return common.template_args('${member_name} = ${value};', member_name=member_name,
-                                    value=self.get_transform_to_storage_type("value"))
+    def get_setter_body(self, member_name, validator_method_name):
+        # type: (str, str) -> str
+        return common.template_args(
+            'auto _tmpValue = ${value}; ${optionally_call_validator} ${member_name} = std::move(_tmpValue);',
+            member_name=member_name, optionally_call_validator=_optionally_make_call(
+                validator_method_name,
+                '_tmpValue'), value=self.get_transform_to_storage_type("value"))
 
     def get_transform_to_getter_type(self, expression):
-        # type: (unicode) -> Optional[unicode]
+        # type: (str) -> Optional[str]
         return None
 
     def get_transform_to_storage_type(self, expression):
-        # type: (unicode) -> Optional[unicode]
+        # type: (str) -> Optional[str]
         return common.template_args(
             '${expression}.toString()',
             expression=expression,
@@ -281,15 +305,15 @@ class _CppTypeVector(CppTypeBase):
     """Base type for C++ Std::Vector Types information."""
 
     def get_type_name(self):
-        # type: () -> unicode
+        # type: () -> str
         return 'std::vector<std::uint8_t>'
 
     def get_storage_type(self):
-        # type: () -> unicode
+        # type: () -> str
         return self.get_type_name()
 
     def get_getter_setter_type(self):
-        # type: () -> unicode
+        # type: () -> str
         return 'ConstDataRange'
 
     def is_const_type(self):
@@ -309,22 +333,24 @@ class _CppTypeVector(CppTypeBase):
         return True
 
     def get_getter_body(self, member_name):
-        # type: (unicode) -> unicode
-        return common.template_args(
-            'return ConstDataRange(reinterpret_cast<const char*>(${member_name}.data()), ${member_name}.size());',
-            member_name=member_name)
+        # type: (str) -> str
+        return common.template_args('return ConstDataRange(${member_name});',
+                                    member_name=member_name)
 
-    def get_setter_body(self, member_name):
-        # type: (unicode) -> unicode
-        return common.template_args('${member_name} = ${value};', member_name=member_name,
-                                    value=self.get_transform_to_storage_type("value"))
+    def get_setter_body(self, member_name, validator_method_name):
+        # type: (str, str) -> str
+        return common.template_args(
+            'auto _tmpValue = ${value}; ${optionally_call_validator} ${member_name} = std::move(_tmpValue);',
+            member_name=member_name, optionally_call_validator=_optionally_make_call(
+                validator_method_name,
+                '_tmpValue'), value=self.get_transform_to_storage_type("value"))
 
     def get_transform_to_getter_type(self, expression):
-        # type: (unicode) -> Optional[unicode]
-        return common.template_args('makeCDR(${expression});', expression=expression)
+        # type: (str) -> Optional[str]
+        return common.template_args('ConstDataRange(${expression});', expression=expression)
 
     def get_transform_to_storage_type(self, expression):
-        # type: (unicode) -> Optional[unicode]
+        # type: (str) -> Optional[str]
         return common.template_args(
             'std::vector<std::uint8_t>(reinterpret_cast<const uint8_t*>(${expression}.data()), ' +
             'reinterpret_cast<const uint8_t*>(${expression}.data()) + ${expression}.length())',
@@ -340,15 +366,15 @@ class _CppTypeDelegating(CppTypeBase):
         super(_CppTypeDelegating, self).__init__(field)
 
     def get_type_name(self):
-        # type: () -> unicode
+        # type: () -> str
         return self._base.get_type_name()
 
     def get_storage_type(self):
-        # type: () -> unicode
+        # type: () -> str
         return self._base.get_storage_type()
 
     def get_getter_setter_type(self):
-        # type: () -> unicode
+        # type: () -> str
         return self._base.get_getter_setter_type()
 
     def is_const_type(self):
@@ -368,19 +394,19 @@ class _CppTypeDelegating(CppTypeBase):
         return self._base.is_view_type()
 
     def get_getter_body(self, member_name):
-        # type: (unicode) -> unicode
+        # type: (str) -> str
         return self._base.get_getter_body(member_name)
 
-    def get_setter_body(self, member_name):
-        # type: (unicode) -> unicode
-        return self._base.get_setter_body(member_name)
+    def get_setter_body(self, member_name, validator_method_name):
+        # type: (str, str) -> str
+        return self._base.get_setter_body(member_name, validator_method_name)
 
     def get_transform_to_getter_type(self, expression):
-        # type: (unicode) -> Optional[unicode]
+        # type: (str) -> Optional[str]
         return self._base.get_transform_to_getter_type(expression)
 
     def get_transform_to_storage_type(self, expression):
-        # type: (unicode) -> Optional[unicode]
+        # type: (str) -> Optional[str]
         return self._base.get_transform_to_storage_type(expression)
 
 
@@ -388,11 +414,11 @@ class _CppTypeArray(_CppTypeDelegating):
     """C++ Array type for wrapping a base C++ Type information."""
 
     def get_storage_type(self):
-        # type: () -> unicode
+        # type: () -> str
         return _qualify_array_type(self._base.get_storage_type())
 
     def get_getter_setter_type(self):
-        # type: () -> unicode
+        # type: () -> str
         return _qualify_array_type(self._base.get_getter_setter_type())
 
     def return_by_reference(self):
@@ -406,22 +432,24 @@ class _CppTypeArray(_CppTypeDelegating):
         return True
 
     def get_getter_body(self, member_name):
-        # type: (unicode) -> unicode
+        # type: (str) -> str
         convert = self.get_transform_to_getter_type(member_name)
         if convert:
             return common.template_args('return ${convert};', convert=convert)
         return self._base.get_getter_body(member_name)
 
-    def get_setter_body(self, member_name):
-        # type: (unicode) -> unicode
+    def get_setter_body(self, member_name, validator_method_name):
+        # type: (str, str) -> str
         convert = self.get_transform_to_storage_type("value")
         if convert:
-            return common.template_args('${member_name} = ${convert};', member_name=member_name,
-                                        convert=convert)
-        return self._base.get_setter_body(member_name)
+            return common.template_args(
+                'auto _tmpValue = ${convert}; ${optionally_call_validator} ${member_name} = std::move(_tmpValue);',
+                member_name=member_name, optionally_call_validator=_optionally_make_call(
+                    validator_method_name, '_tmpValue'), convert=convert)
+        return self._base.get_setter_body(member_name, validator_method_name)
 
     def get_transform_to_getter_type(self, expression):
-        # type: (unicode) -> Optional[unicode]
+        # type: (str) -> Optional[str]
         if self._base.get_storage_type() != self._base.get_getter_setter_type():
             return common.template_args(
                 'transformVector(${expression})',
@@ -430,7 +458,7 @@ class _CppTypeArray(_CppTypeDelegating):
         return None
 
     def get_transform_to_storage_type(self, expression):
-        # type: (unicode) -> Optional[unicode]
+        # type: (str) -> Optional[str]
         if self._base.get_storage_type() != self._base.get_getter_setter_type():
             return common.template_args(
                 'transformVector(${expression})',
@@ -443,11 +471,11 @@ class _CppTypeOptional(_CppTypeDelegating):
     """Base type for Optional C++ Type information which wraps C++ types."""
 
     def get_storage_type(self):
-        # type: () -> unicode
+        # type: () -> str
         return _qualify_optional_type(self._base.get_storage_type())
 
     def get_getter_setter_type(self):
-        # type: () -> unicode
+        # type: () -> str
         return _qualify_optional_type(self._base.get_getter_setter_type())
 
     def disable_xvalue(self):
@@ -461,7 +489,7 @@ class _CppTypeOptional(_CppTypeDelegating):
         return self._base.return_by_reference()
 
     def get_getter_body(self, member_name):
-        # type: (unicode) -> unicode
+        # type: (str) -> str
         base_expression = common.template_args("${member_name}.get()", member_name=member_name)
 
         convert = self._base.get_transform_to_getter_type(base_expression)
@@ -484,24 +512,29 @@ class _CppTypeOptional(_CppTypeDelegating):
                                         member_name=member_name)
         return common.template_args('return ${member_name};', member_name=member_name)
 
-    def get_setter_body(self, member_name):
-        # type: (unicode) -> unicode
+    def get_setter_body(self, member_name, validator_method_name):
+        # type: (str, str) -> str
         convert = self._base.get_transform_to_storage_type("value.get()")
-        if convert:
+        if convert or validator_method_name:
+            if not convert:
+                convert = "value.get()"
             return common.template_args(
                 textwrap.dedent("""\
                             if (value.is_initialized()) {
-                                ${member_name} = ${convert};
+                                auto _tmpValue = ${convert};
+                                ${optionally_call_validator}
+                                ${member_name} = std::move(_tmpValue);
                             } else {
                                 ${member_name} = boost::none;
                             }
-                            """), member_name=member_name, convert=convert)
-        return self._base.get_setter_body(member_name)
+                            """), member_name=member_name, convert=convert,
+                optionally_call_validator=_optionally_make_call(validator_method_name, '_tmpValue'))
+        return self._base.get_setter_body(member_name, validator_method_name)
 
 
-def get_cpp_type(field):
+def get_cpp_type_without_optional(field):
     # type: (ast.Field) -> CppTypeBase
-    """Get the C++ Type information for the given field."""
+    """Get the C++ Type information for the given field but ignore optional."""
 
     cpp_type_info = None  # type: Any
 
@@ -515,16 +548,23 @@ def get_cpp_type(field):
     if field.array:
         cpp_type_info = _CppTypeArray(cpp_type_info, field)
 
+    return cpp_type_info
+
+
+def get_cpp_type(field):
+    # type: (ast.Field) -> CppTypeBase
+    """Get the C++ Type information for the given field."""
+
+    cpp_type_info = get_cpp_type_without_optional(field)
+
     if field.optional:
         cpp_type_info = _CppTypeOptional(cpp_type_info, field)
 
     return cpp_type_info
 
 
-class BsonCppTypeBase(object):
+class BsonCppTypeBase(object, metaclass=ABCMeta):
     """Base type for custom C++ support for BSON Types information."""
-
-    __metaclass__ = ABCMeta
 
     def __init__(self, field):
         # type: (ast.Field) -> None
@@ -533,7 +573,7 @@ class BsonCppTypeBase(object):
 
     @abstractmethod
     def gen_deserializer_expression(self, indented_writer, object_instance):
-        # type: (writer.IndentedTextWriter, unicode) -> unicode
+        # type: (writer.IndentedTextWriter, str) -> str
         """Generate code with the text writer and return an expression to deserialize the type."""
         pass
 
@@ -545,13 +585,13 @@ class BsonCppTypeBase(object):
 
     @abstractmethod
     def gen_serializer_expression(self, indented_writer, expression):
-        # type: (writer.IndentedTextWriter, unicode) -> unicode
+        # type: (writer.IndentedTextWriter, str) -> str
         """Generate code with the text writer and return an expression to serialize the type."""
         pass
 
 
 def _call_method_or_global_function(expression, method_name):
-    # type: (unicode, unicode) -> unicode
+    # type: (str, str) -> str
     """
     Given a fully-qualified method name, call it correctly.
 
@@ -562,7 +602,7 @@ def _call_method_or_global_function(expression, method_name):
     short_method_name = writer.get_method_name(method_name)
     if writer.is_function(method_name):
         return common.template_args('${method_name}(${expression})', expression=expression,
-                                    method_name=short_method_name)
+                                    method_name=method_name)
 
     return common.template_args('${expression}.${method_name}()', expression=expression,
                                 method_name=short_method_name)
@@ -572,12 +612,12 @@ class _CommonBsonCppTypeBase(BsonCppTypeBase):
     """Custom C++ support for basic BSON types."""
 
     def __init__(self, field, deserialize_method_name):
-        # type: (ast.Field, unicode) -> None
+        # type: (ast.Field, str) -> None
         self._deserialize_method_name = deserialize_method_name
         super(_CommonBsonCppTypeBase, self).__init__(field)
 
     def gen_deserializer_expression(self, indented_writer, object_instance):
-        # type: (writer.IndentedTextWriter, unicode) -> unicode
+        # type: (writer.IndentedTextWriter, str) -> str
         return common.template_args('${object_instance}.${method_name}()',
                                     object_instance=object_instance,
                                     method_name=self._deserialize_method_name)
@@ -587,7 +627,7 @@ class _CommonBsonCppTypeBase(BsonCppTypeBase):
         return self._field.serializer is not None
 
     def gen_serializer_expression(self, indented_writer, expression):
-        # type: (writer.IndentedTextWriter, unicode) -> unicode
+        # type: (writer.IndentedTextWriter, str) -> str
         return _call_method_or_global_function(expression, self._field.serializer)
 
 
@@ -595,7 +635,7 @@ class _ObjectBsonCppTypeBase(BsonCppTypeBase):
     """Custom C++ support for object BSON types."""
 
     def gen_deserializer_expression(self, indented_writer, object_instance):
-        # type: (writer.IndentedTextWriter, unicode) -> unicode
+        # type: (writer.IndentedTextWriter, str) -> str
         if self._field.deserializer:
             # Call a method like: Class::method(const BSONObj& value)
             indented_writer.write_line(
@@ -611,7 +651,7 @@ class _ObjectBsonCppTypeBase(BsonCppTypeBase):
         return self._field.serializer is not None
 
     def gen_serializer_expression(self, indented_writer, expression):
-        # type: (writer.IndentedTextWriter, unicode) -> unicode
+        # type: (writer.IndentedTextWriter, str) -> str
         method_name = writer.get_method_name(self._field.serializer)
         indented_writer.write_line(
             common.template_args('const BSONObj localObject = ${expression}.${method_name}();',
@@ -623,9 +663,9 @@ class _BinDataBsonCppTypeBase(BsonCppTypeBase):
     """Custom C++ support for all binData BSON types."""
 
     def gen_deserializer_expression(self, indented_writer, object_instance):
-        # type: (writer.IndentedTextWriter, unicode) -> unicode
+        # type: (writer.IndentedTextWriter, str) -> str
         if self._field.bindata_subtype == 'uuid':
-            return common.template_args('${object_instance}.uuid()',
+            return common.template_args('uassertStatusOK(UUID::parse(${object_instance}))',
                                         object_instance=object_instance)
         return common.template_args('${object_instance}._binDataVector()',
                                     object_instance=object_instance)
@@ -635,7 +675,7 @@ class _BinDataBsonCppTypeBase(BsonCppTypeBase):
         return True
 
     def gen_serializer_expression(self, indented_writer, expression):
-        # type: (writer.IndentedTextWriter, unicode) -> unicode
+        # type: (writer.IndentedTextWriter, str) -> str
         if self._field.serializer:
             method_name = writer.get_method_name(self._field.serializer)
             indented_writer.write_line(
@@ -643,7 +683,7 @@ class _BinDataBsonCppTypeBase(BsonCppTypeBase):
                                      expression=expression, method_name=method_name))
         else:
             indented_writer.write_line(
-                common.template_args('ConstDataRange tempCDR = makeCDR(${expression});',
+                common.template_args('ConstDataRange tempCDR(${expression});',
                                      expression=expression))
 
         return common.template_args(

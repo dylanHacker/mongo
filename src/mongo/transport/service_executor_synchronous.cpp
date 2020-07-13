@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,28 +27,21 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kExecutor;
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kExecutor
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/transport/service_executor_synchronous.h"
 
-#include "mongo/db/server_parameters.h"
+#include "mongo/logv2/log.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/transport/service_entry_point_utils.h"
-#include "mongo/transport/service_executor_task_names.h"
-#include "mongo/transport/thread_idle_callback.h"
-#include "mongo/util/log.h"
+#include "mongo/transport/service_executor_gen.h"
 #include "mongo/util/processinfo.h"
 
 namespace mongo {
 namespace transport {
 namespace {
-
-// Tasks scheduled with MayRecurse may be called recursively if the recursion depth is below this
-// value.
-MONGO_EXPORT_SERVER_PARAMETER(synchronousServiceExecutorRecursionLimit, int, 8);
-
 constexpr auto kThreadsRunning = "threadsRunning"_sd;
 constexpr auto kExecutorLabel = "executor"_sd;
 constexpr auto kExecutorName = "passthrough"_sd;
@@ -68,11 +62,11 @@ Status ServiceExecutorSynchronous::start() {
 }
 
 Status ServiceExecutorSynchronous::shutdown(Milliseconds timeout) {
-    LOG(3) << "Shutting down passthrough executor";
+    LOGV2_DEBUG(22982, 3, "Shutting down passthrough executor");
 
     _stillRunning.store(false);
 
-    stdx::unique_lock<stdx::mutex> lock(_shutdownMutex);
+    stdx::unique_lock<Latch> lock(_shutdownMutex);
     bool result = _shutdownCondition.wait_for(lock, timeout.toSystemDuration(), [this]() {
         return _numRunningWorkerThreads.load() == 0;
     });
@@ -83,9 +77,7 @@ Status ServiceExecutorSynchronous::shutdown(Milliseconds timeout) {
                  "passthrough executor couldn't shutdown all worker threads within time limit.");
 }
 
-Status ServiceExecutorSynchronous::schedule(Task task,
-                                            ScheduleFlags flags,
-                                            ServiceExecutorTaskName taskName) {
+Status ServiceExecutorSynchronous::schedule(Task task, ScheduleFlags flags) {
     if (!_stillRunning.load()) {
         return Status{ErrorCodes::ShutdownInProgress, "Executor is not running"};
     }
@@ -97,9 +89,6 @@ Status ServiceExecutorSynchronous::schedule(Task task,
          * was greater than the number of available cores.
          */
         if (flags & ScheduleFlags::kMayYieldBeforeSchedule) {
-            if ((_localThreadIdleCounter++ & 0xf) == 0) {
-                markThreadIdle();
-            }
             if (_numRunningWorkerThreads.loadRelaxed() > _numHardwareCores) {
                 stdx::this_thread::yield();
             }
@@ -121,9 +110,9 @@ Status ServiceExecutorSynchronous::schedule(Task task,
 
     // First call to schedule() for this connection, spawn a worker thread that will push jobs
     // into the thread local job queue.
-    LOG(3) << "Starting new executor thread in passthrough mode";
+    LOGV2_DEBUG(22983, 3, "Starting new executor thread in passthrough mode");
 
-    Status status = launchServiceWorkerThread([ this, task = std::move(task) ] {
+    Status status = launchServiceWorkerThread([this, task = std::move(task)] {
         _numRunningWorkerThreads.addAndFetch(1);
 
         _localWorkQueue.emplace_back(std::move(task));
@@ -142,9 +131,8 @@ Status ServiceExecutorSynchronous::schedule(Task task,
 }
 
 void ServiceExecutorSynchronous::appendStats(BSONObjBuilder* bob) const {
-    BSONObjBuilder section(bob->subobjStart("serviceExecutorTaskStats"));
-    section << kExecutorLabel << kExecutorName << kThreadsRunning
-            << static_cast<int>(_numRunningWorkerThreads.loadRelaxed());
+    *bob << kExecutorLabel << kExecutorName << kThreadsRunning
+         << static_cast<int>(_numRunningWorkerThreads.loadRelaxed());
 }
 
 }  // namespace transport

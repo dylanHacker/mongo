@@ -1,29 +1,30 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -33,7 +34,6 @@
 #include "mongo/db/operation_context.h"
 
 namespace mongo {
-
 namespace {
 
 const OperationContext::Decoration<OperationShardingState> shardingMetadataDecoration =
@@ -51,8 +51,16 @@ constexpr auto kDbVersionField = "databaseVersion"_sd;
 
 OperationShardingState::OperationShardingState() = default;
 
+OperationShardingState::~OperationShardingState() {
+    invariant(!_shardingOperationFailedStatus);
+}
+
 OperationShardingState& OperationShardingState::get(OperationContext* opCtx) {
     return shardingMetadataDecoration(opCtx);
+}
+
+bool OperationShardingState::isOperationVersioned(OperationContext* opCtx) {
+    return !(get(opCtx)._shardVersions.empty());
 }
 
 void OperationShardingState::setAllowImplicitCollectionCreation(
@@ -68,30 +76,14 @@ bool OperationShardingState::allowImplicitCollectionCreation() const {
     return _allowImplicitCollectionCreation;
 }
 
-void OperationShardingState::initializeClientRoutingVersions(NamespaceString nss,
-                                                             const BSONObj& cmdObj) {
-    invariant(_shardVersions.empty());
-    invariant(_databaseVersions.empty());
-
+void OperationShardingState::initializeClientRoutingVersionsFromCommand(NamespaceString nss,
+                                                                        const BSONObj& cmdObj) {
+    // TODO SERVER-48618 Enforce that the nss shoud not be empty.
+    boost::optional<ChunkVersion> shardVersion;
+    boost::optional<DatabaseVersion> dbVersion;
     const auto shardVersionElem = cmdObj.getField(ChunkVersion::kShardVersionField);
     if (!shardVersionElem.eoo()) {
-        uassert(ErrorCodes::BadValue,
-                str::stream() << "expected shardVersion element to be an array, got "
-                              << shardVersionElem,
-                shardVersionElem.type() == BSONType::Array);
-        const BSONArray versionArr(shardVersionElem.Obj());
-
-        bool canParse;
-        ChunkVersion shardVersion = ChunkVersion::fromBSON(versionArr, &canParse);
-        uassert(ErrorCodes::BadValue,
-                str::stream() << "could not parse shardVersion from field " << versionArr,
-                canParse);
-
-        if (nss.isSystemDotIndexes()) {
-            _shardVersions[nss.ns()] = ChunkVersion::IGNORED();
-        } else {
-            _shardVersions[nss.ns()] = std::move(shardVersion);
-        }
+        shardVersion = uassertStatusOK(ChunkVersion::parseFromCommand(cmdObj));
     }
 
     const auto dbVersionElem = cmdObj.getField(kDbVersionField);
@@ -100,30 +92,46 @@ void OperationShardingState::initializeClientRoutingVersions(NamespaceString nss
                 str::stream() << "expected databaseVersion element to be an object, got "
                               << dbVersionElem,
                 dbVersionElem.type() == BSONType::Object);
-        // Unforunately this is a bit ugly; it's because a command comes with a shardVersion or
-        // databaseVersion, and the assumption is that those versions are applied to whatever is
-        // returned by the Command's parseNs(), which can either be a full namespace or just a db.
-        _databaseVersions[nss.db().empty() ? nss.ns() : nss.db()] = DatabaseVersion::parse(
-            IDLParserErrorContext("initializeClientRoutingVersions"), dbVersionElem.Obj());
+
+        dbVersion = DatabaseVersion::parse(IDLParserErrorContext("initializeClientRoutingVersions"),
+                                           dbVersionElem.Obj());
+    }
+
+    initializeClientRoutingVersions(nss, shardVersion, dbVersion);
+}
+
+void OperationShardingState::initializeClientRoutingVersions(
+    NamespaceString nss,
+    const boost::optional<ChunkVersion>& shardVersion,
+    const boost::optional<DatabaseVersion>& dbVersion) {
+    // TODO SERVER-48618 Enforce that the nss shoud not be empty. For now, all empty
+    // NamespaceStrings will be mapped under the empty string "".
+    if (shardVersion) {
+        invariant(_shardVersionsChecked.find(nss.ns()) == _shardVersionsChecked.end(), nss.ns());
+        _shardVersions[nss.ns()] = *shardVersion;
+    }
+    if (dbVersion) {
+        invariant(_databaseVersions.find(nss.db()) == _databaseVersions.end());
+        _databaseVersions[nss.db()] = *dbVersion;
     }
 }
 
-bool OperationShardingState::hasShardVersion() const {
-    return _globalUnshardedShardVersion || !_shardVersions.empty();
+bool OperationShardingState::hasShardVersion(const NamespaceString& nss) const {
+    // TODO SERVER-48618 Enforce that the nss shoud not be empty. For now, all empty
+    // NamespaceStrings will be treated as the same namespace.
+    return _shardVersions.find(nss.ns()) != _shardVersions.end();
 }
 
-ChunkVersion OperationShardingState::getShardVersion(const NamespaceString& nss) const {
-    if (_globalUnshardedShardVersion) {
-        return ChunkVersion::UNSHARDED();
-    }
-
+boost::optional<ChunkVersion> OperationShardingState::getShardVersion(const NamespaceString& nss) {
+    // TODO SERVER-48618 Enforce that the nss shoud not be empty. For now, all empty
+    // NamespaceStrings will be treated as the same namespace.
+    _shardVersionsChecked.insert(nss.ns());
     const auto it = _shardVersions.find(nss.ns());
     if (it != _shardVersions.end()) {
         return it->second;
     }
-    // If the client did not send a shardVersion for the requested namespace, assume the client
-    // expected the namespace to be unsharded.
-    return ChunkVersion::UNSHARDED();
+
+    return boost::none;
 }
 
 bool OperationShardingState::hasDbVersion() const {
@@ -137,11 +145,6 @@ boost::optional<DatabaseVersion> OperationShardingState::getDbVersion(
         return boost::none;
     }
     return it->second;
-}
-
-void OperationShardingState::setGlobalUnshardedShardVersion() {
-    invariant(_shardVersions.empty());
-    _globalUnshardedShardVersion = true;
 }
 
 bool OperationShardingState::waitForMigrationCriticalSectionSignal(OperationContext* opCtx) {
@@ -188,6 +191,20 @@ void OperationShardingState::setMovePrimaryCriticalSectionSignal(
     std::shared_ptr<Notification<void>> critSecSignal) {
     invariant(critSecSignal);
     _movePrimaryCriticalSectionSignal = std::move(critSecSignal);
+}
+
+void OperationShardingState::setShardingOperationFailedStatus(const Status& status) {
+    invariant(!_shardingOperationFailedStatus);
+    _shardingOperationFailedStatus = std::move(status);
+}
+
+boost::optional<Status> OperationShardingState::resetShardingOperationFailedStatus() {
+    if (!_shardingOperationFailedStatus) {
+        return boost::none;
+    }
+    Status failedStatus = Status(*_shardingOperationFailedStatus);
+    _shardingOperationFailedStatus = boost::none;
+    return failedStatus;
 }
 
 }  // namespace mongo

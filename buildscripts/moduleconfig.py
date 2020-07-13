@@ -23,7 +23,6 @@ alter those programs' behavior.
 MongoDB module SConscript files can describe libraries, programs and unit tests, just as other
 MongoDB SConscript files do.
 """
-from __future__ import print_function
 
 __all__ = ('discover_modules', 'discover_module_directories', 'configure_modules',
            'register_module_test')  # pylint: disable=undefined-all-variable
@@ -58,7 +57,7 @@ def discover_modules(module_root, allowed_modules):
             print("skipping module: %s" % (name))
             continue
 
-        if os.path.isfile(build_py):
+        try:
             print("adding module: %s" % (name))
             fp = open(build_py, "r")
             try:
@@ -69,6 +68,8 @@ def discover_modules(module_root, allowed_modules):
                 found_modules.append(module)
             finally:
                 fp.close()
+        except (FileNotFoundError, IOError):
+            pass
 
     return found_modules
 
@@ -111,10 +112,17 @@ def configure_modules(modules, conf):
 
     The configure() function should prepare the Mongo build system for building the module.
     """
+    env = conf.env
+    env['MONGO_MODULES'] = []
     for module in modules:
         name = module.name
         print("configuring module: %s" % (name))
-        module.configure(conf, conf.env)
+        modules_configured = module.configure(conf, env)
+        if modules_configured:
+            for module_name in modules_configured:
+                env['MONGO_MODULES'].append(module_name)
+        else:
+            env['MONGO_MODULES'].append(name)
 
 
 def get_module_sconscripts(modules):

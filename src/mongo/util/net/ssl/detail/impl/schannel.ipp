@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -33,6 +35,7 @@
 #include <memory>
 
 #include "asio/detail/assert.hpp"
+#include "mongo/base/init.h"
 #include "mongo/util/assert_util.h"
 
 namespace asio {
@@ -248,8 +251,15 @@ ssl_want SSLHandshakeManager::startShutdown(asio::error_code& ec) {
             return ssl_want::want_nothing;
         }
 
-        // TODO - I have not found a way to hit this code path
-        ASIO_ASSERT(false);
+        _pOutBuffer->reset();
+        _pOutBuffer->append(outputBuffers[0].pvBuffer, outputBuffers[0].cbBuffer);
+
+        if (SEC_E_OK == ss && outputBuffers[0].cbBuffer != 0) {
+            ec = asio::error::eof;
+            return ssl_want::want_output;
+        } else {
+            return ssl_want::want_nothing;
+        }
     }
 
     return ssl_want::want_nothing;
@@ -321,13 +331,38 @@ ssl_want SSLHandshakeManager::doServerHandshake(asio::error_code& ec,
         return ssl_want::want_nothing;
     }
 
+    if (!_sni_set) {
+        DWORD client_hello_size = _pInBuffer->size();
+        DWORD sni_size = client_hello_size + 1;
+        PBYTE sni_ptr = nullptr;
+
+        SECURITY_STATUS status =
+            _sslGetServerIdentityFn(_pInBuffer->data(), client_hello_size, &sni_ptr, &sni_size, 0);
+        if (status != SEC_E_OK) {
+            ec = asio::error_code(status, asio::error::get_ssl_category());
+        } else if (sni_ptr == nullptr) {
+            _sni = boost::none;
+            _sni_set = true;
+        } else {
+            std::vector<BYTE> sni(sni_size);
+            std::memcpy(sni.data(), sni_ptr, sni_size);
+            sni.push_back('\0');
+            _sni = sni;
+            _sni_set = true;
+        }
+    }
+
     // ASC_RET_EXTENDED_ERROR is not support on Windows 7/Windows 2008 R2.
     // ASC_RET_MUTUAL_AUTH is not set since we do our own certificate validation later.
     invariant(attribs == (retAttribs | ASC_RET_EXTENDED_ERROR | ASC_RET_MUTUAL_AUTH));
 
-    if (inputBuffers[1].BufferType == SECBUFFER_EXTRA) {
+    if (inputBuffers[1].BufferType == SECBUFFER_EXTRA && inputBuffers[1].cbBuffer > 0) {
+        // SECBUFFER_EXTRA do not set pvBuffer, just cbBuffer.
+        // cbBuffer tells us how much remaining in the buffer is extra
         _pExtraEncryptedBuffer->reset();
-        _pExtraEncryptedBuffer->append(inputBuffers[1].pvBuffer, inputBuffers[1].cbBuffer);
+        _pExtraEncryptedBuffer->append(_pInBuffer->data() +
+                                           (_pInBuffer->size() - inputBuffers[1].cbBuffer),
+                                       inputBuffers[1].cbBuffer);
     }
 
 
@@ -347,12 +382,14 @@ ssl_want SSLHandshakeManager::doServerHandshake(asio::error_code& ec,
     // Reset the input buffer
     _pInBuffer->reset();
 
-    // Check if we have any additional encrypted data
+    // Check if we have any additional data
     if (!_pExtraEncryptedBuffer->empty()) {
         _pInBuffer->swap(*_pExtraEncryptedBuffer);
         _pExtraEncryptedBuffer->reset();
 
-        setState(State::HaveEncryptedData);
+        // When doing the handshake and we have extra data, this means we have an incomplete tls
+        // record and need more bytes to complete the tls record.
+        setState(State::NeedMoreHandshakeData);
     }
 
     if (needOutput) {
@@ -464,9 +501,13 @@ ssl_want SSLHandshakeManager::doClientHandshake(asio::error_code& ec) {
 
     if (_pInBuffer->size()) {
         // Locate (optional) extra buffer
-        if (inputBuffers[1].BufferType == SECBUFFER_EXTRA) {
+        if (inputBuffers[1].BufferType == SECBUFFER_EXTRA && inputBuffers[1].cbBuffer > 0) {
+            // SECBUFFER_EXTRA do not set pvBuffer, just cbBuffer
+            // cbBuffer tells us how much remaining in the buffer is extra
             _pExtraEncryptedBuffer->reset();
-            _pExtraEncryptedBuffer->append(inputBuffers[1].pvBuffer, inputBuffers[1].cbBuffer);
+            _pExtraEncryptedBuffer->append(_pInBuffer->data() +
+                                               (_pInBuffer->size() - inputBuffers[1].cbBuffer),
+                                           inputBuffers[1].cbBuffer);
         }
     }
 
@@ -491,7 +532,9 @@ ssl_want SSLHandshakeManager::doClientHandshake(asio::error_code& ec) {
         _pInBuffer->swap(*_pExtraEncryptedBuffer);
         _pExtraEncryptedBuffer->reset();
 
-        setState(State::HaveEncryptedData);
+        // When doing the handshake and we have extra data, this means we have an incomplete tls
+        // record and need more bytes to complete the tls record.
+        setState(State::NeedMoreHandshakeData);
     }
 
     if (needOutput) {
@@ -604,12 +647,13 @@ ssl_want SSLReadManager::decryptBuffer(asio::error_code& ec, DecryptState* pDecr
             *pDecryptState = DecryptState::Renegotiate;
 
             // Fail the connection on SSL renegotiations
-            ec = asio::ssl::error::stream_truncated;
+            ec = asio::ssl::error::no_renegotiation;
             return ssl_want::want_nothing;
         }
 
         // The network layer may have read more then 1 SSL packet so remember the extra data.
-        if (securityBuffers[3].BufferType == SECBUFFER_EXTRA && securityBuffers[3].cbBuffer > 0) {
+        if (securityBuffers[3].BufferType == SECBUFFER_EXTRA &&
+            securityBuffers[3].pvBuffer != nullptr && securityBuffers[3].cbBuffer > 0) {
             ASIO_ASSERT(_pExtraEncryptedBuffer->empty());
             _pExtraEncryptedBuffer->append(securityBuffers[3].pvBuffer,
                                            securityBuffers[3].cbBuffer);
@@ -623,6 +667,10 @@ ssl_want SSLReadManager::decryptBuffer(asio::error_code& ec, DecryptState* pDecr
 
             return ssl_want::want_nothing;
         } else {
+            // Clear the existing TLS packet from the input buffer since it was completely empty
+            // and we have already processed any extra data.
+            _pInBuffer->reset();
+
             // Sigh, this means that the remote side sent us an TLS record with just a encryption
             // header/trailer but no actual data.
             //
@@ -761,6 +809,16 @@ ssl_want SSLWriteManager::encryptMessage(const void* pMessage,
     bytes_transferred = messageLength;
 
     return ssl_want::want_output;
+}
+
+
+MONGO_INITIALIZER(InitializeSchannelGetServerIdentityFn)(mongo::InitializerContext*) {
+    auto sc = std::move(mongo::SharedLibrary::create("Schannel.dll").getValue());
+
+    SSLHandshakeManager::setSslGetServerIdentityFn(
+        sc->getFunctionAs<SslGetServerIdentityFn>("SslGetServerIdentity").getValue());
+
+    return mongo::Status::OK();
 }
 
 }  // namespace detail

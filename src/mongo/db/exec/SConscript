@@ -4,6 +4,16 @@ Import("env")
 
 env = env.Clone()
 
+env.SConscript(
+    dirs=[
+        "document_value",
+        "sbe",
+    ],
+    exports=[
+        "env",
+    ],
+)
+
 # WorkingSet target and associated test
 env.Library(
     target = "working_set",
@@ -14,16 +24,7 @@ env.Library(
         "$BUILD_DIR/mongo/base",
         "$BUILD_DIR/mongo/db/bson/dotted_path_support",
         "$BUILD_DIR/mongo/db/service_context",
-    ],
-)
-
-env.CppUnitTest(
-    target = "working_set_test",
-    source = [
-        "working_set_test.cpp"
-    ],
-    LIBDEPS = [
-        "working_set",
+        "document_value/document_value",
     ],
 )
 
@@ -34,6 +35,38 @@ env.Library(
     ],
     LIBDEPS = [
         '$BUILD_DIR/mongo/util/net/network',
+    ],
+)
+
+sortExecutorEnv = env.Clone()
+sortExecutorEnv.InjectThirdParty(libraries=['snappy'])
+sortExecutorEnv.Library(
+    target="sort_executor",
+    source=[
+        "sort_executor.cpp",
+        "sort_key_comparator.cpp",
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/query/sort_pattern',
+        '$BUILD_DIR/mongo/db/storage/encryption_hooks',
+        '$BUILD_DIR/mongo/db/storage/storage_options',
+        '$BUILD_DIR/mongo/s/is_mongos',
+        '$BUILD_DIR/third_party/shim_snappy',
+        'working_set',
+    ],
+)
+
+env.Library(
+    target='projection_executor',
+    source=[
+        'add_fields_projection_executor.cpp',
+        'inclusion_projection_executor.cpp',
+        'projection_executor_builder.cpp',
+        'projection_executor_utils.cpp',
+        'projection_node.cpp'
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/matcher/expressions'
     ],
 )
 
@@ -51,46 +84,54 @@ env.Library(
     ],
 )
 
-env.CppUnitTest(
-    target = "queued_data_stage_test",
-    source = [
-        "queued_data_stage_test.cpp",
+env.Library(
+    target='sbe_cmd',
+    source=[
+        'sbe_cmd.cpp'
     ],
-    LIBDEPS = [
+    LIBDEPS=[
         "$BUILD_DIR/mongo/db/query_exec",
-        "$BUILD_DIR/mongo/db/serveronly",
-        "$BUILD_DIR/mongo/db/service_context_d",
-        "$BUILD_DIR/mongo/dbtests/mocklib",
-        "$BUILD_DIR/mongo/util/clock_source_mock",
+        "sbe/query_sbe_parser",
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
     ],
 )
 
 env.CppUnitTest(
-    target = "sort_test",
-    source = [
+    target='db_exec_test',
+    source=[
+        "document_value/document_comparator_test.cpp",
+        "document_value/document_metadata_fields_test.cpp",
+        "document_value/document_value_test.cpp",
+        "document_value/document_value_test_util_self_test.cpp",
+        "document_value/value_comparator_test.cpp",
+        "add_fields_projection_executor_test.cpp",
+        "exclusion_projection_executor_test.cpp",
+        "find_projection_executor_test.cpp",
+        "inclusion_projection_executor_test.cpp",
+        "projection_executor_builder_test.cpp",
+        "projection_executor_test.cpp",
+        "projection_executor_utils_test.cpp",
+        "projection_executor_wildcard_access_test.cpp",
+        "queued_data_stage_test.cpp",
         "sort_test.cpp",
+        "working_set_test.cpp",
     ],
-    LIBDEPS = [
-        "$BUILD_DIR/mongo/db/query_exec",
-        "$BUILD_DIR/mongo/db/serveronly",
-        "$BUILD_DIR/mongo/db/service_context_d",
-        "$BUILD_DIR/mongo/dbtests/mocklib",
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/db/auth/authmocks",
         "$BUILD_DIR/mongo/db/query/collation/collator_factory_mock",
         "$BUILD_DIR/mongo/db/query/collation/collator_interface_mock",
-        "$BUILD_DIR/mongo/util/clock_source_mock",
-    ],
-)
-
-env.CppUnitTest(
-    target = "projection_exec_test",
-    source = [
-        "projection_exec_test.cpp",
-    ],
-    LIBDEPS = [
-        "$BUILD_DIR/mongo/db/query_exec",
-        "$BUILD_DIR/mongo/db/query/collation/collator_interface_mock",
         "$BUILD_DIR/mongo/db/query/query_test_service_context",
-        "$BUILD_DIR/mongo/db/serveronly",
+        "$BUILD_DIR/mongo/db/query_exec",
         "$BUILD_DIR/mongo/db/service_context_d",
+        "$BUILD_DIR/mongo/db/service_context_d_test_fixture",
+        "$BUILD_DIR/mongo/dbtests/mocklib",
+        "$BUILD_DIR/mongo/util/clock_source_mock",
+        "document_value/document_value",
+        "document_value/document_value_test_util",
+        "projection_executor",
+        "working_set",
     ],
 )

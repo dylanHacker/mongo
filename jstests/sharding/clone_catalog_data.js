@@ -1,10 +1,9 @@
 'use strict';
 
 // Test that the 'cloneCatalogData' command works correctly.
-// Eventually, _movePrimary will use this command.
+// Eventually, _shardsvrMovePrimary will use this command.
 
 (() => {
-
     function sortByName(a, b) {
         if (a.name < b.name)
             return -1;
@@ -27,15 +26,15 @@
 
     // Create some test documents and put them in each collection.
     [{a: 1, b: 2, c: 4}, {a: 2, b: 4, c: 8}, {a: 3, b: 6, c: 12}].forEach(d => {
-        assert.writeOK(testDB.coll1.insert(d));
-        assert.writeOK(testDB.coll2.insert(d));
+        assert.commandWorked(testDB.coll1.insert(d));
+        assert.commandWorked(testDB.coll2.insert(d));
     });
 
     // Create indexes on each collection.
     var coll1Indexes =
             [
-              {key: {a: 1}, name: 'index1', expireAfterSeconds: 5000},
-              {key: {b: -1}, name: 'index2', unique: true},
+                {key: {a: 1}, name: 'index1', expireAfterSeconds: 5000},
+                {key: {b: -1}, name: 'index2', unique: true},
             ],
         coll2Indexes = [
             {key: {a: 1, b: 1}, name: 'index3'},
@@ -48,26 +47,31 @@
     // Shard coll2, but leave coll1 unsharded.
     assert.commandWorked(st.s.adminCommand({shardCollection: 'test.coll2', key: {_id: 1}}));
 
+    // Wait for the write to config.collections to be visible in the majority snapshot on all config
+    // secondaries, since the test directly talks to shards and so does not gossip the configOpTime
+    // to those shards.
+    st.configRS.awaitLastOpCommitted();
+
     // Get the primary shard, and the non-primary shard.
     var fromShard = st.getPrimaryShard('test');
     var toShard = st.getOther(fromShard);
 
     var res = fromShard.getDB('test').runCommand({listCollections: 1});
     assert.commandWorked(res);
-    var collections = res.cursor.firstBatch.filter(coll => coll.name != 'system.indexes');
+    var collections = res.cursor.firstBatch;
 
     collections.sort(sortByName);
     var coll2uuid = collections[1].info.uuid;
 
     // Have the other shard clone the DB from the primary.
     assert.commandWorked(toShard.adminCommand(
-        {_cloneCatalogData: 'test', from: fromShard.host, writeConcern: {w: "majority"}}));
+        {_shardsvrCloneCatalogData: 'test', from: fromShard.host, writeConcern: {w: "majority"}}));
 
-    // Ask the shard that just called _cloneCatalogData for the collections.
+    // Ask the shard that just called _shardsvrCloneCatalogData for the collections.
     res = toShard.getDB('test').runCommand({listCollections: 1});
     assert.commandWorked(res);
 
-    collections = res.cursor.firstBatch.filter(coll => coll.name != 'system.indexes');
+    collections = res.cursor.firstBatch;
 
     // There should be 2 collections: coll1, coll2
     assert.eq(collections.length, 2);
@@ -141,31 +145,38 @@
 
     // Check that the command fails without writeConcern majority.
     assert.commandFailedWithCode(
-        toShard.adminCommand({_cloneCatalogData: 'test', from: fromShard.host}),
+        toShard.adminCommand({_shardsvrCloneCatalogData: 'test', from: fromShard.host}),
         ErrorCodes.InvalidOptions);
 
     // Check that the command fails when attempting to clone the admin database.
-    assert.commandFailedWithCode(
-        toShard.adminCommand(
-            {_cloneCatalogData: 'admin', from: fromShard.host, writeConcern: {w: "majority"}}),
-        ErrorCodes.InvalidOptions);
+    assert.commandFailedWithCode(toShard.adminCommand({
+        _shardsvrCloneCatalogData: 'admin',
+        from: fromShard.host,
+        writeConcern: {w: "majority"}
+    }),
+                                 ErrorCodes.InvalidOptions);
 
     // Check that the command fails when attempting to run on the config server.
-    assert.commandFailedWithCode(
-        st.configRS.getPrimary().adminCommand(
-            {_cloneCatalogData: 'test', from: fromShard.host, writeConcern: {w: "majority"}}),
-        ErrorCodes.NoShardingEnabled);
+    assert.commandFailedWithCode(st.configRS.getPrimary().adminCommand({
+        _shardsvrCloneCatalogData: 'test',
+        from: fromShard.host,
+        writeConcern: {w: "majority"}
+    }),
+                                 ErrorCodes.NoShardingEnabled);
 
     // Check that the command fails when failing to specify a source.
     assert.commandFailedWithCode(
-        toShard.adminCommand({_cloneCatalogData: 'test', from: '', writeConcern: {w: "majority"}}),
+        toShard.adminCommand(
+            {_shardsvrCloneCatalogData: 'test', from: '', writeConcern: {w: "majority"}}),
         ErrorCodes.InvalidOptions);
 
     // Check that clone errors when the collection already exists on the destination.
-    assert.commandFailedWithCode(
-        toShard.adminCommand(
-            {_cloneCatalogData: 'test', from: fromShard.host, writeConcern: {w: "majority"}}),
-        ErrorCodes.NamespaceExists);
+    assert.commandFailedWithCode(toShard.adminCommand({
+        _shardsvrCloneCatalogData: 'test',
+        from: fromShard.host,
+        writeConcern: {w: "majority"}
+    }),
+                                 ErrorCodes.NamespaceExists);
 
     st.stop();
 })();

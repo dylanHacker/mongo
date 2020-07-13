@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -36,6 +37,22 @@
 
 namespace mongo {
 namespace {
+std::function<std::unique_ptr<RecoveryUnitHarnessHelper>()> recoveryUnitHarnessFactory;
+}
+}  // namespace mongo
+
+void mongo::registerRecoveryUnitHarnessHelperFactory(
+    std::function<std::unique_ptr<RecoveryUnitHarnessHelper>()> factory) {
+    recoveryUnitHarnessFactory = std::move(factory);
+}
+
+namespace mongo {
+
+auto newRecoveryUnitHarnessHelper() -> std::unique_ptr<RecoveryUnitHarnessHelper> {
+    return recoveryUnitHarnessFactory();
+}
+
+namespace {
 
 class RecoveryUnitTestHarness : public unittest::Test {
 public:
@@ -50,19 +67,28 @@ public:
     RecoveryUnit* ru;
 };
 
+class TestChange final : public RecoveryUnit::Change {
+public:
+    TestChange(int* count) : _count(count) {}
 
-TEST_F(RecoveryUnitTestHarness, SetReadConcernLevel) {
-    ru->setReadConcernLevelAndReplicationMode(repl::ReadConcernLevel::kAvailableReadConcern,
-                                              repl::ReplicationCoordinator::modeReplSet);
-    ASSERT_TRUE(repl::ReadConcernLevel::kAvailableReadConcern == ru->getReadConcernLevel());
-}
+    void commit(boost::optional<Timestamp>) override {
+        *_count = *_count + 1;
+    }
+
+    void rollback() override {
+        *_count = *_count - 1;
+    }
+
+private:
+    int* _count;
+};
 
 TEST_F(RecoveryUnitTestHarness, CommitUnitOfWork) {
     const auto rs = harnessHelper->createRecordStore(opCtx.get(), "table1");
     ru->beginUnitOfWork(opCtx.get());
-    StatusWith<RecordId> s = rs->insertRecord(opCtx.get(), "data", 4, Timestamp(), false);
+    StatusWith<RecordId> s = rs->insertRecord(opCtx.get(), "data", 4, Timestamp());
     ASSERT_TRUE(s.isOK());
-    ASSERT_EQUALS(1, rs->numRecords(NULL));
+    ASSERT_EQUALS(1, rs->numRecords(opCtx.get()));
     ru->commitUnitOfWork();
     RecordData rd;
     ASSERT_TRUE(rs->findRecord(opCtx.get(), s.getValue(), &rd));
@@ -71,11 +97,83 @@ TEST_F(RecoveryUnitTestHarness, CommitUnitOfWork) {
 TEST_F(RecoveryUnitTestHarness, AbortUnitOfWork) {
     const auto rs = harnessHelper->createRecordStore(opCtx.get(), "table1");
     ru->beginUnitOfWork(opCtx.get());
-    StatusWith<RecordId> s = rs->insertRecord(opCtx.get(), "data", 4, Timestamp(), false);
+    StatusWith<RecordId> s = rs->insertRecord(opCtx.get(), "data", 4, Timestamp());
     ASSERT_TRUE(s.isOK());
-    ASSERT_EQUALS(1, rs->numRecords(NULL));
+    ASSERT_EQUALS(1, rs->numRecords(opCtx.get()));
     ru->abortUnitOfWork();
     ASSERT_FALSE(rs->findRecord(opCtx.get(), s.getValue(), nullptr));
+}
+
+TEST_F(RecoveryUnitTestHarness, CommitAndRollbackChanges) {
+    int count = 0;
+    const auto rs = harnessHelper->createRecordStore(opCtx.get(), "table1");
+
+    ru->beginUnitOfWork(opCtx.get());
+    ru->registerChange(std::make_unique<TestChange>(&count));
+    ASSERT_EQUALS(count, 0);
+    ru->commitUnitOfWork();
+    ASSERT_EQUALS(count, 1);
+
+    ru->beginUnitOfWork(opCtx.get());
+    ru->registerChange(std::make_unique<TestChange>(&count));
+    ASSERT_EQUALS(count, 1);
+    ru->abortUnitOfWork();
+    ASSERT_EQUALS(count, 0);
+}
+
+TEST_F(RecoveryUnitTestHarness, CheckInActiveTxnWithCommit) {
+    const auto rs = harnessHelper->createRecordStore(opCtx.get(), "table1");
+    ru->beginUnitOfWork(opCtx.get());
+    ASSERT_TRUE(ru->inActiveTxn());
+    StatusWith<RecordId> s = rs->insertRecord(opCtx.get(), "data", 4, Timestamp());
+    ru->commitUnitOfWork();
+    ASSERT_FALSE(ru->inActiveTxn());
+}
+
+TEST_F(RecoveryUnitTestHarness, CheckInActiveTxnWithAbort) {
+    const auto rs = harnessHelper->createRecordStore(opCtx.get(), "table1");
+    ru->beginUnitOfWork(opCtx.get());
+    ASSERT_TRUE(ru->inActiveTxn());
+    StatusWith<RecordId> s = rs->insertRecord(opCtx.get(), "data", 4, Timestamp());
+    ru->abortUnitOfWork();
+    ASSERT_FALSE(ru->inActiveTxn());
+}
+
+TEST_F(RecoveryUnitTestHarness, BeginningUnitOfWorkDoesNotIncrementSnapshotId) {
+    auto snapshotIdBefore = ru->getSnapshotId();
+    ru->beginUnitOfWork(opCtx.get());
+    ASSERT_EQ(snapshotIdBefore, ru->getSnapshotId());
+    ru->abortUnitOfWork();
+}
+
+TEST_F(RecoveryUnitTestHarness, NewlyAllocatedRecoveryUnitHasNewSnapshotId) {
+    auto newRu = harnessHelper->newRecoveryUnit();
+    ASSERT_NE(newRu->getSnapshotId(), ru->getSnapshotId());
+}
+
+TEST_F(RecoveryUnitTestHarness, AbandonSnapshotIncrementsSnapshotId) {
+    auto snapshotIdBefore = ru->getSnapshotId();
+    ru->abandonSnapshot();
+    ASSERT_NE(snapshotIdBefore, ru->getSnapshotId());
+}
+
+TEST_F(RecoveryUnitTestHarness, CommitUnitOfWorkIncrementsSnapshotId) {
+    auto snapshotIdBefore = ru->getSnapshotId();
+    ru->beginUnitOfWork(opCtx.get());
+    ru->commitUnitOfWork();
+    ASSERT_NE(snapshotIdBefore, ru->getSnapshotId());
+}
+
+TEST_F(RecoveryUnitTestHarness, AbortUnitOfWorkIncrementsSnapshotId) {
+    auto snapshotIdBefore = ru->getSnapshotId();
+    ru->beginUnitOfWork(opCtx.get());
+    ru->abortUnitOfWork();
+    ASSERT_NE(snapshotIdBefore, ru->getSnapshotId());
+}
+
+DEATH_TEST_F(RecoveryUnitTestHarness, RegisterChangeMustBeInUnitOfWork, "invariant") {
+    int count = 0;
+    opCtx->recoveryUnit()->registerChange(std::make_unique<TestChange>(&count));
 }
 
 DEATH_TEST_F(RecoveryUnitTestHarness, CommitMustBeInUnitOfWork, "invariant") {
@@ -86,13 +184,22 @@ DEATH_TEST_F(RecoveryUnitTestHarness, AbortMustBeInUnitOfWork, "invariant") {
     opCtx->recoveryUnit()->abortUnitOfWork();
 }
 
+DEATH_TEST_F(RecoveryUnitTestHarness, CannotHaveUnfinishedUnitOfWorkOnExit, "invariant") {
+    opCtx->recoveryUnit()->beginUnitOfWork(opCtx.get());
+}
+
 DEATH_TEST_F(RecoveryUnitTestHarness, PrepareMustBeInUnitOfWork, "invariant") {
-    opCtx->recoveryUnit()->prepareUnitOfWork();
+    try {
+        opCtx->recoveryUnit()->prepareUnitOfWork();
+    } catch (const ExceptionFor<ErrorCodes::CommandNotSupported>&) {
+        bool prepareCommandSupported = false;
+        invariant(prepareCommandSupported);
+    }
 }
 
 DEATH_TEST_F(RecoveryUnitTestHarness, WaitUntilDurableMustBeOutOfUnitOfWork, "invariant") {
     opCtx->recoveryUnit()->beginUnitOfWork(opCtx.get());
-    opCtx->recoveryUnit()->waitUntilDurable();
+    opCtx->recoveryUnit()->waitUntilDurable(opCtx.get());
 }
 
 DEATH_TEST_F(RecoveryUnitTestHarness, AbandonSnapshotMustBeOutOfUnitOfWork, "invariant") {

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -34,11 +35,18 @@
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/mutable/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/field_ref_set.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/ops/write_ops_parsers.h"
+#include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/update/modifier_table.h"
+#include "mongo/db/update/object_replace_executor.h"
+#include "mongo/db/update/pipeline_executor.h"
+#include "mongo/db/update/update_node_visitor.h"
 #include "mongo/db/update/update_object_node.h"
+#include "mongo/db/update/update_tree_executor.h"
 #include "mongo/db/update_index_data.h"
 
 namespace mongo {
@@ -48,16 +56,18 @@ class OperationContext;
 
 class UpdateDriver {
 public:
+    enum class UpdateType { kOperator, kReplacement, kPipeline, kDelta };
+
     UpdateDriver(const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     /**
-     * Parses the 'updateExpr' update expression into the '_root' member variable. Uasserts or
-     * returns a non-ok status if 'updateExpr' fails to parse.
+     * Parses the 'updateExpr' update expression into the '_updateExecutor' member variable.
+     * Uasserts if 'updateExpr' fails to parse.
      */
-    Status parse(
-        const BSONObj& updateExpr,
-        const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>>& arrayFilters,
-        const bool multi = false);
+    void parse(const write_ops::UpdateModification& updateExpr,
+               const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>>& arrayFilters,
+               boost::optional<BSONObj> constants = boost::none,
+               const bool multi = false);
 
     /**
      * Fills in document with any fields in the query which are valid.
@@ -94,32 +104,73 @@ public:
      * If 'validateForStorage' is true, ensures that modified elements do not violate depth or DBRef
      * constraints. Ensures that no paths in 'immutablePaths' are modified (though they may be
      * created, if they do not yet exist).
+     *
+     * The value of 'isInsert' controls whether $setOnInsert modifiers get applied.
+     *
+     * If 'modifiedPaths' is not null, this method will populate it with the set of paths that were
+     * either modified at runtime or present statically in the update modifiers. For arrays, the
+     * set will include only the path to the array if the length has changed. All paths encode array
+     * indexes explicitly.
+     *
+     * The caller must either provide a null pointer, or a non-null pointer to an empty field ref
+     * set.
      */
     Status update(StringData matchedField,
                   mutablebson::Document* doc,
                   bool validateForStorage,
                   const FieldRefSet& immutablePaths,
+                  bool isInsert,
                   BSONObj* logOpRec = nullptr,
-                  bool* docWasModified = nullptr);
+                  bool* docWasModified = nullptr,
+                  FieldRefSetWithStorage* modifiedPaths = nullptr);
+
+    /**
+     * Passes the visitor through to the root of the update tree. The visitor is responsible for
+     * implementing methods that operate on the nodes of the tree.
+     */
+    void visitRoot(UpdateNodeVisitor* visitor) {
+        if (_updateType == UpdateType::kOperator) {
+            UpdateTreeExecutor* exec = static_cast<UpdateTreeExecutor*>(_updateExecutor.get());
+            invariant(exec);
+            return exec->getUpdateTree()->acceptVisitor(visitor);
+        }
+
+        MONGO_UNREACHABLE;
+    }
+
+    UpdateExecutor* getUpdateExecutor() {
+        return _updateExecutor.get();
+    }
 
     //
     // Accessors
     //
 
-    bool isDocReplacement() const;
-    static bool isDocReplacement(const BSONObj& updateExpr);
+    UpdateType type() const {
+        return _updateType;
+    }
 
-    bool modsAffectIndices() const;
-    void refreshIndexKeys(const UpdateIndexData* indexedFields);
+    static bool isDocReplacement(const write_ops::UpdateModification& updateMod);
 
-    bool logOp() const;
-    void setLogOp(bool logOp);
+    bool modsAffectIndices() const {
+        return _affectIndices;
+    }
+    void refreshIndexKeys(const UpdateIndexData* indexedFields) {
+        _indexedFields = indexedFields;
+    }
 
-    bool fromOplogApplication() const;
-    void setFromOplogApplication(bool fromOplogApplication);
+    bool logOp() const {
+        return _logOp;
+    }
+    void setLogOp(bool logOp) {
+        _logOp = logOp;
+    }
 
-    void setInsert(bool insert) {
-        _insert = insert;
+    bool fromOplogApplication() const {
+        return _fromOplogApplication;
+    }
+    void setFromOplogApplication(bool fromOplogApplication) {
+        _fromOplogApplication = fromOplogApplication;
     }
 
     mutablebson::Document& getDocument() {
@@ -132,6 +183,14 @@ public:
 
     bool needMatchDetails() const {
         return _positional;
+    }
+
+    /**
+     * Serialize the update expression to Value. Output of this method is expected to, when parsed,
+     * produce a logically equivalent update expression.
+     */
+    Value serialize() const {
+        return _updateExecutor->serialize();
     }
 
     /**
@@ -149,12 +208,9 @@ private:
     // immutable properties after parsing
     //
 
-    // Is this a full object replacement or do we have update modifiers in the '_root' UpdateNode
-    // tree?
-    bool _replacementMode = false;
+    UpdateType _updateType = UpdateType::kOperator;
 
-    // The root of the UpdateNode tree.
-    std::unique_ptr<UpdateNode> _root;
+    std::unique_ptr<UpdateExecutor> _updateExecutor;
 
     // What are the list of fields in the collection over which the update is going to be
     // applied that participate in indices?
@@ -180,9 +236,6 @@ private:
 
     // Do any of the mods require positional match details when calling 'prepare'?
     bool _positional = false;
-
-    // Is this update going to be an upsert?
-    bool _insert = false;
 
     // The document used to represent or store the object being updated.
     mutablebson::Document _objDoc;

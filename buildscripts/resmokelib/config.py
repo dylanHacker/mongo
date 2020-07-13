@@ -1,7 +1,5 @@
 """Configuration options for resmoke.py."""
 
-from __future__ import absolute_import
-
 import collections
 import datetime
 import itertools
@@ -23,11 +21,12 @@ MONGO_RUNNER_SUBDIR = "mongorunner"
 # The latter is set automatically as part of resmoke's option parsing on startup.
 ##
 
-# Default path for where to look for executables.
+# We default to search for executables in the current working directory or in /data/multiversion
+# which are both part of the PATH.
 DEFAULT_DBTEST_EXECUTABLE = os.path.join(os.curdir, "dbtest")
-DEFAULT_MONGO_EXECUTABLE = os.path.join(os.curdir, "mongo")
-DEFAULT_MONGOD_EXECUTABLE = os.path.join(os.curdir, "mongod")
-DEFAULT_MONGOS_EXECUTABLE = os.path.join(os.curdir, "mongos")
+DEFAULT_MONGO_EXECUTABLE = "mongo"
+DEFAULT_MONGOD_EXECUTABLE = "mongod"
+DEFAULT_MONGOS_EXECUTABLE = "mongos"
 
 DEFAULT_BENCHMARK_REPETITIONS = 3
 DEFAULT_BENCHMARK_MIN_TIME = datetime.timedelta(seconds=5)
@@ -36,20 +35,34 @@ DEFAULT_BENCHMARK_MIN_TIME = datetime.timedelta(seconds=5)
 # starts, as well as those started by individual tests.
 DEFAULT_DBPATH_PREFIX = os.path.normpath("/data/db")
 
+# Default directory that we expect to contain binaries for multiversion testing. This directory is
+# added to the PATH when calling programs.make_process().
+DEFAULT_MULTIVERSION_DIR = os.path.normpath("/data/multiversion")
+
+# Default location for the genny executable. Override this in the YAML suite configuration if
+# desired.
+DEFAULT_GENNY_EXECUTABLE = os.path.normpath("genny/build/src/driver/genny")
+
 # Names below correspond to how they are specified via the command line or in the options YAML file.
 DEFAULTS = {
-    "archive_file": None,
+    "always_use_log_files": False,
     "archive_limit_mb": 5000,
     "archive_limit_tests": 10,
     "base_port": 20000,
+    "backup_on_restart_dir": None,
     "buildlogger_url": "https://logkeeper.mongodb.org",
     "continue_on_failure": False,
     "dbpath_prefix": None,
     "dbtest_executable": None,
     "dry_run": None,
     "exclude_with_any_tags": None,
+    "flow_control": None,
+    "flow_control_tickets": None,
+    "genny_executable": None,
     "include_with_any_tags": None,
+    "install_dir": None,
     "jobs": 1,
+    "logger_file": None,
     "mongo_executable": None,
     "mongod_executable": None,
     "mongod_set_parameters": None,
@@ -58,22 +71,36 @@ DEFAULTS = {
     "no_journal": False,
     "num_clients_per_fixture": 1,
     "perf_report_file": None,
-    "prealloc_journal": None,  # Default is set on the commandline.
-    "repeat": 1,
+    "repeat_suites": 1,
+    "repeat_tests": 1,
+    "repeat_tests_max": None,
+    "repeat_tests_min": None,
+    "repeat_tests_secs": None,
     "report_failure_status": "fail",
     "report_file": None,
-    "seed": long(time.time() * 256),  # Taken from random.py code in Python 2.7.
+    "seed": int(time.time() * 256),  # Taken from random.py code in Python 2.7.
     "service_executor": None,
     "shell_conn_string": None,
     "shell_port": None,
     "shell_read_mode": None,
     "shell_write_mode": None,
     "shuffle": None,
+    "spawn_using": None,
     "stagger_jobs": None,
+    "majority_read_concern": None,  # Default is set on the commandline.
     "storage_engine": None,
     "storage_engine_cache_size_gb": None,
+    "suite_files": "with_server",
     "tag_file": None,
+    "test_files": None,
     "transport_layer": None,
+    "mixed_bin_versions": None,
+    "linear_chain": None,
+    "num_replset_nodes": None,
+    "num_shards": None,
+
+    # Internal testing options.
+    "internal_params": [],
 
     # Evergreen options.
     "build_id": None,
@@ -97,7 +124,13 @@ DEFAULTS = {
     "benchmark_filter": None,
     "benchmark_list_tests": None,
     "benchmark_min_time_secs": None,
-    "benchmark_repetitions": None
+    "benchmark_repetitions": None,
+
+    # Config Dir
+    "config_dir": "buildscripts/resmokeconfig",
+
+    # UndoDB options
+    "undo_recorder_path": None
 }
 
 _SuiteOptions = collections.namedtuple("_SuiteOptions", [
@@ -105,7 +138,11 @@ _SuiteOptions = collections.namedtuple("_SuiteOptions", [
     "fail_fast",
     "include_tags",
     "num_jobs",
-    "num_repeats",
+    "num_repeat_suites",
+    "num_repeat_tests",
+    "num_repeat_tests_max",
+    "num_repeat_tests_min",
+    "time_repeat_tests_secs",
     "report_failure_status",
 ])
 
@@ -162,14 +199,19 @@ class SuiteOptions(_SuiteOptions):
         description = None
         include_tags = None
         parent = dict(
-            zip(SuiteOptions._fields, [
-                description,
-                FAIL_FAST,
-                include_tags,
-                JOBS,
-                REPEAT,
-                REPORT_FAILURE_STATUS,
-            ]))
+            list(
+                zip(SuiteOptions._fields, [
+                    description,
+                    FAIL_FAST,
+                    include_tags,
+                    JOBS,
+                    REPEAT_SUITES,
+                    REPEAT_TESTS,
+                    REPEAT_TESTS_MAX,
+                    REPEAT_TESTS_MIN,
+                    REPEAT_TESTS_SECS,
+                    REPORT_FAILURE_STATUS,
+                ])))
 
         options = self._asdict()
         for field in SuiteOptions._fields:
@@ -180,14 +222,14 @@ class SuiteOptions(_SuiteOptions):
 
 
 SuiteOptions.ALL_INHERITED = SuiteOptions(  # type: ignore
-    **dict(zip(SuiteOptions._fields, itertools.repeat(SuiteOptions.INHERIT))))
+    **dict(list(zip(SuiteOptions._fields, itertools.repeat(SuiteOptions.INHERIT)))))
 
 ##
 # Variables that are set by the user at the command line or with --options.
 ##
 
-# The name of the archive JSON file used to associate S3 archives to an Evergreen task.
-ARCHIVE_FILE = None
+# Log to files located in the db path and don't clean dbpaths after tests.
+ALWAYS_USE_LOG_FILES = False
 
 # The limit size of all archive files for an Evergreen task.
 ARCHIVE_LIMIT_MB = None
@@ -252,15 +294,31 @@ EVERGREEN_VERSION_ID = None
 # If set, then any jstests that have any of the specified tags will be excluded from the suite(s).
 EXCLUDE_WITH_ANY_TAGS = None
 
+# A tag which is implicited excluded. This is useful for temporarily disabling a test.
+EXCLUDED_TAG = "__TEMPORARILY_DISABLED__"
+
 # If true, then a test failure or error will cause resmoke.py to exit and not run any more tests.
 FAIL_FAST = None
+
+# Executable file for genny, passed in as a command line arg.
+GENNY_EXECUTABLE = None
 
 # If set, then only jstests that have at least one of the specified tags will be run during the
 # jstest portion of the suite(s).
 INCLUDE_WITH_ANY_TAGS = None
 
+# Params that can be set to change internal resmoke behavior. Used to test resmoke and should
+# not be set by the user.
+INTERNAL_PARAMS = []
+
 # If set, then resmoke.py starts the specified number of Job instances to run tests.
 JOBS = None
+
+# Yaml file that specified logging configuration.
+LOGGER_FILE = None
+
+# Where to find the MONGO*_EXECUTABLE binaries
+INSTALL_DIR = None
 
 # The path to the mongo executable used by resmoke.py.
 MONGO_EXECUTABLE = None
@@ -281,10 +339,6 @@ MONGOS_SET_PARAMETERS = None
 # enabled.
 NO_JOURNAL = None
 
-# If true, then all mongod's started by resmoke.py and by the mongo shell will not preallocate
-# journal files.
-NO_PREALLOC_JOURNAL = None
-
 # If set, then each fixture runs tests with the specified number of clients.
 NUM_CLIENTS_PER_FIXTURE = None
 
@@ -296,7 +350,21 @@ PERF_REPORT_FILE = None
 RANDOM_SEED = None
 
 # If set, then each suite is repeated the specified number of times.
-REPEAT = None
+REPEAT_SUITES = None
+
+# If set, then each test is repeated the specified number of times inside the suites.
+REPEAT_TESTS = None
+
+# If set and REPEAT_TESTS_SECS is set, then each test is repeated up to specified number of
+# times inside the suites.
+REPEAT_TESTS_MAX = None
+
+# If set and REPEAT_TESTS_SECS is set, then each test is repeated at least specified number of
+# times inside the suites.
+REPEAT_TESTS_MIN = None
+
+# If set, then each test is repeated the specified time (seconds) inside the suites.
+REPEAT_TESTS_SECS = None
 
 # Controls if the test failure status should be reported as failed or be silently ignored.
 REPORT_FAILURE_STATUS = None
@@ -321,8 +389,34 @@ SHELL_WRITE_MODE = None
 # alphabetical (case-insensitive) order.
 SHUFFLE = None
 
+# Possible values are python and jasper. If python, resmoke uses the python built-in subprocess
+# or subprocess32 module to spawn threads. If jasper, resmoke uses the jasper module.
+SPAWN_USING = None
+
 # If true, the launching of jobs is staggered in resmoke.py.
 STAGGER_JOBS = None
+
+# If set to true, it enables read concern majority. Else, read concern majority is disabled.
+MAJORITY_READ_CONCERN = None
+
+# Specifies the binary versions of each node we should run for a replica set.
+MIXED_BIN_VERSIONS = None
+
+# Specifies the number of replica set members in a ReplicaSetFixture.
+NUM_REPLSET_NODES = None
+
+# Specifies the number of shards in a ShardedClusterFixture.
+NUM_SHARDS = None
+
+# If true, run ReplicaSetFixture with linear chaining.
+LINEAR_CHAIN = None
+
+# If set to "on", it enables flow control. If set to "off", it disables flow control. If left as
+# None, the server's default will determine whether flow control is enabled.
+FLOW_CONTROL = None
+
+# If set, it ensures Flow Control only ever assigns this number of tickets in one second.
+FLOW_CONTROL_TICKETS = None
 
 # If set, then all mongod's started by resmoke.py and by the mongo shell will use the specified
 # storage engine.
@@ -332,8 +426,14 @@ STORAGE_ENGINE = None
 # storage engine cache size.
 STORAGE_ENGINE_CACHE_SIZE = None
 
+# Yaml suites that specify how tests should be executed.
+SUITE_FILES = None
+
 # The tag file to use that associates tests with tags.
 TAG_FILE = None
+
+# The test files to execute.
+TEST_FILES = None
 
 # If set, then mongod/mongos's started by resmoke.py will use the specified transport layer.
 TRANSPORT_LAYER = None
@@ -356,9 +456,15 @@ BENCHMARK_LIST_TESTS = None
 BENCHMARK_MIN_TIME = None
 BENCHMARK_REPETITIONS = None
 
+# UndoDB options
+UNDO_RECORDER_PATH = None
+
 ##
 # Internally used configuration options that aren't exposed to the user
 ##
+
+# The name of the archive JSON file used to associate S3 archives to an Evergreen task.
+ARCHIVE_FILE = "archive.json"
 
 # S3 Bucket to upload archive files.
 ARCHIVE_BUCKET = "mongodatafiles"
@@ -373,8 +479,18 @@ ORDER_TESTS_BY_NAME = True
 DEFAULT_BENCHMARK_TEST_LIST = "build/benchmarks.txt"
 DEFAULT_UNIT_TEST_LIST = "build/unittests.txt"
 DEFAULT_INTEGRATION_TEST_LIST = "build/integration_tests.txt"
+DEFAULT_LIBFUZZER_TEST_LIST = "build/libfuzzer_tests.txt"
 
 # External files or executables, used as suite selectors, that are created during the build and
 # therefore might not be available when creating a test membership map.
 EXTERNAL_SUITE_SELECTORS = (DEFAULT_BENCHMARK_TEST_LIST, DEFAULT_UNIT_TEST_LIST,
-                            DEFAULT_INTEGRATION_TEST_LIST, DEFAULT_DBTEST_EXECUTABLE)
+                            DEFAULT_INTEGRATION_TEST_LIST, DEFAULT_DBTEST_EXECUTABLE,
+                            DEFAULT_LIBFUZZER_TEST_LIST)
+
+# Where to look for logging and suite configuration files
+CONFIG_DIR = None
+NAMED_SUITES = None
+LOGGER_DIR = None
+
+# Generated logging config for the current invocation.
+LOGGING_CONFIG: dict = {}

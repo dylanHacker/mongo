@@ -3,62 +3,46 @@ test_kind: js_test
 selector:
   roots:
   - jstests/sharding/*.js
+  - jstests/sharding/change_streams/*.js
+  - jstests/sharding/query/*.js
+  exclude_with_any_tags:
+  - multiversion_incompatible
+  - requires_fcv_46
+  - need_fixing_for_46
   exclude_files:
-  # Will always fail on last-stable. In order for the test to succeed, the setFCV
-  # command has to reach the shards. Since the cluster will already be
-  # running in fully downgraded version, the config server won't forward the
-  # command to the shards - it'll just return success immediately. 
-  - jstests/sharding/max_time_ms_sharded_new_commands.js
-  #### Enable when 4.0 becomes last-stable.
-  - jstests/sharding/change_streams_unsharded_becomes_sharded.js
-  - jstests/sharding/create_database.js
-  - jstests/sharding/database_and_shard_versioning_all_commands.js
-  - jstests/sharding/dump_coll_metadata.js
-  - jstests/sharding/geo_near_random1.js
-  - jstests/sharding/geo_near_random2.js
-  - jstests/sharding/geo_near_sort.js
-  - jstests/sharding/basic_drop_coll.js
-  - jstests/sharding/commands_that_write_accept_wc_configRS.js
-  - jstests/sharding/kill_pinned_cursor.js
-  - jstests/sharding/movechunk_commit_changelog_stats.js
-  - jstests/sharding/configsvr_metadata_commands_require_majority_write_concern.js
-  - jstests/sharding/mongos_local_explain.js
-  - jstests/sharding/safe_secondary_reads_drop_recreate.js
-  - jstests/sharding/safe_secondary_reads_single_migration_suspend_range_deletion.js
-  - jstests/sharding/safe_secondary_reads_single_migration_waitForDelete.js
-  - jstests/sharding/move_primary_basic.js
-  - jstests/sharding/movePrimary1.js
   # Requires fix to SERVER-31689
-  - jstests/sharding/aggregation_currentop.js
-  #### End "Enable when 4.0 becomes last stable"
+  - jstests/sharding/query/aggregation_currentop.js
   # SERVER-33683: We added a restriction on using an aggregation within a transaction against
   # mongos. This should be removed and the test can be adjusted and re-added to this passthrough.
   - jstests/sharding/aggregations_in_session.js
-  # New failpoint in v4.0 mongos.
-  - jstests/sharding/crash_mongos_against_upgraded_cluster.js
-  # New failpoint in v4.0 mongod.
-  - jstests/sharding/move_primary_clone_test.js
-  # New failpoint in v4.0 config server.
-  - jstests/sharding/check_db_version_persisted.js
-  # New waitForClusterTime
-  - jstests/sharding/auth_slaveok_routing.js
-  # This test should not be run with a mixed cluster environment.
-  - jstests/sharding/nonreplicated_uuids_on_shardservers.js
-  # Requires the ability to interrupt a pinned cursor, introduced in v4.0.
+  # Enable when SERVER-43860 is backported by BACKPORT-5471 or 4.4 becomes last-stable
+  - jstests/sharding/agg_merge_hashed.js
+  - jstests/sharding/merge_from_stale_mongos.js
+  - jstests/sharding/query/merge_stale_on_fields.js
+  - jstests/sharding/refresh_sessions.js
+  - jstests/sharding/query/lookup.js
+  # Enable when 4.4 becomes last stable
+  - jstests/sharding/query/out_fails_to_replace_sharded_collection.js
+  - jstests/sharding/merge_from_stale_mongos.js
+  - jstests/sharding/migration_coordinator_basic.js
+  - jstests/sharding/migration_coordinator_killop_in_critical_section.js
+  - jstests/sharding/migration_coordinator_shutdown_in_critical_section.js
+  - jstests/sharding/test_stacked_migration_cleanup.js
   - jstests/sharding/kill_pinned_cursor.js
-  # New feature in v4.0 mongos and mongod.
-  - jstests/sharding/shards_and_config_return_last_committed_optime.js
-  # Requires maxTimeMS tracking on mongos, added in v4.0
-  - jstests/sharding/max_time_ms_sharded.js
-  # Requires killOp to work for local operations on mongos, introduced in v4.0.
   - jstests/sharding/killop.js
-  # New 4.0 feature
-  - jstests/sharding/snapshot_aggregate_mongos.js
-  - jstests/sharding/resume_change_stream.js
-  # Requires count command to be accurate on sharded clusters, introduced in v4.0.
-  - jstests/sharding/accurate_count_with_predicate.js
-  # Disabled throughout sharding. See SERVER-31937 for details.
-  - jstests/sharding/kill_sessions.js
+  # Enable when 4.6 becomes last stable
+  - jstests/sharding/mongos_dataSize.js
+  # Enable when SERVER-44733 is backported
+  - jstests/sharding/change_streams_update_lookup_shard_metadata_missing.js
+  - jstests/sharding/repl_monitor_refresh.js
+  - jstests/sharding/retryable_write_error_labels.js
+  # Enable when SERVER-43310 is backported
+  - jstests/sharding/cluster_create_indexes_always_routes_through_primary.js
+  # TODO SERVER-46040: Enable when SERVER-46040 is backported
+  - jstests/sharding/drop_indexes_with_stale_config_error.js
+  # Enable when SERVER-43614 is backported.
+  - jstests/sharding/query/unionWith_current_op.js
+  - jstests/sharding/verify_sessions_expiration_sharded.js
 
 executor:
   config:

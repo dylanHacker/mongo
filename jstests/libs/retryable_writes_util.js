@@ -4,10 +4,27 @@
 var RetryableWritesUtil = (function() {
     /**
      * Returns true if the error code is retryable, assuming the command is idempotent.
+     *
+     * TODO SERVER-34666: Expose the isRetryableCode() function that's defined in
+     * src/mongo/shell/session.js and use it here.
      */
     function isRetryableCode(code) {
         return ErrorCodes.isNetworkError(code) || ErrorCodes.isNotMasterError(code) ||
-            ErrorCodes.isWriteConcernError(code) || ErrorCodes.isInterruption(code);
+            ErrorCodes.isWriteConcernError(code) || ErrorCodes.isShutdownError(code) ||
+            ErrorCodes.isInterruption(code);
+    }
+
+    // The names of all codes that return true in isRetryableCode() above. Can be used where the
+    // original error code is buried in a response's error message.
+    const kRetryableCodeNames = Object.keys(ErrorCodes).filter((codeName) => {
+        return isRetryableCode(ErrorCodes[codeName]);
+    });
+
+    // Returns true if the error message contains a retryable code name.
+    function errmsgContainsRetryableCodeName(errmsg) {
+        return typeof errmsg !== "undefined" && kRetryableCodeNames.some(codeName => {
+            return errmsg.indexOf(codeName) > 0;
+        });
     }
 
     const kRetryableWriteCommands =
@@ -20,7 +37,7 @@ var RetryableWritesUtil = (function() {
         return kRetryableWriteCommands.has(cmdName);
     }
 
-    const kStorageEnginesWithoutDocumentLocking = new Set(["ephemeralForTest", "mmapv1"]);
+    const kStorageEnginesWithoutDocumentLocking = new Set(["ephemeralForTest"]);
 
     /**
      * Returns true if the given storage engine supports retryable writes (i.e. supports
@@ -58,6 +75,7 @@ var RetryableWritesUtil = (function() {
 
     return {
         isRetryableCode,
+        errmsgContainsRetryableCodeName,
         isRetryableWriteCmdName,
         storageEngineSupportsRetryableWrites,
         checkTransactionTable,

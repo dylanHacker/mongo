@@ -1,25 +1,24 @@
-// expression_parser_array_test.cpp
-
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -199,16 +198,12 @@ TEST(MatchExpressionParserArrayTest, ElemMatchDBRef1) {
     OID oid = OID::gen();
     BSONObj match = BSON("$ref"
                          << "coll"
-                         << "$id"
-                         << oid
-                         << "$db"
+                         << "$id" << oid << "$db"
                          << "db");
     OID oidx = OID::gen();
     BSONObj notMatch = BSON("$ref"
                             << "coll"
-                            << "$id"
-                            << oidx
-                            << "$db"
+                            << "$id" << oidx << "$db"
                             << "db");
 
     BSONObj query = BSON("x" << BSON("$elemMatch" << BSON("$eq" << match)));
@@ -225,16 +220,12 @@ TEST(MatchExpressionParserArrayTest, ElemMatchDBRef2) {
     OID oid = OID::gen();
     BSONObj match = BSON("$ref"
                          << "coll"
-                         << "$id"
-                         << oid
-                         << "$db"
+                         << "$id" << oid << "$db"
                          << "db");
     OID oidx = OID::gen();
     BSONObj notMatch = BSON("$ref"
                             << "coll"
-                            << "$id"
-                            << oidx
-                            << "$db"
+                            << "$id" << oidx << "$db"
                             << "db");
 
     BSONObj query = BSON("x" << BSON("$elemMatch" << match));
@@ -252,17 +243,11 @@ TEST(MatchExpressionParserArrayTest, ElemMatchDBRef3) {
     OID oid = OID::gen();
     BSONObj match = BSON("$ref"
                          << "coll"
-                         << "$id"
-                         << oid
-                         << "foo"
-                         << 12345);
+                         << "$id" << oid << "foo" << 12345);
     OID oidx = OID::gen();
     BSONObj notMatch = BSON("$ref"
                             << "coll"
-                            << "$id"
-                            << oidx
-                            << "foo"
-                            << 12345);
+                            << "$id" << oidx << "foo" << 12345);
 
     BSONObj query = BSON("x" << BSON("$elemMatch" << match));
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
@@ -274,14 +259,10 @@ TEST(MatchExpressionParserArrayTest, ElemMatchDBRef3) {
     ASSERT(result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(match))));
 
     // Document contains fields not referred to in $elemMatch query.
-    ASSERT(result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(BSON("$ref"
-                                                                      << "coll"
-                                                                      << "$id"
-                                                                      << oid
-                                                                      << "foo"
-                                                                      << 12345
-                                                                      << "bar"
-                                                                      << 678)))));
+    ASSERT(result.getValue()->matchesBSON(
+        BSON("x" << BSON_ARRAY(BSON("$ref"
+                                    << "coll"
+                                    << "$id" << oid << "foo" << 12345 << "bar" << 678)))));
 }
 
 // Query with DBRef fields out of order.
@@ -289,22 +270,16 @@ TEST(MatchExpressionParserArrayTest, ElemMatchDBRef4) {
     OID oid = OID::gen();
     BSONObj match = BSON("$ref"
                          << "coll"
-                         << "$id"
-                         << oid
-                         << "$db"
+                         << "$id" << oid << "$db"
                          << "db");
     BSONObj matchOutOfOrder = BSON("$db"
                                    << "db"
-                                   << "$id"
-                                   << oid
-                                   << "$ref"
+                                   << "$id" << oid << "$ref"
                                    << "coll");
     OID oidx = OID::gen();
     BSONObj notMatch = BSON("$ref"
                             << "coll"
-                            << "$id"
-                            << oidx
-                            << "$db"
+                            << "$id" << oidx << "$db"
                             << "db");
 
     BSONObj query = BSON("x" << BSON("$elemMatch" << matchOutOfOrder));
@@ -323,19 +298,13 @@ TEST(MatchExpressionParserArrayTest, ElemMatchDBRef5) {
     OID oid = OID::gen();
     BSONObj match = BSON("$ref"
                          << "coll"
-                         << "$id"
-                         << oid
-                         << "foo"
-                         << 12345);
+                         << "$id" << oid << "foo" << 12345);
     BSONObj matchOutOfOrder = BSON("foo" << 12345 << "$id" << oid << "$ref"
                                          << "coll");
     OID oidx = OID::gen();
     BSONObj notMatch = BSON("$ref"
                             << "coll"
-                            << "$id"
-                            << oidx
-                            << "foo"
-                            << 12345);
+                            << "$id" << oidx << "foo" << 12345);
 
     BSONObj query = BSON("x" << BSON("$elemMatch" << matchOutOfOrder));
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
@@ -347,14 +316,10 @@ TEST(MatchExpressionParserArrayTest, ElemMatchDBRef5) {
     ASSERT(result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(match))));
 
     // Document contains fields not referred to in $elemMatch query.
-    ASSERT(result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(BSON("$ref"
-                                                                      << "coll"
-                                                                      << "$id"
-                                                                      << oid
-                                                                      << "foo"
-                                                                      << 12345
-                                                                      << "bar"
-                                                                      << 678)))));
+    ASSERT(result.getValue()->matchesBSON(
+        BSON("x" << BSON_ARRAY(BSON("$ref"
+                                    << "coll"
+                                    << "$id" << oid << "foo" << 12345 << "bar" << 678)))));
 }
 
 // Incomplete DBRef - $id missing.
@@ -362,20 +327,13 @@ TEST(MatchExpressionParserArrayTest, ElemMatchDBRef6) {
     OID oid = OID::gen();
     BSONObj match = BSON("$ref"
                          << "coll"
-                         << "$id"
-                         << oid
-                         << "foo"
-                         << 12345);
+                         << "$id" << oid << "foo" << 12345);
     BSONObj matchMissingID = BSON("$ref"
                                   << "coll"
-                                  << "foo"
-                                  << 12345);
+                                  << "foo" << 12345);
     BSONObj notMatch = BSON("$ref"
                             << "collx"
-                            << "$id"
-                            << oid
-                            << "foo"
-                            << 12345);
+                            << "$id" << oid << "foo" << 12345);
 
     BSONObj query = BSON("x" << BSON("$elemMatch" << matchMissingID));
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
@@ -387,14 +345,10 @@ TEST(MatchExpressionParserArrayTest, ElemMatchDBRef6) {
     ASSERT(result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(match))));
 
     // Document contains fields not referred to in $elemMatch query.
-    ASSERT(result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(BSON("$ref"
-                                                                      << "coll"
-                                                                      << "$id"
-                                                                      << oid
-                                                                      << "foo"
-                                                                      << 12345
-                                                                      << "bar"
-                                                                      << 678)))));
+    ASSERT(result.getValue()->matchesBSON(
+        BSON("x" << BSON_ARRAY(BSON("$ref"
+                                    << "coll"
+                                    << "$id" << oid << "foo" << 12345 << "bar" << 678)))));
 }
 
 // Incomplete DBRef - $ref missing.
@@ -402,18 +356,12 @@ TEST(MatchExpressionParserArrayTest, ElemMatchDBRef7) {
     OID oid = OID::gen();
     BSONObj match = BSON("$ref"
                          << "coll"
-                         << "$id"
-                         << oid
-                         << "foo"
-                         << 12345);
+                         << "$id" << oid << "foo" << 12345);
     BSONObj matchMissingRef = BSON("$id" << oid << "foo" << 12345);
     OID oidx = OID::gen();
     BSONObj notMatch = BSON("$ref"
                             << "coll"
-                            << "$id"
-                            << oidx
-                            << "foo"
-                            << 12345);
+                            << "$id" << oidx << "foo" << 12345);
 
     BSONObj query = BSON("x" << BSON("$elemMatch" << matchMissingRef));
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
@@ -425,14 +373,10 @@ TEST(MatchExpressionParserArrayTest, ElemMatchDBRef7) {
     ASSERT(result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(match))));
 
     // Document contains fields not referred to in $elemMatch query.
-    ASSERT(result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(BSON("$ref"
-                                                                      << "coll"
-                                                                      << "$id"
-                                                                      << oid
-                                                                      << "foo"
-                                                                      << 12345
-                                                                      << "bar"
-                                                                      << 678)))));
+    ASSERT(result.getValue()->matchesBSON(
+        BSON("x" << BSON_ARRAY(BSON("$ref"
+                                    << "coll"
+                                    << "$id" << oid << "foo" << 12345 << "bar" << 678)))));
 }
 
 // Incomplete DBRef - $db only.
@@ -440,24 +384,17 @@ TEST(MatchExpressionParserArrayTest, ElemMatchDBRef8) {
     OID oid = OID::gen();
     BSONObj match = BSON("$ref"
                          << "coll"
-                         << "$id"
-                         << oid
-                         << "$db"
+                         << "$id" << oid << "$db"
                          << "db"
-                         << "foo"
-                         << 12345);
+                         << "foo" << 12345);
     BSONObj matchDBOnly = BSON("$db"
                                << "db"
-                               << "foo"
-                               << 12345);
+                               << "foo" << 12345);
     BSONObj notMatch = BSON("$ref"
                             << "coll"
-                            << "$id"
-                            << oid
-                            << "$db"
+                            << "$id" << oid << "$db"
                             << "dbx"
-                            << "foo"
-                            << 12345);
+                            << "foo" << 12345);
 
     BSONObj query = BSON("x" << BSON("$elemMatch" << matchDBOnly));
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
@@ -469,16 +406,12 @@ TEST(MatchExpressionParserArrayTest, ElemMatchDBRef8) {
     ASSERT(result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(match))));
 
     // Document contains fields not referred to in $elemMatch query.
-    ASSERT(result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(BSON("$ref"
-                                                                      << "coll"
-                                                                      << "$id"
-                                                                      << oid
-                                                                      << "$db"
-                                                                      << "db"
-                                                                      << "foo"
-                                                                      << 12345
-                                                                      << "bar"
-                                                                      << 678)))));
+    ASSERT(result.getValue()->matchesBSON(
+        BSON("x" << BSON_ARRAY(BSON("$ref"
+                                    << "coll"
+                                    << "$id" << oid << "$db"
+                                    << "db"
+                                    << "foo" << 12345 << "bar" << 678)))));
 }
 
 TEST(MatchExpressionParserArrayTest, All1) {
@@ -833,8 +766,9 @@ TEST(MatchExpressionParserArrayTest, AllStringNullCollation) {
 TEST(MatchExpressionParserArrayTest, AllStringCollation) {
     BSONObj query = BSON("x" << BSON("$all" << BSON_ARRAY("string")));
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kAlwaysEqual);
-    expCtx->setCollator(&collator);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kAlwaysEqual);
+    expCtx->setCollator(std::move(collator));
     StatusWithMatchExpression result = MatchExpressionParser::parse(query, expCtx);
     ASSERT_TRUE(result.isOK());
     ASSERT_EQUALS(MatchExpression::AND, result.getValue()->matchType());
@@ -842,6 +776,6 @@ TEST(MatchExpressionParserArrayTest, AllStringCollation) {
     MatchExpression* child = result.getValue()->getChild(0);
     ASSERT_EQUALS(MatchExpression::EQ, child->matchType());
     EqualityMatchExpression* eqMatch = static_cast<EqualityMatchExpression*>(child);
-    ASSERT_TRUE(eqMatch->getCollator() == &collator);
+    ASSERT_TRUE(eqMatch->getCollator() == expCtx->getCollator());
 }
-}
+}  // namespace mongo

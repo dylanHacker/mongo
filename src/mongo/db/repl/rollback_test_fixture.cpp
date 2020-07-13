@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,12 +31,15 @@
 
 #include "mongo/db/repl/rollback_test_fixture.h"
 
+#include <memory>
 #include <string>
 
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/op_observer_noop.h"
+#include "mongo/db/op_observer_registry.h"
+#include "mongo/db/read_write_concern_defaults_cache_lookup_mock.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_consistency_markers_mock.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -43,12 +47,9 @@
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/replication_recovery.h"
 #include "mongo/db/repl/rs_rollback.h"
-#include "mongo/db/session_catalog.h"
-#include "mongo/logger/log_component.h"
-#include "mongo/logger/logger.h"
-
-#include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/storage/durable_catalog.h"
+#include "mongo/unittest/log_test.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
@@ -65,16 +66,35 @@ ReplSettings createReplSettings() {
     return settings;
 }
 
+class RollbackTestOpObserver : public OpObserverNoop {
+public:
+    repl::OpTime onDropCollection(OperationContext* opCtx,
+                                  const NamespaceString& collectionName,
+                                  OptionalCollectionUUID uuid,
+                                  std::uint64_t numRecords,
+                                  const CollectionDropType dropType) override {
+        // If the oplog is not disabled for this namespace, then we need to reserve an op time for
+        // the drop.
+        if (!repl::ReplicationCoordinator::get(opCtx)->isOplogDisabledFor(opCtx, collectionName)) {
+            OpObserver::Times::get(opCtx).reservedOpTimes.push_back(dropOpTime);
+        }
+        return {};
+    }
+
+    const repl::OpTime dropOpTime = {Timestamp(Seconds(100), 1U), 1LL};
+};
+
 }  // namespace
 
 void RollbackTest::setUp() {
-    _serviceContextMongoDTest.setUp();
+    ServiceContextMongoDTest::setUp();
+
     _storageInterface = new StorageInterfaceRollback();
-    auto serviceContext = _serviceContextMongoDTest.getServiceContext();
-    auto consistencyMarkers = stdx::make_unique<ReplicationConsistencyMarkersMock>();
+    auto serviceContext = getServiceContext();
+    auto consistencyMarkers = std::make_unique<ReplicationConsistencyMarkersMock>();
     auto recovery =
-        stdx::make_unique<ReplicationRecoveryImpl>(_storageInterface, consistencyMarkers.get());
-    _replicationProcess = stdx::make_unique<ReplicationProcess>(
+        std::make_unique<ReplicationRecoveryImpl>(_storageInterface, consistencyMarkers.get());
+    _replicationProcess = std::make_unique<ReplicationProcess>(
         _storageInterface, std::move(consistencyMarkers), std::move(recovery));
     _dropPendingCollectionReaper = new DropPendingCollectionReaper(_storageInterface);
     DropPendingCollectionReaper::set(
@@ -85,32 +105,15 @@ void RollbackTest::setUp() {
                                 std::unique_ptr<ReplicationCoordinator>(_coordinator));
     setOplogCollectionName(serviceContext);
 
-    _opCtx = cc().makeOperationContext();
+    _opCtx = makeOperationContext();
     _replicationProcess->getConsistencyMarkers()->clearAppliedThrough(_opCtx.get(), {});
     _replicationProcess->getConsistencyMarkers()->setMinValid(_opCtx.get(), OpTime{});
     _replicationProcess->initializeRollbackID(_opCtx.get()).transitional_ignore();
 
-    // Increase rollback log component verbosity for unit tests.
-    mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-        logger::LogComponent::kReplicationRollback, logger::LogSeverity::Debug(2));
-}
+    auto observerRegistry = checked_cast<OpObserverRegistry*>(serviceContext->getOpObserver());
+    observerRegistry->addObserver(std::make_unique<RollbackTestOpObserver>());
 
-void RollbackTest::tearDown() {
-    _coordinator = nullptr;
-    _opCtx.reset();
-
-    SessionCatalog::get(_serviceContextMongoDTest.getServiceContext())->reset_forTest();
-
-    // We cannot unset the global replication coordinator because ServiceContextMongoD::tearDown()
-    // calls dropAllDatabasesExceptLocal() which requires the replication coordinator to clear all
-    // snapshots.
-    _serviceContextMongoDTest.tearDown();
-
-    // ServiceContextMongoD::tearDown() does not destroy service context so it is okay
-    // to access the service context after tearDown().
-    auto serviceContext = _serviceContextMongoDTest.getServiceContext();
-    _replicationProcess.reset();
-    ReplicationCoordinator::set(serviceContext, {});
+    ReadWriteConcernDefaults::create(serviceContext, _lookupMock.getFetchDefaultsFn());
 }
 
 RollbackTest::ReplicationCoordinatorRollbackMock::ReplicationCoordinatorRollbackMock(
@@ -134,6 +137,11 @@ Status RollbackTest::ReplicationCoordinatorRollbackMock::setFollowerMode(
     return ReplicationCoordinatorMock::setFollowerMode(newState);
 }
 
+Status RollbackTest::ReplicationCoordinatorRollbackMock::setFollowerModeRollback(
+    OperationContext* opCtx) {
+    return setFollowerMode(MemberState::RS_ROLLBACK);
+}
+
 std::pair<BSONObj, RecordId> RollbackTest::makeCRUDOp(OpTypeEnum opType,
                                                       Timestamp ts,
                                                       UUID uuid,
@@ -145,7 +153,6 @@ std::pair<BSONObj, RecordId> RollbackTest::makeCRUDOp(OpTypeEnum opType,
 
     BSONObjBuilder bob;
     bob.append("ts", ts);
-    bob.append("h", 1LL);
     bob.append("op", OpType_serializer(opType));
     uuid.appendToBuilder(&bob, "ui");
     bob.append("ns", nss);
@@ -153,23 +160,50 @@ std::pair<BSONObj, RecordId> RollbackTest::makeCRUDOp(OpTypeEnum opType,
     if (o2) {
         bob.append("o2", *o2);
     }
+    bob.append("wall", Date_t());
 
     return std::make_pair(bob.obj(), RecordId(recordId));
 }
 
 
-std::pair<BSONObj, RecordId> RollbackTest::makeCommandOp(
-    Timestamp ts, OptionalCollectionUUID uuid, StringData nss, BSONObj cmdObj, int recordId) {
+std::pair<BSONObj, RecordId> RollbackTest::makeCommandOp(Timestamp ts,
+                                                         OptionalCollectionUUID uuid,
+                                                         StringData nss,
+                                                         BSONObj cmdObj,
+                                                         int recordId,
+                                                         boost::optional<BSONObj> o2) {
 
     BSONObjBuilder bob;
     bob.append("ts", ts);
-    bob.append("h", 1LL);
     bob.append("op", "c");
     if (uuid) {  // Not all ops have UUID fields.
         uuid.get().appendToBuilder(&bob, "ui");
     }
     bob.append("ns", nss);
     bob.append("o", cmdObj);
+    if (o2) {
+        bob.append("o2", *o2);
+    }
+    bob.append("wall", Date_t());
+
+    return std::make_pair(bob.obj(), RecordId(recordId));
+}
+
+std::pair<BSONObj, RecordId> RollbackTest::makeCommandOpForApplyOps(OptionalCollectionUUID uuid,
+                                                                    StringData nss,
+                                                                    BSONObj cmdObj,
+                                                                    int recordId,
+                                                                    boost::optional<BSONObj> o2) {
+    BSONObjBuilder bob;
+    bob.append("op", "c");
+    if (uuid) {  // Not all ops have UUID fields.
+        uuid.get().appendToBuilder(&bob, "ui");
+    }
+    bob.append("ns", nss);
+    bob.append("o", cmdObj);
+    if (o2) {
+        bob.append("o2", *o2);
+    }
 
     return std::make_pair(bob.obj(), RecordId(recordId));
 }
@@ -179,10 +213,11 @@ Collection* RollbackTest::_createCollection(OperationContext* opCtx,
                                             const CollectionOptions& options) {
     Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
     mongo::WriteUnitOfWork wuow(opCtx);
-    auto db = dbHolder().openDb(opCtx, nss.db());
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+    auto db = databaseHolder->openDb(opCtx, nss.db());
     ASSERT_TRUE(db);
-    db->dropCollection(opCtx, nss.ns()).transitional_ignore();
-    auto coll = db->createCollection(opCtx, nss.ns(), options);
+    db->dropCollection(opCtx, nss).transitional_ignore();
+    auto coll = db->createCollection(opCtx, nss, options);
     ASSERT_TRUE(coll);
     wuow.commit();
     return coll;
@@ -192,6 +227,23 @@ Collection* RollbackTest::_createCollection(OperationContext* opCtx,
                                             const std::string& nss,
                                             const CollectionOptions& options) {
     return _createCollection(opCtx, NamespaceString(nss), options);
+}
+
+void RollbackTest::_insertDocument(OperationContext* opCtx,
+                                   const NamespaceString& nss,
+                                   const BSONObj& doc) {
+
+    AutoGetCollection autoColl(opCtx, nss, MODE_X);
+    auto collection = autoColl.getCollection();
+    if (!collection) {
+        CollectionOptions options;
+        options.uuid = UUID::gen();
+        collection = _createCollection(opCtx, nss, options);
+    }
+    WriteUnitOfWork wuow(opCtx);
+    OpDebug* const opDebug = nullptr;
+    ASSERT_OK(collection->insertDocument(opCtx, InsertStatement(doc), opDebug));
+    wuow.commit();
 }
 
 Status RollbackTest::_insertOplogEntry(const BSONObj& doc) {
@@ -233,9 +285,6 @@ std::pair<BSONObj, NamespaceString> RollbackSourceMock::findOneByUUID(const std:
     return {BSONObj(), NamespaceString()};
 }
 
-void RollbackSourceMock::copyCollectionFromRemote(OperationContext* opCtx,
-                                                  const NamespaceString& nss) const {}
-
 StatusWith<BSONObj> RollbackSourceMock::getCollectionInfo(const NamespaceString& nss) const {
     return BSON("name" << nss.ns() << "options" << BSONObj());
 }
@@ -262,8 +311,8 @@ void RollbackResyncsCollectionOptionsTest::resyncCollectionOptionsTest(
                                 remoteCollOptionsObj,
                                 BSON("collMod"
                                      << "coll"
-                                     << "noPadding"
-                                     << false),
+                                     << "validationLevel"
+                                     << "strict"),
                                 "coll");
 }
 void RollbackResyncsCollectionOptionsTest::resyncCollectionOptionsTest(
@@ -277,8 +326,15 @@ void RollbackResyncsCollectionOptionsTest::resyncCollectionOptionsTest(
     auto nss = NamespaceString(dbName, collName);
 
     auto coll = _createCollection(_opCtx.get(), nss.toString(), localCollOptions);
-    auto commonOperation =
-        std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
+
+    auto commonOpUuid = unittest::assertGet(UUID::parse("f005ba11-cafe-bead-f00d-123456789abc"));
+    auto commonOpBson = BSON("ts" << Timestamp(1, 1) << "t" << 1LL << "op"
+                                  << "n"
+                                  << "o" << BSONObj() << "ns"
+                                  << "rollback_test.test"
+                                  << "wall" << Date_t() << "ui" << commonOpUuid);
+
+    auto commonOperation = std::make_pair(commonOpBson, RecordId(1));
 
     auto collectionModificationOperation =
         makeCommandOp(Timestamp(Seconds(2), 0), coll->uuid(), nss.toString(), collModCmd, 2);
@@ -291,13 +347,15 @@ void RollbackResyncsCollectionOptionsTest::resyncCollectionOptionsTest(
                            OplogInterfaceMock({collectionModificationOperation, commonOperation}),
                            rollbackSource,
                            {},
+                           {},
                            _coordinator,
                            _replicationProcess.get()));
 
     // Make sure the collection options are correct.
     AutoGetCollectionForReadCommand autoColl(_opCtx.get(), NamespaceString(nss.toString()));
     auto collAfterRollbackOptions =
-        autoColl.getCollection()->getCatalogEntry()->getCollectionOptions(_opCtx.get());
+        DurableCatalog::get(_opCtx.get())
+            ->getCollectionOptions(_opCtx.get(), autoColl.getCollection()->getCatalogId());
 
     BSONObjBuilder expectedOptionsBob;
     if (localCollOptions.uuid) {

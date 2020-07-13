@@ -3,9 +3,9 @@
 load('jstests/concurrency/fsm_libs/assert.js');
 load('jstests/concurrency/fsm_libs/cluster.js');       // for Cluster.isStandalone
 load('jstests/concurrency/fsm_libs/parse_config.js');  // for parseConfig
+load('jstests/libs/specific_secondary_reader_mongo.js');
 
 var workerThread = (function() {
-
     // workloads = list of workload filenames
     // args.tid = the thread identifier
     // args.data = map of workload -> 'this' parameter passed to the FSM state functions
@@ -19,19 +19,21 @@ var workerThread = (function() {
     // args.globalAssertLevel = the global assertion level to use
     // args.errorLatch = CountDownLatch instance that threads count down when they error
     // args.sessionOptions = the options to start a session with
-    // args.testData = TestData object
     // run = callback that takes a map of workloads to their associated $config
     function main(workloads, args, run) {
         var myDB;
         var configs = {};
-        var connectionString = 'mongodb://' + args.host + '/?appname=tid:' + args.tid;
+        var connectionString = 'mongodb://' + args.host + '/?appName=tid:' + args.tid;
+        if (typeof args.replSetName !== 'undefined') {
+            connectionString += '&replicaSet=' + args.replSetName;
+        }
 
         globalAssertLevel = args.globalAssertLevel;
 
         // The global 'TestData' object may still be undefined if the concurrency suite isn't being
         // run by resmoke.py (e.g. if it is being run via a parallel shell in the backup/restore
         // tests).
-        TestData = (args.testData !== undefined) ? args.testData : {};
+        TestData = (TestData !== undefined) ? TestData : {};
 
         try {
             if (typeof db !== 'undefined') {
@@ -41,14 +43,25 @@ var workerThread = (function() {
                 gc();
             }
 
+            let mongo;
+            if (TestData.pinningSecondary) {
+                mongo = new SpecificSecondaryReaderMongo(connectionString, args.secondaryHost);
+            } else {
+                mongo = new Mongo(connectionString);
+            }
+
+            // Retry operations that fail due to in-progress background operations. Load this early
+            // so that later overrides can be retried.
+            load('jstests/libs/override_methods/implicitly_retry_on_background_op_in_progress.js');
+
             if (typeof args.sessionOptions !== 'undefined') {
                 let initialClusterTime;
                 let initialOperationTime;
 
                 // JavaScript objects backed by C++ objects (e.g. BSON values from a command
-                // response) do not serialize correctly when passed through the ScopedThread
+                // response) do not serialize correctly when passed through the Thread
                 // constructor. To work around this behavior, we instead pass a stringified form
-                // of the JavaScript object through the ScopedThread constructor and use eval()
+                // of the JavaScript object through the Thread constructor and use eval()
                 // to rehydrate it.
                 if (typeof args.sessionOptions.initialClusterTime === 'string') {
                     initialClusterTime = eval('(' + args.sessionOptions.initialClusterTime + ')');
@@ -69,7 +82,19 @@ var workerThread = (function() {
                     delete args.sessionOptions.initialOperationTime;
                 }
 
-                const session = new Mongo(connectionString).startSession(args.sessionOptions);
+                const session = mongo.startSession(args.sessionOptions);
+                const readPreference = session.getOptions().getReadPreference();
+                if (readPreference && readPreference.mode === 'secondary') {
+                    // Unset the explicit read preference so set_read_preference_secondary.js can do
+                    // the right thing based on the DB.
+                    session.getOptions().setReadPreference(undefined);
+
+                    // We load() set_read_preference_secondary.js in order to avoid running
+                    // commands against the "admin" and "config" databases via mongos with
+                    // readPreference={mode: "secondary"} when there's only a single node in
+                    // the CSRS.
+                    load('jstests/libs/override_methods/set_read_preference_secondary.js');
+                }
 
                 if (typeof initialClusterTime !== 'undefined') {
                     session.advanceClusterTime(initialClusterTime);
@@ -81,7 +106,7 @@ var workerThread = (function() {
 
                 myDB = session.getDatabase(args.dbName);
             } else {
-                myDB = new Mongo(connectionString).getDB(args.dbName);
+                myDB = mongo.getDB(args.dbName);
             }
 
             {
@@ -117,7 +142,9 @@ var workerThread = (function() {
                     };
                     Object.assign(TestData, newOptions);
 
-                    load('jstests/libs/override_methods/auto_retry_on_network_error.js');
+                    assert(!TestData.hasOwnProperty('networkErrorAndTxnOverrideConfig'), TestData);
+                    TestData.networkErrorAndTxnOverrideConfig = {retryOnNetworkErrors: true};
+                    load('jstests/libs/override_methods/network_error_and_txn_override.js');
                 }
 
                 // Operations that run after a "dropDatabase" command has been issued may fail with
@@ -156,20 +183,10 @@ var workerThread = (function() {
                 // Object.extend() defines all properties added to the destination object as
                 // configurable, enumerable, and writable. To prevent workloads from changing
                 // the iterations and threadCount properties in their state functions, we redefine
-                // them here as non-configurable, non-enumerable, and non-writable.
+                // them here as non-configurable and non-writable.
                 Object.defineProperties(data, {
-                    'iterations': {
-                        configurable: false,
-                        enumerable: false,
-                        writable: false,
-                        value: data.iterations
-                    },
-                    'threadCount': {
-                        configurable: false,
-                        enumerable: false,
-                        writable: false,
-                        value: data.threadCount
-                    }
+                    'iterations': {configurable: false, writable: false, value: data.iterations},
+                    'threadCount': {configurable: false, writable: false, value: data.threadCount}
                 });
 
                 data.tid = args.tid;
@@ -182,6 +199,7 @@ var workerThread = (function() {
                     passConnectionCache: config.passConnectionCache,
                     startState: config.startState,
                     states: config.states,
+                    tid: args.tid,
                     transitions: config.transitions
                 };
             });
@@ -217,5 +235,4 @@ var workerThread = (function() {
     }
 
     return {main: main};
-
 })();

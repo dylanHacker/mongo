@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,16 +27,47 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/commands.h"
-#include "mongo/s/commands/cluster_commands_helpers.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
+#include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/s/grid.h"
 
 namespace mongo {
 namespace {
+
+struct StaleConfigRetryState {
+    std::set<ShardId> shardsWithSuccessResponses;
+    std::vector<AsyncRequestsSender::Response> shardSuccessResponses;
+};
+
+const OperationContext::Decoration<std::unique_ptr<StaleConfigRetryState>> staleConfigRetryState =
+    OperationContext::declareDecoration<std::unique_ptr<StaleConfigRetryState>>();
+
+StaleConfigRetryState createAndRetrieveStateFromStaleConfigRetry(OperationContext* opCtx) {
+    if (!staleConfigRetryState(opCtx)) {
+        staleConfigRetryState(opCtx) = std::make_unique<StaleConfigRetryState>();
+    }
+
+    return *staleConfigRetryState(opCtx);
+}
+
+void updateStateForStaleConfigRetry(OperationContext* opCtx,
+                                    const StaleConfigRetryState& retryState,
+                                    const RawResponsesResult& response) {
+    std::set<ShardId> okShardIds;
+    std::set_union(response.shardsWithSuccessResponses.begin(),
+                   response.shardsWithSuccessResponses.end(),
+                   retryState.shardsWithSuccessResponses.begin(),
+                   retryState.shardsWithSuccessResponses.end(),
+                   std::inserter(okShardIds, okShardIds.begin()));
+
+    staleConfigRetryState(opCtx)->shardsWithSuccessResponses = std::move(okShardIds);
+    staleConfigRetryState(opCtx)->shardSuccessResponses = std::move(response.successResponses);
+}
 
 class DropIndexesCmd : public ErrmsgCommandDeprecated {
 public:
@@ -67,26 +99,54 @@ public:
                    std::string& errmsg,
                    BSONObjBuilder& output) override {
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
-        LOG(1) << "dropIndexes: " << nss << " cmd:" << redact(cmdObj);
+        LOGV2_DEBUG(22751,
+                    1,
+                    "dropIndexes: {namespace} cmd: {command}",
+                    "CMD: dropIndexes",
+                    "namespace"_attr = nss,
+                    "command"_attr = redact(cmdObj));
 
-        // If the collection is sharded, we target all shards rather than just shards that own
-        // chunks for the collection, because some shard may have previously owned chunks but no
-        // longer does (and so, may have the index). However, we ignore NamespaceNotFound errors
-        // from individual shards, because some shards may have never owned chunks for the
-        // collection. We additionally ignore IndexNotFound errors, because the index may not have
-        // been built on a shard if the earlier createIndexes command coincided with the shard
-        // receiving its first chunk for the collection (see SERVER-31715).
-        auto shardResponses = scatterGatherOnlyVersionIfUnsharded(
-            opCtx,
-            nss,
-            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
-            ReadPreferenceSetting::get(opCtx),
-            Shard::RetryPolicy::kNotIdempotent);
-        return appendRawResponses(opCtx,
-                                  &errmsg,
-                                  &output,
-                                  std::move(shardResponses),
-                                  {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound});
+        // dropIndexes can be retried on a stale config error. If a previous attempt already
+        // successfully dropped the index on shards, those shards will return an IndexNotFound
+        // error when retried. We instead maintain the record of shards that have already
+        // successfully dropped the index, so that we don't try to contact those shards again
+        // across stale config retries.
+        const auto retryState = createAndRetrieveStateFromStaleConfigRetry(opCtx);
+
+        // If the collection is sharded, we target only the primary shard and the shards that own
+        // chunks for the collection.
+        auto routingInfo =
+            uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
+        auto shardResponses =
+            scatterGatherVersionedTargetByRoutingTableNoThrowOnStaleShardVersionErrors(
+                opCtx,
+                nss.db(),
+                nss,
+                routingInfo,
+                retryState.shardsWithSuccessResponses,
+                applyReadWriteConcern(
+                    opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
+                ReadPreferenceSetting::get(opCtx),
+                Shard::RetryPolicy::kNotIdempotent,
+                BSONObj() /* query */,
+                BSONObj() /* collation */);
+
+        // Append responses we've received from previous retries of this operation due to a stale
+        // config error.
+        shardResponses.insert(shardResponses.end(),
+                              retryState.shardSuccessResponses.begin(),
+                              retryState.shardSuccessResponses.end());
+
+        const auto aggregateResponse =
+            appendRawResponses(opCtx, &errmsg, &output, std::move(shardResponses));
+
+        // If we have a stale config error, update the success shards for the upcoming retry.
+        if (!aggregateResponse.responseOK && aggregateResponse.firstStaleConfigError) {
+            updateStateForStaleConfigRetry(opCtx, retryState, aggregateResponse);
+            uassertStatusOK(*aggregateResponse.firstStaleConfigError);
+        }
+
+        return aggregateResponse.responseOK;
     }
 
 } dropIndexesCmd;

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -36,23 +37,20 @@
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/ops/write_ops.h"
+#include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
-#include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
-#include "mongo/s/catalog/type_changelog.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_identity_loader.h"
-#include "mongo/s/config_server_test_fixture.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/stdx/chrono.h"
 #include "mongo/stdx/future.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -64,8 +62,6 @@ using executor::TaskExecutor;
 using std::string;
 using std::vector;
 using unittest::assertGet;
-
-const Seconds kFutureTimeout{5};
 
 BSONObj getReplSecondaryOkMetadata() {
     BSONObjBuilder o;
@@ -81,11 +77,7 @@ protected:
      * the client name.
      */
     void setUp() override {
-        ConfigServerTestFixture::setUp();
-
-        // Make sure clusterID is written to the config.version collection.
-        ASSERT_OK(ShardingCatalogManager::get(operationContext())
-                      ->initializeConfigDatabaseIfNeeded(operationContext()));
+        setUpAndInitializeConfigDb();
 
         auto clusterIdLoader = ClusterIdentityLoader::get(operationContext());
         ASSERT_OK(clusterIdLoader->loadClusterId(operationContext(),
@@ -100,7 +92,7 @@ protected:
         auto response = assertGet(shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
             operationContext(),
             ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-            repl::ReadConcernLevel::kMajorityReadConcern,
+            repl::ReadConcernLevel::kLocalReadConcern,
             ShardType::ConfigNS,
             BSON(ShardType::name() << shardName),
             BSONObj(),
@@ -130,21 +122,28 @@ TEST_F(RemoveShardTest, RemoveShardAnotherShardDraining) {
     shard2.setMaxSizeMB(100);
     shard2.setState(ShardType::ShardState::kShardAware);
 
-    ASSERT_OK(setupShards(std::vector<ShardType>{shard1, shard2}));
+    ShardType shard3;
+    shard3.setName("shard3");
+    shard3.setHost("host3:12345");
+    shard3.setMaxSizeMB(100);
+    shard3.setState(ShardType::ShardState::kShardAware);
 
-    auto result = assertGet(ShardingCatalogManager::get(operationContext())
-                                ->removeShard(operationContext(), shard1.getName()));
-    ASSERT_EQUALS(ShardDrainingStatus::STARTED, result);
+    setupShards(std::vector<ShardType>{shard1, shard2, shard3});
+
+    auto result = ShardingCatalogManager::get(operationContext())
+                      ->removeShard(operationContext(), shard1.getName());
+    ASSERT_EQUALS(RemoveShardProgress::STARTED, result.status);
+    ASSERT_EQUALS(false, result.remainingCounts.is_initialized());
     ASSERT_TRUE(isDraining(shard1.getName()));
 
-    ASSERT_EQUALS(ErrorCodes::ConflictingOperationInProgress,
-                  ShardingCatalogManager::get(operationContext())
-                      ->removeShard(operationContext(), shard2.getName()));
-    ASSERT_FALSE(isDraining(shard2.getName()));
+    auto result2 = ShardingCatalogManager::get(operationContext())
+                       ->removeShard(operationContext(), shard2.getName());
+    ASSERT_EQUALS(RemoveShardProgress::STARTED, result2.status);
+    ASSERT_EQUALS(false, result2.remainingCounts.is_initialized());
+    ASSERT_TRUE(isDraining(shard2.getName()));
 }
 
 TEST_F(RemoveShardTest, RemoveShardCantRemoveLastShard) {
-    string shardName = "shardToRemove";
 
     ShardType shard1;
     shard1.setName("shard1");
@@ -152,11 +151,12 @@ TEST_F(RemoveShardTest, RemoveShardCantRemoveLastShard) {
     shard1.setMaxSizeMB(100);
     shard1.setState(ShardType::ShardState::kShardAware);
 
-    ASSERT_OK(setupShards(std::vector<ShardType>{shard1}));
+    setupShards(std::vector<ShardType>{shard1});
 
-    ASSERT_EQUALS(ErrorCodes::IllegalOperation,
-                  ShardingCatalogManager::get(operationContext())
-                      ->removeShard(operationContext(), shard1.getName()));
+    ASSERT_THROWS_CODE(ShardingCatalogManager::get(operationContext())
+                           ->removeShard(operationContext(), shard1.getName()),
+                       DBException,
+                       ErrorCodes::IllegalOperation);
     ASSERT_FALSE(isDraining(shard1.getName()));
 }
 
@@ -173,11 +173,12 @@ TEST_F(RemoveShardTest, RemoveShardStartDraining) {
     shard2.setMaxSizeMB(100);
     shard2.setState(ShardType::ShardState::kShardAware);
 
-    ASSERT_OK(setupShards(std::vector<ShardType>{shard1, shard2}));
+    setupShards(std::vector<ShardType>{shard1, shard2});
 
-    auto result = assertGet(ShardingCatalogManager::get(operationContext())
-                                ->removeShard(operationContext(), shard1.getName()));
-    ASSERT_EQUALS(ShardDrainingStatus::STARTED, result);
+    auto result = ShardingCatalogManager::get(operationContext())
+                      ->removeShard(operationContext(), shard1.getName());
+    ASSERT_EQUALS(RemoveShardProgress::STARTED, result.status);
+    ASSERT_EQUALS(false, result.remainingCounts.is_initialized());
     ASSERT_TRUE(isDraining(shard1.getName()));
 }
 
@@ -209,18 +210,25 @@ TEST_F(RemoveShardTest, RemoveShardStillDrainingChunksRemaining) {
                      ChunkVersion(1, 3, epoch),
                      shard1.getName());
 
-    ASSERT_OK(setupShards(std::vector<ShardType>{shard1, shard2}));
-    setupDatabase("testDB", shard1.getName(), true);
-    ASSERT_OK(setupChunks(std::vector<ChunkType>{chunk1, chunk2, chunk3}));
+    chunk3.setJumbo(true);
 
-    auto startedResult = assertGet(ShardingCatalogManager::get(operationContext())
-                                       ->removeShard(operationContext(), shard1.getName()));
-    ASSERT_EQUALS(ShardDrainingStatus::STARTED, startedResult);
+    setupShards(std::vector<ShardType>{shard1, shard2});
+    setupDatabase("testDB", shard1.getName(), true);
+    setupChunks(std::vector<ChunkType>{chunk1, chunk2, chunk3});
+
+    auto startedResult = ShardingCatalogManager::get(operationContext())
+                             ->removeShard(operationContext(), shard1.getName());
+    ASSERT_EQUALS(RemoveShardProgress::STARTED, startedResult.status);
+    ASSERT_EQUALS(false, startedResult.remainingCounts.is_initialized());
     ASSERT_TRUE(isDraining(shard1.getName()));
 
-    auto ongoingResult = assertGet(ShardingCatalogManager::get(operationContext())
-                                       ->removeShard(operationContext(), shard1.getName()));
-    ASSERT_EQUALS(ShardDrainingStatus::ONGOING, ongoingResult);
+    auto ongoingResult = ShardingCatalogManager::get(operationContext())
+                             ->removeShard(operationContext(), shard1.getName());
+    ASSERT_EQUALS(RemoveShardProgress::ONGOING, ongoingResult.status);
+    ASSERT_EQUALS(true, ongoingResult.remainingCounts.is_initialized());
+    ASSERT_EQUALS(3, ongoingResult.remainingCounts->totalChunks);
+    ASSERT_EQUALS(1, ongoingResult.remainingCounts->jumboChunks);
+    ASSERT_EQUALS(1, ongoingResult.remainingCounts->databases);
     ASSERT_TRUE(isDraining(shard1.getName()));
 }
 
@@ -238,17 +246,22 @@ TEST_F(RemoveShardTest, RemoveShardStillDrainingDatabasesRemaining) {
     shard2.setMaxSizeMB(100);
     shard2.setState(ShardType::ShardState::kShardAware);
 
-    ASSERT_OK(setupShards(std::vector<ShardType>{shard1, shard2}));
+    setupShards(std::vector<ShardType>{shard1, shard2});
     setupDatabase("testDB", shard1.getName(), false);
 
-    auto startedResult = assertGet(ShardingCatalogManager::get(operationContext())
-                                       ->removeShard(operationContext(), shard1.getName()));
-    ASSERT_EQUALS(ShardDrainingStatus::STARTED, startedResult);
+    auto startedResult = ShardingCatalogManager::get(operationContext())
+                             ->removeShard(operationContext(), shard1.getName());
+    ASSERT_EQUALS(RemoveShardProgress::STARTED, startedResult.status);
+    ASSERT_EQUALS(false, startedResult.remainingCounts.is_initialized());
     ASSERT_TRUE(isDraining(shard1.getName()));
 
-    auto ongoingResult = assertGet(ShardingCatalogManager::get(operationContext())
-                                       ->removeShard(operationContext(), shard1.getName()));
-    ASSERT_EQUALS(ShardDrainingStatus::ONGOING, ongoingResult);
+    auto ongoingResult = ShardingCatalogManager::get(operationContext())
+                             ->removeShard(operationContext(), shard1.getName());
+    ASSERT_EQUALS(RemoveShardProgress::ONGOING, ongoingResult.status);
+    ASSERT_EQUALS(true, ongoingResult.remainingCounts.is_initialized());
+    ASSERT_EQUALS(0, ongoingResult.remainingCounts->totalChunks);
+    ASSERT_EQUALS(0, ongoingResult.remainingCounts->jumboChunks);
+    ASSERT_EQUALS(1, ongoingResult.remainingCounts->databases);
     ASSERT_TRUE(isDraining(shard1.getName()));
 }
 
@@ -282,18 +295,23 @@ TEST_F(RemoveShardTest, RemoveShardCompletion) {
 
     std::vector<ChunkType> chunks{chunk1, chunk2, chunk3};
 
-    ASSERT_OK(setupShards(std::vector<ShardType>{shard1, shard2}));
+    setupShards(std::vector<ShardType>{shard1, shard2});
     setupDatabase("testDB", shard2.getName(), false);
-    ASSERT_OK(setupChunks(std::vector<ChunkType>{chunk1, chunk2, chunk3}));
+    setupChunks(std::vector<ChunkType>{chunk1, chunk2, chunk3});
 
-    auto startedResult = assertGet(ShardingCatalogManager::get(operationContext())
-                                       ->removeShard(operationContext(), shard1.getName()));
-    ASSERT_EQUALS(ShardDrainingStatus::STARTED, startedResult);
+    auto startedResult = ShardingCatalogManager::get(operationContext())
+                             ->removeShard(operationContext(), shard1.getName());
+    ASSERT_EQUALS(RemoveShardProgress::STARTED, startedResult.status);
+    ASSERT_EQUALS(false, startedResult.remainingCounts.is_initialized());
     ASSERT_TRUE(isDraining(shard1.getName()));
 
-    auto ongoingResult = assertGet(ShardingCatalogManager::get(operationContext())
-                                       ->removeShard(operationContext(), shard1.getName()));
-    ASSERT_EQUALS(ShardDrainingStatus::ONGOING, ongoingResult);
+    auto ongoingResult = ShardingCatalogManager::get(operationContext())
+                             ->removeShard(operationContext(), shard1.getName());
+    ASSERT_EQUALS(RemoveShardProgress::ONGOING, ongoingResult.status);
+    ASSERT_EQUALS(true, ongoingResult.remainingCounts.is_initialized());
+    ASSERT_EQUALS(3, ongoingResult.remainingCounts->totalChunks);
+    ASSERT_EQUALS(0, ongoingResult.remainingCounts->jumboChunks);
+    ASSERT_EQUALS(0, ongoingResult.remainingCounts->databases);
     ASSERT_TRUE(isDraining(shard1.getName()));
 
     // Mock the operation during which the chunks are moved to the other shard.
@@ -305,15 +323,16 @@ TEST_F(RemoveShardTest, RemoveShardCompletion) {
             operationContext(), chunkNS, chunk.toConfigBSON(), updatedChunk.toConfigBSON(), false));
     }
 
-    auto completedResult = assertGet(ShardingCatalogManager::get(operationContext())
-                                         ->removeShard(operationContext(), shard1.getName()));
-    ASSERT_EQUALS(ShardDrainingStatus::COMPLETED, completedResult);
+    auto completedResult = ShardingCatalogManager::get(operationContext())
+                               ->removeShard(operationContext(), shard1.getName());
+    ASSERT_EQUALS(RemoveShardProgress::COMPLETED, completedResult.status);
+    ASSERT_EQUALS(false, startedResult.remainingCounts.is_initialized());
 
     // Now make sure that the shard no longer exists on config.
     auto response = assertGet(shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
         operationContext(),
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-        repl::ReadConcernLevel::kMajorityReadConcern,
+        repl::ReadConcernLevel::kLocalReadConcern,
         ShardType::ConfigNS,
         BSON(ShardType::name() << shard1.getName()),
         BSONObj(),

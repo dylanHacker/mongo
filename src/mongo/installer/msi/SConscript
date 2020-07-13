@@ -3,7 +3,15 @@
 import os
 
 Import("env")
+Import("get_option")
 Import("has_option")
+
+if not env.TargetOSIs('windows'):
+    Return()
+
+import re
+import subprocess
+import winreg
 
 env = env.Clone()
 
@@ -23,10 +31,10 @@ env['WIXCANDLE'] = r'$WIXPATH\candle.exe'
 env['WIXLIGHT'] = r'$WIXPATH\light.exe'
 env['WIXUIEXT'] = r'$WIXPATH\WixUIExtension.dll'
 env['WIXUTILEXT'] = r'$WIXPATH\WixUtilExtension.dll'
-env['MERGEMODULESBASEPATH'] = os.environ.get('MERGEMODULESBASEPATH')
-if env['MERGEMODULESBASEPATH'] == None and os.environ.get('ProgramFiles(x86)') != None:
-    env['MERGEMODULESBASEPATH'] = (os.environ.get('ProgramFiles(x86)') +
-            r"\Common Files\Merge Modules")
+
+if not 'VCREDISTMERGEMODULEPATH' in env['MSVS']:
+    print("SCons tool setup did not configure the path to the vcredist merge modules, disabling MSI installer")
+    Return()
 
 sourcesList = [ "BinaryFragment.wxs",
             "FeatureFragment.wxs",
@@ -36,10 +44,7 @@ sourcesList = [ "BinaryFragment.wxs",
 
 # Need to do this in order to get scons to translate path separators into native format
 buildDir = env.Dir("$BUILD_DIR").path
-if has_option("use-new-tools"):
-	toolBuildDir = "src\mongo-tools"
-else:
-	toolBuildDir = buildDir + r'\mongo'
+toolBuildDir = buildDir + r'\mongo'
 
 enterprisebase = 'src\mongo\db\modules\enterprise'
 enterpriseToolBuildDir = buildDir + r'\mongo\db\modules\enterprise'
@@ -57,15 +62,15 @@ msi_platform = 'x64'
 # Enterprise
 if 'enterprise' in env['MONGO_MODULES']:
   msi_edition = 'Enterprise'
-  upgrade_code = '4E54E7FE-4C19-4291-B21B-6C2742199A6B'
+  upgrade_code = 'a6b1bdf1-df59-4951-b06f-9c725f0e4718'
 # Community
 else:
-  if has_option('ssl'):
+  if get_option('ssl') == 'on':
     msi_edition = 'SSL'
-    upgrade_code = '74770C0B-53B0-4F8C-A453-B92CF7448FCD'
+    upgrade_code = '3849e763-ce67-472c-8f51-99584207c5f9'
   else:
     msi_edition = 'Standard'
-    upgrade_code = '94AF64D6-0A84-4238-ACB7-E112E13EE0B4'
+    upgrade_code = 'f0a6c3e0-eb06-4e1f-8f8e-25dce563e5b8'
 
 sourcesList.append("Installer_64.wxs")
 
@@ -89,7 +94,7 @@ major_version = "%s.%s" % (mv[0], mv[1])
 #    It allows upgrade from 3.2.0 to 3.2.1 in place instead of side-by-side.
 # 3. Update the check for the next major release below so we bump the GUIDs in the future.
 #
-if float(major_version) > 3.8:
+if float(major_version) > 4.6:
     # If you are troubleshooting this error, see the comment above
     env.FatalError("The upgrade codes are out of date for this release. Please \n" +
     "replace the existing GUIDs listed in this file with new GUIDs so " +
@@ -114,9 +119,9 @@ env.Command(objects,
             ' -dLicenseSource=distsrc'
             r' -dEnterpriseBase=' + enterprisebase + '\\'
             ' -dBinarySource=' + buildDir + r'\mongo'
-            ' -dToolBinarySource=' + toolBuildDir +
             ' -dEnterpriseToolBinarySource=' + enterpriseToolBuildDir +
-            ' -dMergeModulesBasePath="$MERGEMODULESBASEPATH"'
+            ' -dMergeModulesBasePath=' + "\"${MSVS['VCREDISTMERGEMODULEPATH']}\"" +
+            ' -dMergeModuleFileCRT=' + env.GetMergeModuleNameForFeature('CRT') +
             ' -dEdition=' + msi_edition +
             ' -d"ProductId=*\"'
             ' -dUpgradeCode=' + upgrade_code +
@@ -127,7 +132,7 @@ env.Command(objects,
             ' -dFlavor=' + msi_flavor +
             r' -dProjectDir=buildscripts\packaging\msi\\'
             ' -dProjectName=MongoDB'
-            ' -dCompassDir=src\mongo\installer\compass'
+            ' -dCompassDir=' + buildDir + r'\mongo\installer\compass'
             ' -dTargetDir=' + buildDir + r'\msi'
             ' -dTargetExt=.msi'
             ' -dTargetFileName=${SERVER_ARCHIVE}'
@@ -159,14 +164,14 @@ pre_msi_cmd = env.Command(pre_msi,
             ' -ext "$WIXUIEXT"'
             ' -ext "$WIXUTILEXT"'
             ' ${SOURCES}')
+env.NoCache(pre_msi_cmd)
 
 # Generated Dependencies
 env.Depends(pre_msi_cmd, '$BUILD_DIR/mongo/mongo.exe')
 env.Depends(pre_msi_cmd, '$BUILD_DIR/mongo/mongod.exe')
 env.Depends(pre_msi_cmd, '$BUILD_DIR/mongo/mongos.exe')
-env.Depends(pre_msi_cmd, '$BUILD_DIR/mongo/mongoperf.exe')
 env.Depends(pre_msi_cmd, '$BUILD_DIR/mongo/installer/msi/ca/mongoca.dll')
-env.Depends(pre_msi_cmd, '#src/mongo/installer/compass/Install-Compass.ps1')
+env.Depends(pre_msi_cmd, '$BUILD_DIR/mongo/installer/compass/Install-Compass.ps1')
 
 # Source Dependencies
 env.Depends(pre_msi_cmd, '#buildscripts/packaging/msi/mongod.yaml')
@@ -174,11 +179,13 @@ env.Depends(pre_msi_cmd, '#buildscripts/packaging/msi/mongod.yaml')
 if 'enterprise' in env['MONGO_MODULES']:
     env.Depends(pre_msi_cmd, "#" + enterpriseToolBuildDir + "/mongodecrypt.exe")
     env.Depends(pre_msi_cmd, "#" + enterpriseToolBuildDir + "/mongoldap.exe")
+    env.Depends(pre_msi_cmd, "#" + enterpriseToolBuildDir + "/mongocryptd.exe")
 
 msi = "$BUILD_DIR/msi/${SERVER_DIST_BASENAME}.msi"
 env.Command(msi,
             pre_msi,
             r'$PYTHON buildscripts\msitrim.py ${SOURCES} ${TARGET}')
 env.AlwaysBuild(msi)
+env.NoCache(msi)
 
 env.Alias( "msi" , msi )

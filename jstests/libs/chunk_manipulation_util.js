@@ -19,11 +19,19 @@ load('./jstests/libs/test_background_ops.js');
 // Returns a join function; call it to wait for moveChunk to complete.
 //
 
-function moveChunkParallel(staticMongod, mongosURL, findCriteria, bounds, ns, toShardId) {
+function moveChunkParallel(staticMongod,
+                           mongosURL,
+                           findCriteria,
+                           bounds,
+                           ns,
+                           toShardId,
+                           expectSuccess = true,
+                           forceJumbo = false) {
     assert((findCriteria || bounds) && !(findCriteria && bounds),
            'Specify either findCriteria or bounds, but not both.');
 
-    function runMoveChunk(mongosURL, findCriteria, bounds, ns, toShardId) {
+    function runMoveChunk(
+        mongosURL, findCriteria, bounds, ns, toShardId, expectSuccess, forceJumbo) {
         assert(mongosURL && ns && toShardId, 'Missing arguments.');
         assert((findCriteria || bounds) && !(findCriteria && bounds),
                'Specify either findCriteria or bounds, but not both.');
@@ -38,16 +46,23 @@ function moveChunkParallel(staticMongod, mongosURL, findCriteria, bounds, ns, to
 
         cmd.to = toShardId;
         cmd._waitForDelete = true;
+        cmd.forceJumbo = forceJumbo;
 
         printjson(cmd);
         var result = admin.runCommand(cmd);
         printjson(result);
-        assert(result.ok);
+        if (expectSuccess) {
+            assert(result.ok);
+        } else {
+            assert.commandFailed(result);
+        }
     }
 
     // Return the join function.
     return startParallelOps(
-        staticMongod, runMoveChunk, [mongosURL, findCriteria, bounds, ns, toShardId]);
+        staticMongod,
+        runMoveChunk,
+        [mongosURL, findCriteria, bounds, ns, toShardId, expectSuccess, forceJumbo]);
 }
 
 // moveChunk starts at step 0 and proceeds to 1 (it has *finished* parsing
@@ -112,7 +127,7 @@ function configureMoveChunkFailPoint(shardConnection, stepNumber, mode) {
 function waitForMoveChunkStep(shardConnection, stepNumber) {
     var searchString = 'step ' + stepNumber, admin = shardConnection.getDB('admin');
 
-    assert.between(migrateStepNames.copiedIndexes,
+    assert.between(migrateStepNames.deletedPriorDataInRange,
                    stepNumber,
                    migrateStepNames.done,
                    "incorrect stepNumber",
@@ -129,8 +144,9 @@ function waitForMoveChunkStep(shardConnection, stepNumber) {
             let op = in_progress.next();
             inProgressStr += tojson(op);
 
-            if (op.query && op.query.moveChunk ||  // compatibility with v3.4, remove after v3.6
-                op.command && op.command.moveChunk) {
+            // TODO (SERVER-45993): Remove the 4.2 and prior branch once 4.4 becomes last-stable.
+            if ((op.desc && op.desc === "MoveChunk") ||
+                (op.command && op.command.moveChunk /* required for v4.2 and prior */)) {
                 // Note: moveChunk in join mode will not have the "step" message. So keep on
                 // looking if searchString is not found.
                 if (op.msg && op.msg.startsWith(searchString)) {
@@ -144,8 +160,8 @@ function waitForMoveChunkStep(shardConnection, stepNumber) {
 }
 
 var migrateStepNames = {
-    copiedIndexes: 1,
-    deletedPriorDataInRange: 2,
+    deletedPriorDataInRange: 1,
+    copiedIndexes: 2,
     cloned: 3,
     catchup: 4,  // About to enter steady state.
     steady: 5,
@@ -177,7 +193,7 @@ function proceedToMigrateStep(shardConnection, stepNumber) {
 }
 
 function configureMigrateFailPoint(shardConnection, stepNumber, mode) {
-    assert.between(migrateStepNames.copiedIndexes,
+    assert.between(migrateStepNames.deletedPriorDataInRange,
                    stepNumber,
                    migrateStepNames.done,
                    "incorrect stepNumber",
@@ -194,7 +210,7 @@ function configureMigrateFailPoint(shardConnection, stepNumber, mode) {
 function waitForMigrateStep(shardConnection, stepNumber) {
     var searchString = 'step ' + stepNumber, admin = shardConnection.getDB('admin');
 
-    assert.between(migrateStepNames.copiedIndexes,
+    assert.between(migrateStepNames.deletedPriorDataInRange,
                    stepNumber,
                    migrateStepNames.done,
                    "incorrect stepNumber",
@@ -219,4 +235,56 @@ function waitForMigrateStep(shardConnection, stepNumber) {
 
         return false;
     }, msg);
+}
+
+//
+// Run the given function in the transferMods phase.
+//
+function runCommandDuringTransferMods(
+    mongos, staticMongod, ns, bounds, fromShard, toShard, cmdFunc) {
+    // Turn on the fail point and wait for moveChunk to hit the fail point.
+    pauseMoveChunkAtStep(fromShard, moveChunkStepNames.startedMoveChunk);
+    let joinMoveChunk =
+        moveChunkParallel(staticMongod, mongos.host, null, bounds, ns, toShard.shardName);
+    waitForMoveChunkStep(fromShard, moveChunkStepNames.startedMoveChunk);
+
+    // Run the commands.
+    cmdFunc();
+
+    // Turn off the fail point and wait for moveChunk to complete.
+    unpauseMoveChunkAtStep(fromShard, moveChunkStepNames.startedMoveChunk);
+    joinMoveChunk();
+}
+
+function killRunningMoveChunk(admin) {
+    let inProgressOps = admin.aggregate([{$currentOp: {'allUsers': true}}]);
+    var abortedMigration = false;
+    let inProgressStr = '';
+    let opIdsToKill = {};
+    while (inProgressOps.hasNext()) {
+        let op = inProgressOps.next();
+        inProgressStr += tojson(op);
+
+        // For 4.4 binaries and later.
+        if (op.desc && op.desc === "MoveChunk") {
+            opIdsToKill["MoveChunk"] = op.opid;
+        }
+        // TODO (SERVER-45993): Remove this branch once 4.4 becomes last-stable.
+        // For 4.2 binaries and prior.
+        if (op.command && op.command.moveChunk) {
+            opIdsToKill["moveChunkCommand"] = op.opid;
+        }
+    }
+
+    if (opIdsToKill.MoveChunk) {
+        admin.killOp(opIdsToKill.MoveChunk);
+        abortedMigration = true;
+    } else if (opIdsToKill.moveChunkCommand) {
+        // TODO (SERVER-45993): Remove this branch once 4.4 becomes last-stable.
+        admin.killOp(opIdsToKill.moveChunkCommand);
+        abortedMigration = true;
+    }
+
+    assert.eq(
+        true, abortedMigration, "Failed to abort migration, current running ops: " + inProgressStr);
 }

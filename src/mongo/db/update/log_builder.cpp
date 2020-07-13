@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -27,29 +28,20 @@
  */
 
 #include "mongo/db/update/log_builder.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 using mutablebson::Element;
-namespace str = mongoutils::str;
 
 namespace {
 const char kSet[] = "$set";
 const char kUnset[] = "$unset";
 }  // namespace
 
-constexpr StringData LogBuilder::kUpdateSemanticsFieldName;
-
 inline Status LogBuilder::addToSection(Element newElt, Element* section, const char* sectionName) {
     // If we don't already have this section, try to create it now.
     if (!section->ok()) {
-        // If we already have object replacement data, we can't also have section entries.
-        if (hasObjectReplacement())
-            return Status(ErrorCodes::IllegalOperation,
-                          "LogBuilder: Invalid attempt to add a $set/$unset entry"
-                          "to a log with an existing object replacement");
-
         mutablebson::Document& doc = _logRoot.getDocument();
 
         // We should not already have an element with the section name under the root.
@@ -66,16 +58,11 @@ inline Status LogBuilder::addToSection(Element newElt, Element* section, const c
         if (!result.isOK())
             return result;
         *section = newElement;
-
-        // Invalidate attempts to add an object replacement, now that we have a named
-        // section under the root.
-        _objectReplacementAccumulator = doc.end();
     }
 
     // Whatever transpired, we should now have an ok accumulator for the section, and not
     // have a replacement accumulator.
     dassert(section->ok());
-    dassert(!_objectReplacementAccumulator.ok());
 
     // Enqueue the provided element to the section and propagate the result.
     return section->pushBack(newElt);
@@ -89,11 +76,9 @@ Status LogBuilder::addToSetsWithNewFieldName(StringData name, const mutablebson:
     mutablebson::Element elemToSet = _logRoot.getDocument().makeElementWithNewFieldName(name, val);
     if (!elemToSet.ok())
         return Status(ErrorCodes::InternalError,
-                      str::stream() << "Could not create new '" << name
-                                    << "' element from existing element '"
-                                    << val.getFieldName()
-                                    << "' of type "
-                                    << typeName(val.getType()));
+                      str::stream()
+                          << "Could not create new '" << name << "' element from existing element '"
+                          << val.getFieldName() << "' of type " << typeName(val.getType()));
 
     return addToSets(elemToSet);
 }
@@ -102,11 +87,9 @@ Status LogBuilder::addToSetsWithNewFieldName(StringData name, const BSONElement&
     mutablebson::Element elemToSet = _logRoot.getDocument().makeElementWithNewFieldName(name, val);
     if (!elemToSet.ok())
         return Status(ErrorCodes::InternalError,
-                      str::stream() << "Could not create new '" << name
-                                    << "' element from existing element '"
-                                    << val.fieldName()
-                                    << "' of type "
-                                    << typeName(val.type()));
+                      str::stream()
+                          << "Could not create new '" << name << "' element from existing element '"
+                          << val.fieldName() << "' of type " << typeName(val.type()));
 
     return addToSets(elemToSet);
 }
@@ -130,60 +113,17 @@ Status LogBuilder::addToUnsets(StringData path) {
     return addToSection(logElement, &_unsetAccumulator, kUnset);
 }
 
-Status LogBuilder::setUpdateSemantics(UpdateSemantics updateSemantics) {
-    if (hasObjectReplacement()) {
-        return Status(ErrorCodes::IllegalOperation,
-                      "LogBuilder: Invalid attempt to add a $v entry to a log with an existing "
-                      "object replacement");
-    }
-
-    if (_updateSemantics.ok()) {
+Status LogBuilder::setVersion(UpdateOplogEntryVersion oplogVersion) {
+    if (_version.ok()) {
         return Status(ErrorCodes::IllegalOperation, "LogBuilder: Invalid attempt to set $v twice.");
     }
 
     mutablebson::Document& doc = _logRoot.getDocument();
-    _updateSemantics =
-        doc.makeElementInt(kUpdateSemanticsFieldName, static_cast<int>(updateSemantics));
+    _version =
+        doc.makeElementInt(kUpdateOplogEntryVersionFieldName, static_cast<int>(oplogVersion));
 
-    dassert(_logRoot[kUpdateSemanticsFieldName] == doc.end());
+    dassert(_logRoot[kUpdateOplogEntryVersionFieldName] == doc.end());
 
-    return _logRoot.pushFront(_updateSemantics);
+    return _logRoot.pushFront(_version);
 }
-
-Status LogBuilder::getReplacementObject(Element* outElt) {
-    // If the replacement accumulator is not ok, we must have started a $set or $unset
-    // already, so an object replacement is not permitted.
-    if (!_objectReplacementAccumulator.ok()) {
-        dassert(_setAccumulator.ok() || _unsetAccumulator.ok());
-        return Status(ErrorCodes::IllegalOperation,
-                      "LogBuilder: Invalid attempt to obtain the object replacement slot "
-                      "for a log containing $set or $unset entries");
-    }
-
-    if (hasObjectReplacement())
-        return Status(ErrorCodes::IllegalOperation,
-                      "LogBuilder: Invalid attempt to acquire the replacement object "
-                      "in a log with existing object replacement data");
-
-    if (_updateSemantics.ok()) {
-        return Status(ErrorCodes::IllegalOperation,
-                      "LogBuilder: Invalid attempt to acquire the replacement object in a log with "
-                      "an update semantics value");
-    }
-
-    // OK to enqueue object replacement items.
-    *outElt = _objectReplacementAccumulator;
-    return Status::OK();
-}
-
-inline bool LogBuilder::hasObjectReplacement() const {
-    if (!_objectReplacementAccumulator.ok())
-        return false;
-
-    dassert(!_setAccumulator.ok());
-    dassert(!_unsetAccumulator.ok());
-
-    return _objectReplacementAccumulator.hasChildren();
-}
-
 }  // namespace mongo

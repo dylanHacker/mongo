@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,25 +33,23 @@
 
 #include "mongo/db/commands.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/commands/cluster_commands_helpers.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 
 namespace mongo {
 namespace {
 
-void aggregateResults(const std::vector<AsyncRequestsSender::Response>& responses,
+void aggregateResults(int scale,
+                      const std::vector<AsyncRequestsSender::Response>& responses,
                       BSONObjBuilder& output) {
     long long objects = 0;
     long long unscaledDataSize = 0;
     long long dataSize = 0;
     long long storageSize = 0;
-    long long numExtents = 0;
+    long long totalSize = 0;
     long long indexes = 0;
     long long indexSize = 0;
     long long fileSize = 0;
-
-    long long freeListNum = 0;
-    long long freeListSize = 0;
 
     for (const auto& response : responses) {
         invariant(response.swResponse.getStatus().isOK());
@@ -60,18 +59,12 @@ void aggregateResults(const std::vector<AsyncRequestsSender::Response>& response
         unscaledDataSize += b["avgObjSize"].numberLong() * b["objects"].numberLong();
         dataSize += b["dataSize"].numberLong();
         storageSize += b["storageSize"].numberLong();
-        numExtents += b["numExtents"].numberLong();
+        totalSize += b["totalSize"].numberLong();
         indexes += b["indexes"].numberLong();
         indexSize += b["indexSize"].numberLong();
         fileSize += b["fileSize"].numberLong();
-
-        if (b["extentFreeList"].isABSONObj()) {
-            freeListNum += b["extentFreeList"].Obj()["num"].numberLong();
-            freeListSize += b["extentFreeList"].Obj()["totalSize"].numberLong();
-        }
     }
 
-    // TODO SERVER-26110: Add aggregated 'collections' and 'views' metrics.
     output.appendNumber("objects", objects);
 
     // avgObjSize on mongod is not scaled based on the argument to db.stats(), so we use
@@ -79,17 +72,11 @@ void aggregateResults(const std::vector<AsyncRequestsSender::Response>& response
     output.append("avgObjSize", objects == 0 ? 0 : double(unscaledDataSize) / double(objects));
     output.appendNumber("dataSize", dataSize);
     output.appendNumber("storageSize", storageSize);
-    output.appendNumber("numExtents", numExtents);
+    output.appendNumber("totalSize", totalSize);
     output.appendNumber("indexes", indexes);
     output.appendNumber("indexSize", indexSize);
+    output.appendNumber("scaleFactor", scale);
     output.appendNumber("fileSize", fileSize);
-
-    {
-        BSONObjBuilder extentFreeList(output.subobjStart("extentFreeList"));
-        extentFreeList.appendNumber("num", freeListNum);
-        extentFreeList.appendNumber("totalSize", freeListSize);
-        extentFreeList.done();
-    }
 }
 
 class DBStatsCmd : public ErrmsgCommandDeprecated {
@@ -98,6 +85,10 @@ public:
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
+    }
+
+    bool maintenanceOk() const override {
+        return false;
     }
 
     bool adminOnly() const override {
@@ -121,17 +112,30 @@ public:
                    const BSONObj& cmdObj,
                    std::string& errmsg,
                    BSONObjBuilder& output) override {
-        auto shardResponses = scatterGatherUnversionedTargetAllShards(
-            opCtx,
-            dbName,
-            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
-            ReadPreferenceSetting::get(opCtx),
-            Shard::RetryPolicy::kIdempotent);
-        if (!appendRawResponses(opCtx, &errmsg, &output, shardResponses)) {
+        int scale = 1;
+        if (cmdObj["scale"].isNumber()) {
+            scale = cmdObj["scale"].numberInt();
+            if (scale <= 0) {
+                errmsg = "scale has to be > 0";
+                return false;
+            }
+        } else if (cmdObj["scale"].trueValue()) {
+            errmsg = "scale has to be a number > 0";
             return false;
         }
 
-        aggregateResults(shardResponses, output);
+        auto shardResponses = scatterGatherUnversionedTargetAllShards(
+            opCtx,
+            dbName,
+            applyReadWriteConcern(
+                opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
+            ReadPreferenceSetting::get(opCtx),
+            Shard::RetryPolicy::kIdempotent);
+        if (!appendRawResponses(opCtx, &errmsg, &output, shardResponses).responseOK) {
+            return false;
+        }
+
+        aggregateResults(scale, shardResponses, output);
         return true;
     }
 

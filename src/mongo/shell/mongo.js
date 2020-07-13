@@ -1,11 +1,6 @@
 // mongo.js
 
-// NOTE 'Mongo' may be defined here or in MongoJS.cpp.  Add code to init, not to this constructor.
-if (typeof Mongo == "undefined") {
-    Mongo = function(host) {
-        this.init(host);
-    };
-}
+// Defined in mongojs.cpp
 
 if (!Mongo.prototype) {
     throw Error("Mongo.prototype not defined");
@@ -50,20 +45,104 @@ Mongo.prototype.getDB = function(name) {
     // There is a weird issue where typeof(db._name) !== "string" when the db name
     // is created from objects returned from native C++ methods.
     // This hack ensures that the db._name is always a string.
-    if (typeof(name) === "object") {
+    if (typeof (name) === "object") {
         name = name.toString();
     }
     return new DB(this, name);
 };
 
-Mongo.prototype.getDBs = function(driverSession = this._getDefaultSession()) {
-    var cmdObj = {listDatabases: 1};
-    cmdObj = driverSession._serverSession.injectSessionId(cmdObj);
+Mongo.prototype._getDatabaseNamesFromPrivileges = function() {
+    'use strict';
 
-    var res = this.adminCommand(cmdObj);
-    if (!res.ok)
-        throw _getErrorWithCode(res, "listDatabases failed:" + tojson(res));
-    return res;
+    const ret = this.adminCommand({connectionStatus: 1, showPrivileges: 1});
+    if (!ret.ok) {
+        throw _getErrorWithCode(ret, "Failed to acquire database information from privileges");
+    }
+
+    const privileges = (ret.authInfo || {}).authenticatedUserPrivileges;
+    if (privileges === undefined) {
+        return [];
+    }
+
+    return privileges
+        .filter(function(priv) {
+            // Find all named databases in priv list.
+            return ((priv.resource || {}).db || '').length > 0;
+        })
+        .map(function(priv) {
+            // Return just the names.
+            return priv.resource.db;
+        })
+        .filter(function(db, idx, arr) {
+            // Make sure the list is unique
+            return arr.indexOf(db) === idx;
+        })
+        .sort();
+};
+
+Mongo.prototype.getDBs = function(driverSession = this._getDefaultSession(),
+                                  filter = undefined,
+                                  nameOnly = undefined,
+                                  authorizedDatabases = undefined) {
+    return function(driverSession, filter, nameOnly, authorizedDatabases) {
+        'use strict';
+
+        let cmdObj = {listDatabases: 1};
+        if (filter !== undefined) {
+            cmdObj.filter = filter;
+        }
+        if (nameOnly !== undefined) {
+            cmdObj.nameOnly = nameOnly;
+        }
+        if (authorizedDatabases !== undefined) {
+            cmdObj.authorizedDatabases = authorizedDatabases;
+        }
+
+        if (driverSession._isExplicit || !jsTest.options().disableImplicitSessions) {
+            cmdObj = driverSession._serverSession.injectSessionId(cmdObj);
+        }
+
+        const res = this.adminCommand(cmdObj);
+        if (!res.ok) {
+            // If "Unauthorized" was returned by the back end and we haven't explicitly
+            // asked for anything difficult to provide from userspace, then we can
+            // fallback on inspecting the user's permissions.
+            // This means that:
+            //   * filter must be undefined, as reimplementing that logic is out of scope.
+            //   * nameOnly must not be false as we can't infer size information.
+            //   * authorizedDatabases must not be false as those are the only DBs we can infer.
+            // Note that if the above are valid and we get Unauthorized, that also means
+            // that we MUST be talking to a pre-4.0 mongod.
+            //
+            // Like the server response mode, this path will return a simple list of
+            // names if nameOnly is specified as true.
+            // If nameOnly is undefined, we come as close as we can to what the
+            // server would return by supplying the databases key of the returned
+            // object.  Other information is unavailable.
+            if ((res.code === ErrorCodes.Unauthorized) && (filter === undefined) &&
+                (nameOnly !== false) && (authorizedDatabases !== false)) {
+                const names = this._getDatabaseNamesFromPrivileges();
+                if (nameOnly === true) {
+                    return names;
+                } else {
+                    return {
+                        databases: names.map(function(x) {
+                            return {name: x};
+                        }),
+                    };
+                }
+            }
+            throw _getErrorWithCode(res, "listDatabases failed:" + tojson(res));
+        }
+
+        if (nameOnly) {
+            return res.databases.map(function(db) {
+                return db.name;
+            });
+        }
+
+        return res;
+    }.call(this, driverSession, filter, nameOnly, authorizedDatabases);
 };
 
 Mongo.prototype.adminCommand = function(cmd) {
@@ -75,7 +154,9 @@ Mongo.prototype.adminCommand = function(cmd) {
  */
 Mongo.prototype.getLogComponents = function(driverSession = this._getDefaultSession()) {
     var cmdObj = {getParameter: 1, logComponentVerbosity: 1};
-    cmdObj = driverSession._serverSession.injectSessionId(cmdObj);
+    if (driverSession._isExplicit || !jsTest.options().disableImplicitSessions) {
+        cmdObj = driverSession._serverSession.injectSessionId(cmdObj);
+    }
 
     var res = this.adminCommand(cmdObj);
     if (!res.ok)
@@ -106,7 +187,9 @@ Mongo.prototype.setLogLevel = function(
     }
 
     var cmdObj = {setParameter: 1, logComponentVerbosity: vDoc};
-    cmdObj = driverSession._serverSession.injectSessionId(cmdObj);
+    if (driverSession._isExplicit || !jsTest.options().disableImplicitSessions) {
+        cmdObj = driverSession._serverSession.injectSessionId(cmdObj);
+    }
 
     var res = this.adminCommand(cmdObj);
     if (!res.ok)
@@ -140,21 +223,27 @@ Mongo.prototype.tojson = Mongo.prototype.toString;
  * @param mode {string} read preference mode to use. Pass null to disable read
  *     preference.
  * @param tagSet {Array.<Object>} optional. The list of tags to use, order matters.
- *     Note that this object only keeps a shallow copy of this array.
+ * @param hedgeOptions {<Object>} optional. The hedge options of the form {enabled: <bool>}.
  */
-Mongo.prototype.setReadPref = function(mode, tagSet) {
-    if ((this._readPrefMode === "primary") && (typeof(tagSet) !== "undefined") &&
-        (Object.keys(tagSet).length > 0)) {
-        // we allow empty arrays/objects or no tagSet for compatibility reasons
-        throw Error("Can not supply tagSet with readPref mode primary");
+Mongo.prototype.setReadPref = function(mode, tagSet, hedgeOptions) {
+    if (this._readPrefMode === "primary") {
+        if ((typeof (tagSet) !== "undefined") && (Object.keys(tagSet).length > 0)) {
+            // we allow empty arrays/objects or no tagSet for compatibility reasons
+            throw Error("Cannot supply tagSet with readPref mode \"primary\"");
+        }
+        if ((typeof (hedgeOptions) === "object") && hedgeOptions.enabled) {
+            throw Error("Cannot enable hedging with readPref mode \"primary\"");
+        }
     }
-    this._setReadPrefUnsafe(mode, tagSet);
+
+    this._setReadPrefUnsafe(mode, tagSet, hedgeOptions);
 };
 
 // Set readPref without validating. Exposed so we can test the server's readPref validation.
-Mongo.prototype._setReadPrefUnsafe = function(mode, tagSet) {
+Mongo.prototype._setReadPrefUnsafe = function(mode, tagSet, hedgeOptions) {
     this._readPrefMode = mode;
     this._readPrefTagSet = tagSet;
+    this._readPrefHedgeOptions = hedgeOptions;
 };
 
 Mongo.prototype.getReadPrefMode = function() {
@@ -165,18 +254,33 @@ Mongo.prototype.getReadPrefTagSet = function() {
     return this._readPrefTagSet;
 };
 
+Mongo.prototype.getReadPrefHedgeOptions = function() {
+    return this._readPrefHedgeOptions;
+};
+
 // Returns a readPreference object of the type expected by mongos.
 Mongo.prototype.getReadPref = function() {
-    var obj = {}, mode, tagSet;
-    if (typeof(mode = this.getReadPrefMode()) === "string") {
+    let obj = {};
+
+    const mode = this.getReadPrefMode();
+    if (typeof (mode) === "string") {
         obj.mode = mode;
     } else {
         return null;
     }
+
     // Server Selection Spec: - if readPref mode is "primary" then the tags field MUST
     // be absent. Ensured by setReadPref.
-    if (Array.isArray(tagSet = this.getReadPrefTagSet())) {
+    const tagSet = this.getReadPrefTagSet();
+    if (Array.isArray(tagSet)) {
         obj.tags = tagSet;
+    }
+
+    // Hedged Reads Spec: - if readPref mode is "primary" then the hegde.enabled MUST
+    // be false. Ensured by setReadPref.
+    const hedgeOptions = this.getReadPrefHedgeOptions();
+    if (typeof (hedgeOptions) === "object") {
+        obj.hedge = hedgeOptions;
     }
 
     return obj;
@@ -247,8 +351,23 @@ connect = function(url, user, pass) {
         }
     }
 
-    chatty("connecting to: " + url);
-    var m = new Mongo(url);
+    var atPos = url.indexOf("@");
+    var protocolPos = url.indexOf("://");
+    var safeURL = url;
+    if (atPos != -1 && protocolPos != -1) {
+        safeURL = url.substring(0, protocolPos + 3) + url.substring(atPos + 1);
+    }
+    chatty("connecting to: " + safeURL);
+    try {
+        var m = new Mongo(url);
+    } catch (e) {
+        if (url.indexOf(".mongodb.net") != -1) {
+            print("\n\n*** It looks like this is a MongoDB Atlas cluster. Please ensure that your" +
+                  " IP whitelist allows connections from your network.\n\n");
+        }
+
+        throw e;
+    }
     var db = m.getDB(m.defaultDB);
 
     if (user && pass) {
@@ -257,19 +376,33 @@ connect = function(url, user, pass) {
         }
     }
 
-    // Check server version
-    var serverVersion = db.version();
-    chatty("MongoDB server version: " + serverVersion);
+    if (_shouldUseImplicitSessions()) {
+        chatty("Implicit session: " + db.getSession());
+    }
 
-    var shellVersion = version();
-    if (serverVersion.slice(0, 3) != shellVersion.slice(0, 3)) {
-        chatty("WARNING: shell and server versions do not match");
+    // Implicit sessions should not be used when opening a connection. In particular, the buildInfo
+    // command is erroneously marked as requiring auth in MongoDB 3.6 and therefore fails if a
+    // logical session id is included in the request.
+    const originalTestData = TestData;
+    TestData = Object.merge(originalTestData, {disableImplicitSessions: true});
+    try {
+        // Check server version
+        var serverVersion = db.version();
+        chatty("MongoDB server version: " + serverVersion);
+
+        var shellVersion = version();
+        if (serverVersion.slice(0, 3) != shellVersion.slice(0, 3)) {
+            chatty("WARNING: shell and server versions do not match");
+        }
+    } finally {
+        TestData = originalTestData;
     }
 
     return db;
 };
 
-/** deprecated, use writeMode below
+/**
+ * deprecated, use writeMode below
  *
  */
 Mongo.prototype.useWriteCommands = function() {
@@ -298,7 +431,6 @@ Mongo.prototype.hasExplainCommand = function() {
  */
 
 Mongo.prototype.writeMode = function() {
-
     if ('_writeMode' in this) {
         return this._writeMode;
     }
@@ -373,6 +505,22 @@ Mongo.prototype.readMode = function() {
     return this._readMode;
 };
 
+/**
+ * Run a function while forcing a certain readMode, and then return the readMode to its original
+ * setting afterwards. Passes this connection to the given function, and returns the function's
+ * result.
+ */
+Mongo.prototype._runWithForcedReadMode = function(forcedReadMode, fn) {
+    let origReadMode = this.readMode();
+    this.forceReadMode(forcedReadMode);
+    try {
+        var res = fn(this);
+    } finally {
+        this.forceReadMode(origReadMode);
+    }
+    return res;
+};
+
 //
 // Write Concern can be set at the connection level, and is used for all write operations unless
 // overridden at the collection level.
@@ -422,17 +570,45 @@ Mongo.prototype.startSession = function startSession(options = {}) {
     if (!options.hasOwnProperty("retryWrites") && this.hasOwnProperty("_retryWrites")) {
         options.retryWrites = this._retryWrites;
     }
-    return new DriverSession(this, options);
+    const newDriverSession = new DriverSession(this, options);
+
+    // Only log this message if we are running a test
+    if (typeof TestData === "object" && TestData.testName) {
+        print("New session started with sessionID: " +
+              tojsononeline(newDriverSession.getSessionId()) +
+              " and options: " + tojsononeline(options));
+    }
+
+    return newDriverSession;
 };
 
 Mongo.prototype._getDefaultSession = function getDefaultSession() {
-    // We implicitly associate a Mongo connection object with a DriverSession so that tests which
-    // call DB.prototype.getMongo() and then Mongo.prototype.getDB() to get a different DB instance
-    // are still causally consistent.
+    // We implicitly associate a Mongo connection object with a real session so all requests include
+    // a logical session id. These implicit sessions are intentionally not causally consistent. If
+    // implicit sessions have been globally disabled, a dummy session is used instead of a real one.
     if (!this.hasOwnProperty("_defaultSession")) {
-        this._defaultSession = new _DummyDriverSession(this);
+        if (_shouldUseImplicitSessions()) {
+            try {
+                this._defaultSession = this.startSession({causalConsistency: false});
+            } catch (e) {
+                if (e instanceof DriverSession.UnsupportedError) {
+                    chatty("WARNING: No implicit session: " + e.message);
+                    this._setDummyDefaultSession();
+                } else {
+                    print("ERROR: Implicit session failed: " + e.message);
+                    throw (e);
+                }
+            }
+        } else {
+            this._setDummyDefaultSession();
+        }
+        this._defaultSession._isExplicit = false;
     }
     return this._defaultSession;
+};
+
+Mongo.prototype._setDummyDefaultSession = function setDummyDefaultSession() {
+    this._defaultSession = new _DummyDriverSession(this);
 };
 
 Mongo.prototype.isCausalConsistency = function isCausalConsistency() {
@@ -465,4 +641,55 @@ Mongo.prototype.waitForClusterTime = function waitForClusterTime(maxRetries = 10
         this.adminCommand({"ping": 1});
     }
     throw new Error("failed waiting for non default clusterTime");
+};
+
+/**
+ * Given the options object for a 'watch' helper, determines which options apply to the change
+ * stream stage, and which apply to the aggregate overall. Returns two objects: the change
+ * stream stage specification and the options for the aggregate command, respectively.
+ */
+Mongo.prototype._extractChangeStreamOptions = function(options) {
+    options = options || {};
+    assert(options instanceof Object, "'options' argument must be an object");
+
+    let changeStreamOptions = {fullDocument: options.fullDocument || "default"};
+    delete options.fullDocument;
+
+    if (options.hasOwnProperty("resumeAfter")) {
+        changeStreamOptions.resumeAfter = options.resumeAfter;
+        delete options.resumeAfter;
+    }
+
+    if (options.hasOwnProperty("startAfter")) {
+        changeStreamOptions.startAfter = options.startAfter;
+        delete options.startAfter;
+    }
+
+    if (options.hasOwnProperty("startAtOperationTime")) {
+        changeStreamOptions.startAtOperationTime = options.startAtOperationTime;
+        delete options.startAtOperationTime;
+    }
+
+    if (options.hasOwnProperty("fullDocumentBeforeChange")) {
+        changeStreamOptions.fullDocumentBeforeChange = options.fullDocumentBeforeChange;
+        delete options.fullDocumentBeforeChange;
+    }
+
+    if (options.hasOwnProperty("allChangesForCluster")) {
+        changeStreamOptions.allChangesForCluster = options.allChangesForCluster;
+        delete options.allChangesForCluster;
+    }
+
+    return [{$changeStream: changeStreamOptions}, options];
+};
+
+Mongo.prototype.watch = function(pipeline, options) {
+    pipeline = pipeline || [];
+    assert(pipeline instanceof Array, "'pipeline' argument must be an array");
+
+    let changeStreamStage;
+    [changeStreamStage, aggOptions] = this._extractChangeStreamOptions(options);
+    changeStreamStage.$changeStream.allChangesForCluster = true;
+    pipeline.unshift(changeStreamStage);
+    return this.getDB("admin")._runAggregate({aggregate: 1, pipeline: pipeline}, aggOptions);
 };

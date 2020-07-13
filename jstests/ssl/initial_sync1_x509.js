@@ -40,7 +40,7 @@ function runInitialSyncTest() {
     var foo = master.getDB("foo");
     var admin = master.getDB("admin");
 
-    var slave1 = replTest.liveNodes.slaves[0];
+    var slave1 = replTest._slaves[0];
     var admin_s1 = slave1.getDB("admin");
 
     print("2. Create a root user.");
@@ -53,8 +53,8 @@ function runInitialSyncTest() {
     for (var i = 0; i < 100; i++) {
         bulk.insert({date: new Date(), x: i, str: "all the talk on the market"});
     }
-    assert.writeOK(bulk.execute());
-    print("total in foo: " + foo.bar.find().itcount());
+    assert.commandWorked(bulk.execute());
+    print("total in foo: " + foo.bar.count());
 
     print("4. Make sure synced");
     replTest.awaitReplication();
@@ -65,7 +65,7 @@ function runInitialSyncTest() {
     for (var i = 0; i < 100; i++) {
         bulk.insert({date: new Date(), x: i, str: "all the talk on the market"});
     }
-    assert.writeOK(bulk.execute());
+    assert.commandWorked(bulk.execute());
 
     print("6. Everyone happy eventually");
     replTest.awaitReplication(300000);
@@ -96,6 +96,11 @@ x509_options1 = Object.merge(common_options, {clusterAuthMode: "x509"});
 x509_options2 = Object.merge(common_options,
                              {sslClusterFile: "jstests/libs/smoke.pem", clusterAuthMode: "x509"});
 var replTest = new ReplSetTest({nodes: {node0: x509_options1, node1: x509_options2}});
+
+// We don't want to invoke the hang analyzer because we
+// expect this test to fail by timing out
+MongoRunner.runHangAnalyzer.disable();
+
 var conns = replTest.startSet();
 assert.throws(function() {
     replTest.initiate();

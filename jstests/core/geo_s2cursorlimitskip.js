@@ -7,6 +7,8 @@
 //   assumes_read_preference_unchanged,
 //   does_not_support_stepdowns,
 //   requires_getmore,
+//   requires_capped,
+//   requires_profiling,
 // ]
 
 var testDB = db.getSiblingDB("geo_s2cursorlimitskip");
@@ -33,7 +35,7 @@ function insertRandomPoints(num, minDist, maxDist) {
         var lat = sign() * (minDist + random() * (maxDist - minDist));
         var lng = sign() * (minDist + random() * (maxDist - minDist));
         var point = {geo: {type: "Point", coordinates: [lng, lat]}};
-        assert.writeOK(t.insert(point));
+        assert.commandWorked(t.insert(point));
     }
 }
 

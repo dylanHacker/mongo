@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -56,12 +57,10 @@ public:
     struct CommandResponse {
         CommandResponse(boost::optional<HostAndPort> hostAndPort,
                         BSONObj response,
-                        BSONObj metadata,
                         Status commandStatus,
                         Status writeConcernStatus)
             : hostAndPort(std::move(hostAndPort)),
               response(std::move(response)),
-              metadata(std::move(metadata)),
               commandStatus(std::move(commandStatus)),
               writeConcernStatus(std::move(writeConcernStatus)) {}
 
@@ -79,7 +78,6 @@ public:
 
         boost::optional<HostAndPort> hostAndPort;
         BSONObj response;
-        BSONObj metadata;
         Status commandStatus;
         Status writeConcernStatus;
     };
@@ -198,6 +196,25 @@ public:
         RetryPolicy retryPolicy);
 
     /**
+     * Schedules the command to be sent to the shard asynchronously. Does not provide any guarantee
+     * on whether the command is actually sent or even scheduled successfully.
+     */
+    virtual void runFireAndForgetCommand(OperationContext* opCtx,
+                                         const ReadPreferenceSetting& readPref,
+                                         const std::string& dbName,
+                                         const BSONObj& cmdObj) = 0;
+
+    /**
+     * Runs a cursor command, exhausts the cursor, and pulls all data into memory. Performs retries
+     * if the command fails in accordance with the kIdempotent RetryPolicy.
+     */
+    StatusWith<QueryResponse> runExhaustiveCursorCommand(OperationContext* opCtx,
+                                                         const ReadPreferenceSetting& readPref,
+                                                         const std::string& dbName,
+                                                         const BSONObj& cmdObj,
+                                                         Milliseconds maxTimeMSOverride);
+
+    /**
      * Runs a write command against a shard. This is separate from runCommand, because write
      * commands return errors in a different format than regular commands do, so checking for
      * retriable errors must be done differently.
@@ -208,13 +225,13 @@ public:
                                                 RetryPolicy retryPolicy);
 
     /**
-    * Warning: This method exhausts the cursor and pulls all data into memory.
-    * Do not use other than for very small (i.e., admin or metadata) collections.
-    * Performs retries if the query fails in accordance with the kIdempotent RetryPolicy.
-    *
-    * ShardRemote instances expect "readConcernLevel" to always be kMajorityReadConcern, whereas
-    * ShardLocal instances expect either kLocalReadConcern or kMajorityReadConcern.
-    */
+     * Warning: This method exhausts the cursor and pulls all data into memory.
+     * Do not use other than for very small (i.e., admin or metadata) collections.
+     * Performs retries if the query fails in accordance with the kIdempotent RetryPolicy.
+     *
+     * ShardRemote instances expect "readConcernLevel" to always be kMajorityReadConcern, whereas
+     * ShardLocal instances expect either kLocalReadConcern or kMajorityReadConcern.
+     */
     StatusWith<QueryResponse> exhaustiveFindOnConfig(OperationContext* opCtx,
                                                      const ReadPreferenceSetting& readPref,
                                                      const repl::ReadConcernLevel& readConcernLevel,
@@ -222,6 +239,7 @@ public:
                                                      const BSONObj& query,
                                                      const BSONObj& sort,
                                                      const boost::optional<long long> limit);
+
     /**
      * Builds an index on a config server collection.
      * Creates the collection if it doesn't yet exist.  Does not error if the index already exists,
@@ -276,9 +294,16 @@ private:
      */
     virtual StatusWith<CommandResponse> _runCommand(OperationContext* opCtx,
                                                     const ReadPreferenceSetting& readPref,
-                                                    const std::string& dbname,
+                                                    StringData dbname,
                                                     Milliseconds maxTimeMSOverride,
                                                     const BSONObj& cmdObj) = 0;
+
+    virtual StatusWith<QueryResponse> _runExhaustiveCursorCommand(
+        OperationContext* opCtx,
+        const ReadPreferenceSetting& readPref,
+        StringData dbName,
+        Milliseconds maxTimeMSOverride,
+        const BSONObj& cmdObj) = 0;
 
     virtual StatusWith<QueryResponse> _exhaustiveFindOnConfig(
         OperationContext* opCtx,

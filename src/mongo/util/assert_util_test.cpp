@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,8 +27,9 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
+#include "mongo/config.h"
 #include "mongo/platform/basic.h"
 
 #include <type_traits>
@@ -36,7 +38,7 @@
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -85,9 +87,10 @@ TEST(AssertUtils, UassertNamedCodeWithoutCategories) {
     ASSERT_NOT_CATCHES(ErrorCodes::BadValue, ExceptionForCat<ErrorCategory::Interruption>);
 }
 
-// NotMaster - just NotMasterError
+// NotMaster - NotMasterError, RetriableError
 MONGO_STATIC_ASSERT(std::is_same<error_details::ErrorCategoriesFor<ErrorCodes::NotMaster>,
-                                 error_details::CategoryList<ErrorCategory::NotMasterError>>());
+                                 error_details::CategoryList<ErrorCategory::NotMasterError,
+                                                             ErrorCategory::RetriableError>>());
 MONGO_STATIC_ASSERT(std::is_base_of<AssertionException, ExceptionFor<ErrorCodes::NotMaster>>());
 MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionForCat<ErrorCategory::NetworkError>,
                                      ExceptionFor<ErrorCodes::NotMaster>>());
@@ -106,11 +109,12 @@ TEST(AssertUtils, UassertNamedCodeWithOneCategory) {
     ASSERT_NOT_CATCHES(ErrorCodes::NotMaster, ExceptionForCat<ErrorCategory::Interruption>);
 }
 
-// InterruptedDueToReplStateChange - NotMasterError and Interruption
+// InterruptedDueToReplStateChange - NotMasterError, Interruption, RetriableError
 MONGO_STATIC_ASSERT(
-    std::is_same<
-        error_details::ErrorCategoriesFor<ErrorCodes::InterruptedDueToReplStateChange>,
-        error_details::CategoryList<ErrorCategory::Interruption, ErrorCategory::NotMasterError>>());
+    std::is_same<error_details::ErrorCategoriesFor<ErrorCodes::InterruptedDueToReplStateChange>,
+                 error_details::CategoryList<ErrorCategory::Interruption,
+                                             ErrorCategory::NotMasterError,
+                                             ErrorCategory::RetriableError>>());
 MONGO_STATIC_ASSERT(std::is_base_of<AssertionException,
                                     ExceptionFor<ErrorCodes::InterruptedDueToReplStateChange>>());
 MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionForCat<ErrorCategory::NetworkError>,
@@ -168,6 +172,27 @@ TEST(AssertUtils, UassertStatusOKPreservesExtraInfo) {
     }
 }
 
+TEST(AssertUtils, UassertStatusOKWithContextPreservesExtraInfo) {
+    const auto status = Status(ErrorExtraInfoExample(123), "");
+
+    try {
+        uassertStatusOKWithContext(status, "foo");
+    } catch (const DBException& ex) {
+        ASSERT(ex.extraInfo());
+        ASSERT(ex.extraInfo<ErrorExtraInfoExample>());
+        ASSERT_EQ(ex.extraInfo<ErrorExtraInfoExample>()->data, 123);
+    }
+
+    try {
+        uassertStatusOKWithContext(status, "foo");
+    } catch (const ExceptionFor<ErrorCodes::ForTestingErrorExtraInfo>& ex) {
+        ASSERT(ex.extraInfo());
+        ASSERT(ex.extraInfo<ErrorExtraInfoExample>());
+        ASSERT_EQ(ex.extraInfo<ErrorExtraInfoExample>()->data, 123);
+        ASSERT_EQ(ex->data, 123);
+    }
+}
+
 TEST(AssertUtils, UassertTypedExtraInfoWorks) {
     try {
         uasserted(ErrorExtraInfoExample(123), "");
@@ -187,6 +212,45 @@ TEST(AssertUtils, UassertTypedExtraInfoWorks) {
     }
 }
 
+TEST(AssertUtils, UassertIncrementsUserAssertionCounter) {
+    auto userAssertions = assertionCount.user.load();
+    auto asserted = false;
+    try {
+        Status status = {ErrorCodes::BadValue, "Test"};
+        uassertStatusOK(status);
+    } catch (const DBException&) {
+        asserted = true;
+    }
+    ASSERT(asserted);
+    ASSERT_EQ(userAssertions + 1, assertionCount.user.load());
+}
+
+TEST(AssertUtils, InternalAssertWithStatus) {
+    auto userAssertions = assertionCount.user.load();
+    try {
+        Status status = {ErrorCodes::BadValue, "Test"};
+        internalAssert(status);
+    } catch (const DBException& ex) {
+        ASSERT_EQ(ex.code(), ErrorCodes::BadValue);
+        ASSERT_EQ(ex.reason(), "Test");
+    }
+    ASSERT_EQ(userAssertions, assertionCount.user.load());
+}
+
+TEST(AssertUtils, InternalAssertWithExpression) {
+    auto userAssertions = assertionCount.user.load();
+    try {
+        internalAssert(48922, "Test", false);
+    } catch (const DBException& ex) {
+        ASSERT_EQ(ex.code(), 48922);
+        ASSERT_EQ(ex.reason(), "Test");
+    }
+
+    internalAssert(48922, "Another test", true);
+
+    ASSERT_EQ(userAssertions, assertionCount.user.load());
+}
+
 TEST(AssertUtils, MassertTypedExtraInfoWorks) {
     try {
         msgasserted(ErrorExtraInfoExample(123), "");
@@ -204,24 +268,6 @@ TEST(AssertUtils, MassertTypedExtraInfoWorks) {
         ASSERT_EQ(ex.extraInfo<ErrorExtraInfoExample>()->data, 123);
         ASSERT_EQ(ex->data, 123);
     }
-}
-
-// uassert and its friends
-DEATH_TEST(UassertionTerminationTest, uassert, "Terminating with uassert") {
-    uassert(40204, "Terminating with uassert", false);
-}
-
-DEATH_TEST(UassertionTerminationTest, uasserted, "Terminating with uasserted") {
-    uasserted(40205, "Terminating with uasserted");
-}
-
-DEATH_TEST(UassertionTerminationTest, uassertStatusOK, "Terminating with uassertStatusOK") {
-    uassertStatusOK(Status(ErrorCodes::InternalError, "Terminating with uassertStatusOK"));
-}
-
-DEATH_TEST(UassertionTerminationTest, uassertStatusOKOverload, "Terminating with uassertStatusOK") {
-    uassertStatusOK(
-        StatusWith<std::string>(ErrorCodes::InternalError, "Terminating with uassertStatusOK"));
 }
 
 // fassert and its friends
@@ -271,27 +317,18 @@ DEATH_TEST(FassertionTerminationTest,
         40213, {ErrorCodes::InternalError, "Terminating with fassertFailedWithStatusNoTrace"});
 }
 
-// massert and its friends
-DEATH_TEST(MassertionTerminationTest, massert, "Terminating with massert") {
-    massert(40214, "Terminating with massert", false);
-}
-
-
-DEATH_TEST(MassertionTerminationTest, massertStatusOK, "Terminating with massertStatusOK") {
-    massertStatusOK(Status(ErrorCodes::InternalError, "Terminating with massertStatusOK"));
-}
-
-DEATH_TEST(MassertionTerminationTest, msgasserted, "Terminating with msgasserted") {
-    msgasserted(40215, "Terminating with msgasserted");
-}
-
 // invariant and its friends
-DEATH_TEST(InvariantTerminationTest, invariant, "Invariant failure false " __FILE__) {
+DEATH_TEST_REGEX(InvariantTerminationTest, invariant, "Invariant failure.*false.*" __FILE__) {
     invariant(false);
 }
 
-DEATH_TEST(InvariantTerminationTest, invariantOK, "Terminating with invariantOK") {
-    invariantOK(Status(ErrorCodes::InternalError, "Terminating with invariantOK"));
+DEATH_TEST(InvariantTerminationTest, invariantOverload, "Terminating with invariant") {
+    invariant(Status(ErrorCodes::InternalError, "Terminating with invariant"));
+}
+
+DEATH_TEST(InvariantTerminationTest, invariantStatusWithOverload, "Terminating with invariant") {
+    invariant(StatusWith<std::string>(ErrorCodes::InternalError,
+                                      "Terminating with invariantStatusWithOverload"));
 }
 
 DEATH_TEST(InvariantTerminationTest,
@@ -304,10 +341,95 @@ DEATH_TEST(InvariantTerminationTest,
 DEATH_TEST(InvariantTerminationTest,
            invariantWithStdStringMsg,
            "Terminating with std::string invariant message: 12345") {
-    const std::string msg = str::stream() << "Terminating with std::string invariant message: "
-                                          << 12345;
+    const std::string msg = str::stream()
+        << "Terminating with std::string invariant message: " << 12345;
     invariant(false, msg);
 }
+
+DEATH_TEST(InvariantTerminationTest,
+           invariantOverloadWithStringLiteralMsg,
+           "Terminating with string literal invariant message") {
+    invariant(Status(ErrorCodes::InternalError, "Terminating with invariant"),
+              "Terminating with string literal invariant message");
+}
+
+DEATH_TEST(InvariantTerminationTest,
+           invariantOverloadWithStdStringMsg,
+           "Terminating with std::string invariant message: 12345") {
+    const std::string msg = str::stream()
+        << "Terminating with std::string invariant message: " << 12345;
+    invariant(Status(ErrorCodes::InternalError, "Terminating with invariant"), msg);
+}
+
+DEATH_TEST(InvariantTerminationTest,
+           invariantStatusWithOverloadWithStringLiteralMsg,
+           "Terminating with string literal invariant message") {
+    invariant(StatusWith<std::string>(ErrorCodes::InternalError, "Terminating with invariant"),
+              "Terminating with string literal invariant message");
+}
+
+DEATH_TEST(InvariantTerminationTest,
+           invariantStatusWithOverloadWithStdStringMsg,
+           "Terminating with std::string invariant message: 12345") {
+    const std::string msg = str::stream()
+        << "Terminating with std::string invariant message: " << 12345;
+    invariant(StatusWith<std::string>(ErrorCodes::InternalError, "Terminating with invariant"),
+              msg);
+}
+
+DEATH_TEST(InvariantTerminationTest, invariantStatusOK, "Terminating with invariantStatusOK") {
+    invariantStatusOK(Status(ErrorCodes::InternalError, "Terminating with invariantStatusOK"));
+}
+
+DEATH_TEST(InvariantTerminationTest,
+           invariantStatusOKOverload,
+           "Terminating with invariantStatusOK") {
+    invariantStatusOK(
+        StatusWith<std::string>(ErrorCodes::InternalError, "Terminating with invariantStatusOK"));
+}
+
+DEATH_TEST(InvariantTerminationTest,
+           invariantStatusOKWithContext,
+           "Terminating with invariantStatusOKWithContext") {
+    invariantStatusOKWithContext(
+        Status(ErrorCodes::InternalError, "Terminating with invariantStatusOKWithContext"),
+        "Terminating with invariantStatusOKWithContext");
+}
+
+DEATH_TEST(InvariantTerminationTest,
+           invariantStatusOKWithContextOverload,
+           "Terminating with invariantStatusOKWithContextOverload") {
+    invariantStatusOKWithContext(
+        StatusWith<std::string>(ErrorCodes::InternalError,
+                                "Terminating with invariantStatusOKWithContext"),
+        "Terminating with invariantStatusOKWithContextOverload");
+}
+
+#if defined(MONGO_CONFIG_DEBUG_BUILD)
+// dassert and its friends
+DEATH_TEST_REGEX(DassertTerminationTest, invariant, "Invariant failure.*false.*" __FILE__) {
+    dassert(false);
+}
+
+DEATH_TEST(DassertTerminationTest, dassertOK, "Terminating with dassertOK") {
+    dassert(Status(ErrorCodes::InternalError, "Terminating with dassertOK"));
+}
+
+DEATH_TEST(DassertTerminationTest,
+           invariantWithStringLiteralMsg,
+           "Terminating with string literal dassert message") {
+    const char* msg = "Terminating with string literal dassert message";
+    dassert(false, msg);
+}
+
+DEATH_TEST(DassertTerminationTest,
+           dassertWithStdStringMsg,
+           "Terminating with std::string dassert message: 12345") {
+    const std::string msg = str::stream()
+        << "Terminating with std::string dassert message: " << 12345;
+    dassert(false, msg);
+}
+#endif  // defined(MONGO_CONFIG_DEBUG_BUILD)
 
 }  // namespace
 }  // namespace mongo

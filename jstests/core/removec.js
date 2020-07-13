@@ -1,4 +1,8 @@
-// @tags: [requires_non_retryable_writes]
+// @tags: [
+//   requires_non_retryable_writes,
+//   uses_multiple_connections,
+//   uses_parallel_shell,
+// ]
 
 // Sanity test for removing documents with adjacent index keys.  SERVER-2008
 

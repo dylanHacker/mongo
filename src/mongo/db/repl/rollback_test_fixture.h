@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/db/read_write_concern_defaults_cache_lookup_mock.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/oplog_interface.h"
@@ -38,6 +40,10 @@
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_severity.h"
+#include "mongo/unittest/log_test.h"
+#include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace repl {
@@ -49,7 +55,7 @@ namespace repl {
  *   storage layer. The storage engine is initialized as part of the ServiceContextForMongoD test
  *   fixture.
  */
-class RollbackTest : public unittest::Test {
+class RollbackTest : public ServiceContextMongoDTest {
 public:
     RollbackTest() = default;
 
@@ -57,15 +63,6 @@ public:
      * Initializes the service context and task executor.
      */
     void setUp() override;
-
-    /**
-     * Destroys the service context and task executor.
-     *
-     * Note on overriding tearDown() in tests:
-     * This cancels outstanding tasks and remote command requests scheduled using the task
-     * executor.
-     */
-    void tearDown() override;
 
     /**
      * Creates a collection with the given namespace and options.
@@ -76,6 +73,11 @@ public:
     static Collection* _createCollection(OperationContext* opCtx,
                                          const std::string& nss,
                                          const CollectionOptions& options);
+
+    /**
+     * Inserts a single document into the collection namespace 'nss'.
+     */
+    void _insertDocument(OperationContext* opCtx, const NamespaceString& nss, const BSONObj& doc);
 
     /**
      * Inserts a document into the oplog.
@@ -97,13 +99,25 @@ public:
     /**
      * Creates an oplog entry with a recordId for a command operation.
      */
-    static std::pair<BSONObj, RecordId> makeCommandOp(
-        Timestamp ts, OptionalCollectionUUID uuid, StringData nss, BSONObj cmdObj, int recordId);
+    static std::pair<BSONObj, RecordId> makeCommandOp(Timestamp ts,
+                                                      OptionalCollectionUUID uuid,
+                                                      StringData nss,
+                                                      BSONObj cmdObj,
+                                                      int recordId,
+                                                      boost::optional<BSONObj> o2 = boost::none);
+
+    /**
+     * Creates an oplog entry with a recordId for a command operation. The oplog entry will not have
+     * a "ts" or "wall" field. This is used for creating inner ops for applyOps entries.
+     */
+    static std::pair<BSONObj, RecordId> makeCommandOpForApplyOps(
+        OptionalCollectionUUID uuid,
+        StringData nss,
+        BSONObj cmdObj,
+        int recordId,
+        boost::optional<BSONObj> o2 = boost::none);
 
 protected:
-    // Test fixture used to manage the service context and global storage engine.
-    ServiceContextMongoDTest _serviceContextMongoDTest;
-
     // OperationContext provided to test cases for storage layer operations.
     ServiceContext::UniqueOperationContext _opCtx;
 
@@ -121,46 +135,61 @@ protected:
 
     // DropPendingCollectionReaper used to clean up and roll back dropped collections.
     DropPendingCollectionReaper* _dropPendingCollectionReaper = nullptr;
+
+    ReadWriteConcernDefaultsLookupMock _lookupMock;
+
+    // Increase rollback log component verbosity for unit tests.
+    unittest::MinimumLoggedSeverityGuard severityGuard{logv2::LogComponent::kReplicationRollback,
+                                                       logv2::LogSeverity::Debug(2)};
 };
 
 class RollbackTest::StorageInterfaceRollback : public StorageInterfaceImpl {
 public:
     void setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         _stableTimestamp = snapshotName;
     }
 
     /**
-     * If '_recoverToTimestampStatus' is non-empty, returns it. If '_recoverToTimestampStatus' is
+     * If '_recoverToTimestampStatus' is non-empty, fasserts. If '_recoverToTimestampStatus' is
      * empty, updates '_currTimestamp' to be equal to '_stableTimestamp' and returns the new value
      * of '_currTimestamp'.
      */
-    StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) override {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+    Timestamp recoverToStableTimestamp(OperationContext* opCtx) override {
+        stdx::lock_guard<Latch> lock(_mutex);
         if (_recoverToTimestampStatus) {
-            return _recoverToTimestampStatus.get();
-        } else {
-            _currTimestamp = _stableTimestamp;
-            return _currTimestamp;
+            fassert(4584700, _recoverToTimestampStatus.get());
         }
+
+        _currTimestamp = _stableTimestamp;
+        return _currTimestamp;
     }
 
     bool supportsRecoverToStableTimestamp(ServiceContext* serviceCtx) const override {
         return true;
     }
 
+    bool supportsRecoveryTimestamp(ServiceContext* serviceCtx) const override {
+        return true;
+    }
+
+    boost::optional<Timestamp> getLastStableRecoveryTimestamp(
+        ServiceContext* serviceCtx) const override {
+        return _stableTimestamp;
+    }
+
     void setRecoverToTimestampStatus(Status status) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         _recoverToTimestampStatus = status;
     }
 
     void setCurrentTimestamp(Timestamp ts) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         _currTimestamp = ts;
     }
 
     Timestamp getCurrentTimestamp() {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         return _currTimestamp;
     }
 
@@ -170,28 +199,28 @@ public:
     Status setCollectionCount(OperationContext* opCtx,
                               const NamespaceStringOrUUID& nsOrUUID,
                               long long newCount) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         if (_setCollectionCountStatus && _setCollectionCountStatusUUID &&
             nsOrUUID.uuid() == _setCollectionCountStatusUUID) {
             return *_setCollectionCountStatus;
         }
-        _newCounts[nsOrUUID.uuid().get()] = newCount;
+        _newCounts[*nsOrUUID.uuid()] = newCount;
         return Status::OK();
     }
 
     void setSetCollectionCountStatus(UUID uuid, Status status) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         _setCollectionCountStatus = status;
         _setCollectionCountStatusUUID = uuid;
     }
 
     long long getFinalCollectionCount(const UUID& uuid) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         return _newCounts[uuid];
     }
 
 private:
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("StorageInterfaceRollback::_mutex");
 
     Timestamp _stableTimestamp;
 
@@ -226,6 +255,8 @@ public:
      */
     Status setFollowerMode(const MemberState& newState) override;
 
+    Status setFollowerModeRollback(OperationContext* opCtx) override;
+
     /**
      * Set this to make transitioning to the given follower mode fail with the given error code.
      */
@@ -252,8 +283,6 @@ public:
                                                       UUID uuid,
                                                       const BSONObj& filter) const override;
 
-    void copyCollectionFromRemote(OperationContext* opCtx,
-                                  const NamespaceString& nss) const override;
     StatusWith<BSONObj> getCollectionInfoByUUID(const std::string& db,
                                                 const UUID& uuid) const override;
     StatusWith<BSONObj> getCollectionInfo(const NamespaceString& nss) const override;
@@ -274,9 +303,9 @@ private:
  * 'remoteCollOptionsObj': the collection options object that the sync source will respond with to
  * the rollback node when it fetches collection metadata.
  *
- * If no command is provided, a collMod operation with a 'noPadding' argument is used to trigger a
- * collection metadata resync, since the rollback of collMod operations does not take into account
- * the actual command object. It simply re-syncs all the collection options.
+ * If no command is provided, a collMod operation with a 'validationLevel' argument is used to
+ * trigger a collection metadata resync, since the rollback of collMod operations does not take into
+ * account the actual command object. It simply re-syncs all the collection options.
  */
 class RollbackResyncsCollectionOptionsTest : public RollbackTest {
 

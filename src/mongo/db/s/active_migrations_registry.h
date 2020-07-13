@@ -1,40 +1,40 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
 #include <boost/optional.hpp>
+#include <memory>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/s/migration_session_id.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/request_types/move_chunk_request.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/notification.h"
 
 namespace mongo {
@@ -50,7 +50,8 @@ class StatusWith;
  * to only one per shard. There is only one instance of this object per shard.
  */
 class ActiveMigrationsRegistry {
-    MONGO_DISALLOW_COPYING(ActiveMigrationsRegistry);
+    ActiveMigrationsRegistry(const ActiveMigrationsRegistry&) = delete;
+    ActiveMigrationsRegistry& operator=(const ActiveMigrationsRegistry&) = delete;
 
 public:
     ActiveMigrationsRegistry();
@@ -58,6 +59,15 @@ public:
 
     static ActiveMigrationsRegistry& get(ServiceContext* service);
     static ActiveMigrationsRegistry& get(OperationContext* opCtx);
+
+    /**
+     * These methods can be used to block migrations temporarily. The lock() method will block if
+     * there is a migration operation in progress and will return once it is completed. Any
+     * subsequent migration operations will return ConflictingOperationInProgress until the unlock()
+     * method is called.
+     */
+    void lock(OperationContext* opCtx, StringData reason);
+    void unlock(StringData reason);
 
     /**
      * If there are no migrations running on this shard, registers an active migration with the
@@ -70,7 +80,8 @@ public:
      *
      * Otherwise returns a ConflictingOperationInProgress error.
      */
-    StatusWith<ScopedDonateChunk> registerDonateChunk(const MoveChunkRequest& args);
+    StatusWith<ScopedDonateChunk> registerDonateChunk(OperationContext* opCtx,
+                                                      const MoveChunkRequest& args);
 
     /**
      * If there are no migrations running on this shard, registers an active receive operation with
@@ -79,7 +90,8 @@ public:
      *
      * Otherwise returns a ConflictingOperationInProgress error.
      */
-    StatusWith<ScopedReceiveChunk> registerReceiveChunk(const NamespaceString& nss,
+    StatusWith<ScopedReceiveChunk> registerReceiveChunk(OperationContext* opCtx,
+                                                        const NamespaceString& nss,
                                                         const ChunkRange& chunkRange,
                                                         const ShardId& fromShardId);
 
@@ -151,7 +163,10 @@ private:
     void _clearReceiveChunk();
 
     // Protects the state below
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("ActiveMigrationsRegistry::_mutex");
+    stdx::condition_variable _lockCond;
+
+    bool _migrationsBlocked{false};
 
     // If there is an active moveChunk operation, this field contains the original request
     boost::optional<ActiveMoveChunkState> _activeMoveChunkState;
@@ -160,13 +175,33 @@ private:
     boost::optional<ActiveReceiveChunkState> _activeReceiveChunkState;
 };
 
+class MigrationBlockingGuard {
+public:
+    MigrationBlockingGuard(OperationContext* opCtx, std::string reason)
+        : _registry(ActiveMigrationsRegistry::get(opCtx)), _reason(std::move(reason)) {
+        // Ensure any thread attempting to use a MigrationBlockingGuard will be interrupted by
+        // a stepdown.
+        invariant(opCtx->lockState()->wasGlobalLockTakenInModeConflictingWithWrites());
+        _registry.lock(opCtx, _reason);
+    }
+
+    ~MigrationBlockingGuard() {
+        _registry.unlock(_reason);
+    }
+
+private:
+    ActiveMigrationsRegistry& _registry;
+    std::string _reason;
+};
+
 /**
  * Object of this class is returned from the registerDonateChunk call of the active migrations
  * registry. It can exist in two modes - 'execute' and 'join'. See the comments for
  * registerDonateChunk method for more details.
  */
 class ScopedDonateChunk {
-    MONGO_DISALLOW_COPYING(ScopedDonateChunk);
+    ScopedDonateChunk(const ScopedDonateChunk&) = delete;
+    ScopedDonateChunk& operator=(const ScopedDonateChunk&) = delete;
 
 public:
     ScopedDonateChunk(ActiveMigrationsRegistry* registry,
@@ -219,7 +254,8 @@ private:
  * registry.
  */
 class ScopedReceiveChunk {
-    MONGO_DISALLOW_COPYING(ScopedReceiveChunk);
+    ScopedReceiveChunk(const ScopedReceiveChunk&) = delete;
+    ScopedReceiveChunk& operator=(const ScopedReceiveChunk&) = delete;
 
 public:
     ScopedReceiveChunk(ActiveMigrationsRegistry* registry);

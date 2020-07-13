@@ -1,11 +1,12 @@
 [Unit]
 Description=MongoDB Database Server
-After=network.target
 Documentation=https://docs.mongodb.org/manual
+After=network.target
 
 [Service]
 User=mongodb
 Group=mongodb
+EnvironmentFile=-/etc/default/mongod
 ExecStart=/usr/bin/mongod --config /etc/mongod.conf
 PIDFile=/var/run/mongodb/mongod.pid
 # file size
@@ -24,8 +25,8 @@ LimitMEMLOCK=infinity
 TasksMax=infinity
 TasksAccounting=false
 
-# Recommended limits for for mongod as specified in
-# http://docs.mongodb.org/manual/reference/ulimit/#recommended-settings
+# Recommended limits for mongod as specified in
+# https://docs.mongodb.com/manual/reference/ulimit/#recommended-ulimit-settings
 
 [Install]
 WantedBy=multi-user.target

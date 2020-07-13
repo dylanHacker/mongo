@@ -1,93 +1,216 @@
 /**
  * Tests for making sure that retried writes will wait properly for writeConcern.
+ *
+ * @tags: [uses_transactions, uses_prepare_transaction]
  */
 (function() {
 
-    "use strict";
+"use strict";
 
-    load("jstests/libs/retryable_writes_util.js");
-    load("jstests/libs/write_concern_util.js");
+load("jstests/libs/retryable_writes_util.js");
+load("jstests/libs/write_concern_util.js");
 
-    if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
-        jsTestLog("Retryable writes are not supported, skipping test");
-        return;
-    }
+if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
+    jsTestLog("Retryable writes are not supported, skipping test");
+    return;
+}
 
-    const kNodes = 2;
+const kNodes = 2;
 
-    let checkWriteConcernTimedOut = function(result) {
-        let wcErr = result.writeConcernError;
-        assert.neq(null, wcErr, tojson(result));
+let replTest = new ReplSetTest({nodes: kNodes});
+replTest.startSet({verbose: 1});
+replTest.initiate();
 
-        let errInfo = wcErr.errInfo;
-        assert.neq(null, errInfo, tojson(result));
+let priConn = replTest.getPrimary();
+let secConn = replTest.getSecondary();
 
-        assert.eq(true, errInfo.wtimeout, tojson(result));
-    };
+// Stopping replication on secondaries can take up to 5 seconds normally. Set a small oplog
+// getMore timeout so the test runs faster.
+assert.commandWorked(
+    secConn.adminCommand({configureFailPoint: 'setSmallOplogGetMoreMaxTimeMS', mode: 'alwaysOn'}));
 
-    let runTest = function(priConn, secConn, cmd) {
-        // Send a dummy write to this connection so it will have the Client object initialized.
-        let secondPriConn = new Mongo(priConn.host);
-        let testDB2 = secondPriConn.getDB('test');
-        assert.writeOK(testDB2.dummy.insert({x: 1}, {writeConcern: {w: kNodes}}));
+let lsid = UUID();
 
-        stopServerReplication(secConn);
+// Start at an arbitrary txnNumber.
+let txnNumber = 31;
 
-        let testDB = priConn.getDB('test');
-        checkWriteConcernTimedOut(testDB.runCommand(cmd));
-        checkWriteConcernTimedOut(testDB2.runCommand(cmd));
+txnNumber++;
+runWriteConcernRetryabilityTest(priConn,
+                                secConn,
+                                {
+                                    insert: 'user',
+                                    documents: [{_id: 10}, {_id: 30}],
+                                    ordered: false,
+                                    lsid: {id: lsid},
+                                    txnNumber: NumberLong(txnNumber),
+                                    writeConcern: {w: 'majority', wtimeout: 200},
+                                },
+                                kNodes);
 
-        restartServerReplication(secConn);
-    };
+txnNumber++;
+runWriteConcernRetryabilityTest(priConn,
+                                secConn,
+                                {
+                                    update: 'user',
+                                    updates: [
+                                        {q: {_id: 10}, u: {$inc: {x: 1}}},
+                                    ],
+                                    ordered: false,
+                                    lsid: {id: lsid},
+                                    txnNumber: NumberLong(txnNumber),
+                                    writeConcern: {w: 'majority', wtimeout: 200},
+                                },
+                                kNodes);
 
-    let replTest = new ReplSetTest({nodes: kNodes});
-    replTest.startSet({verbose: 1});
-    replTest.initiate();
+txnNumber++;
+runWriteConcernRetryabilityTest(priConn,
+                                secConn,
+                                {
+                                    delete: 'user',
+                                    deletes: [{q: {x: 1}, limit: 1}, {q: {y: 1}, limit: 1}],
+                                    ordered: false,
+                                    lsid: {id: lsid},
+                                    txnNumber: NumberLong(txnNumber),
+                                    writeConcern: {w: 'majority', wtimeout: 200},
+                                },
+                                kNodes);
 
-    let priConn = replTest.getPrimary();
-    let secConn = replTest.getSecondary();
+txnNumber++;
+runWriteConcernRetryabilityTest(priConn,
+                                secConn,
+                                {
+                                    findAndModify: 'user',
+                                    query: {_id: 60},
+                                    update: {$inc: {x: 1}},
+                                    new: true,
+                                    upsert: true,
+                                    lsid: {id: lsid},
+                                    txnNumber: NumberLong(txnNumber),
+                                    writeConcern: {w: 'majority', wtimeout: 200},
+                                },
+                                kNodes);
 
-    let lsid = UUID();
+txnNumber++;
+runWriteConcernRetryabilityTest(priConn,
+                                secConn,
+                                {
+                                    commitTransaction: 1,
+                                    lsid: {id: lsid},
+                                    txnNumber: NumberLong(txnNumber),
+                                    autocommit: false,
+                                    writeConcern: {w: 'majority', wtimeout: 200},
+                                },
+                                kNodes,
+                                'admin',
+                                function(conn) {
+                                    assert.commandWorked(conn.getDB('test').runCommand({
+                                        insert: 'user',
+                                        documents: [{_id: 80}, {_id: 90}],
+                                        ordered: false,
+                                        lsid: {id: lsid},
+                                        txnNumber: NumberLong(txnNumber),
+                                        readConcern: {level: 'snapshot'},
+                                        autocommit: false,
+                                        startTransaction: true
+                                    }));
+                                });
 
-    runTest(priConn, secConn, {
-        insert: 'user',
-        documents: [{_id: 10}, {_id: 30}],
-        ordered: false,
-        lsid: {id: lsid},
-        txnNumber: NumberLong(34),
-        writeConcern: {w: 'majority', wtimeout: 200},
-    });
+txnNumber++;
+runWriteConcernRetryabilityTest(priConn,
+                                secConn,
+                                {
+                                    prepareTransaction: 1,
+                                    lsid: {id: lsid},
+                                    txnNumber: NumberLong(txnNumber),
+                                    autocommit: false,
+                                    writeConcern: {w: 'majority', wtimeout: 200},
+                                },
+                                kNodes,
+                                'admin',
+                                function(conn) {
+                                    assert.commandWorked(conn.getDB('test').runCommand({
+                                        insert: 'user',
+                                        documents: [{_id: 100}, {_id: 110}],
+                                        ordered: false,
+                                        lsid: {id: lsid},
+                                        txnNumber: NumberLong(txnNumber),
+                                        readConcern: {level: 'snapshot'},
+                                        autocommit: false,
+                                        startTransaction: true
+                                    }));
+                                });
+assert.commandWorked(priConn.adminCommand({
+    abortTransaction: 1,
+    lsid: {id: lsid},
+    txnNumber: NumberLong(txnNumber),
+    autocommit: false,
+    writeConcern: {w: 'majority'},
+}));
 
-    runTest(priConn, secConn, {
-        update: 'user',
-        updates: [
-            {q: {_id: 10}, u: {$inc: {x: 1}}},
-        ],
-        ordered: false,
-        lsid: {id: lsid},
-        txnNumber: NumberLong(35),
-        writeConcern: {w: 'majority', wtimeout: 200},
-    });
+txnNumber++;
+runWriteConcernRetryabilityTest(priConn,
+                                secConn,
+                                {
+                                    abortTransaction: 1,
+                                    lsid: {id: lsid},
+                                    txnNumber: NumberLong(txnNumber),
+                                    autocommit: false,
+                                    writeConcern: {w: 'majority', wtimeout: 200},
+                                },
+                                kNodes,
+                                'admin',
+                                function(conn) {
+                                    assert.commandWorked(conn.getDB('test').runCommand({
+                                        insert: 'user',
+                                        documents: [{_id: 120}, {_id: 130}],
+                                        ordered: false,
+                                        lsid: {id: lsid},
+                                        txnNumber: NumberLong(txnNumber),
+                                        readConcern: {level: 'snapshot'},
+                                        autocommit: false,
+                                        startTransaction: true
+                                    }));
+                                    assert.commandWorked(conn.adminCommand({
+                                        prepareTransaction: 1,
+                                        lsid: {id: lsid},
+                                        txnNumber: NumberLong(txnNumber),
+                                        autocommit: false,
+                                        writeConcern: {w: 'majority'},
+                                    }));
+                                });
 
-    runTest(priConn, secConn, {
-        delete: 'user',
-        deletes: [{q: {x: 1}, limit: 1}, {q: {y: 1}, limit: 1}],
-        ordered: false,
-        lsid: {id: lsid},
-        txnNumber: NumberLong(36),
-        writeConcern: {w: 'majority', wtimeout: 200},
-    });
+txnNumber++;
+assert.commandWorked(priConn.getDB('test').runCommand({
+    insert: 'user',
+    documents: [{_id: 140}, {_id: 150}],
+    ordered: false,
+    lsid: {id: lsid},
+    txnNumber: NumberLong(txnNumber),
+    readConcern: {level: 'snapshot'},
+    autocommit: false,
+    startTransaction: true
+}));
+const prepareTS = assert
+                      .commandWorked(priConn.adminCommand({
+                          prepareTransaction: 1,
+                          lsid: {id: lsid},
+                          txnNumber: NumberLong(txnNumber),
+                          autocommit: false,
+                          writeConcern: {w: 'majority'},
+                      }))
+                      .prepareTimestamp;
+runWriteConcernRetryabilityTest(priConn,
+                                secConn,
+                                {
+                                    commitTransaction: 1,
+                                    commitTimestamp: prepareTS,
+                                    lsid: {id: lsid},
+                                    txnNumber: NumberLong(txnNumber),
+                                    autocommit: false,
+                                    writeConcern: {w: 'majority', wtimeout: 200},
+                                },
+                                kNodes,
+                                'admin');
 
-    runTest(priConn, secConn, {
-        findAndModify: 'user',
-        query: {_id: 60},
-        update: {$inc: {x: 1}},
-        new: true,
-        upsert: true,
-        lsid: {id: lsid},
-        txnNumber: NumberLong(37),
-        writeConcern: {w: 'majority', wtimeout: 200},
-    });
-
-    replTest.stopSet();
+replTest.stopSet();
 })();

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,6 +29,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
 #include <set>
 #include <string>
 
@@ -35,24 +37,24 @@
 #include "mongo/db/key_generator.h"
 #include "mongo/db/keys_collection_client_sharded.h"
 #include "mongo/db/keys_collection_document.h"
-#include "mongo/db/logical_clock.h"
+#include "mongo/db/s/config/config_server_test_fixture.h"
+#include "mongo/db/vector_clock_mutable.h"
 #include "mongo/s/catalog/dist_lock_manager_mock.h"
-#include "mongo/s/config_server_test_fixture.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
+namespace {
 
 class KeyGeneratorUpdateTest : public ConfigServerTestFixture {
 protected:
     void setUp() override {
         ConfigServerTestFixture::setUp();
 
-        auto clockSource = stdx::make_unique<ClockSourceMock>();
+        auto clockSource = std::make_unique<ClockSourceMock>();
         operationContext()->getServiceContext()->setFastClockSource(std::move(clockSource));
-        _catalogClient = stdx::make_unique<KeysCollectionClientSharded>(
+        _catalogClient = std::make_unique<KeysCollectionClientSharded>(
             Grid::get(operationContext())->catalogClient());
     }
 
@@ -66,7 +68,7 @@ protected:
      */
     std::unique_ptr<DistLockManager> makeDistLockManager(
         std::unique_ptr<DistLockCatalog> distLockCatalog) override {
-        return stdx::make_unique<DistLockManagerMock>(std::move(distLockCatalog));
+        return std::make_unique<DistLockManagerMock>(std::move(distLockCatalog));
     }
 
 private:
@@ -77,7 +79,8 @@ TEST_F(KeyGeneratorUpdateTest, ShouldCreate2KeysFromEmpty) {
     KeyGenerator generator("dummy", catalogClient(), Seconds(5));
 
     const LogicalTime currentTime(LogicalTime(Timestamp(100, 2)));
-    LogicalClock::get(operationContext())->setClusterTimeFromTrustedSource(currentTime);
+    VectorClockMutable::get(operationContext())
+        ->tickTo(VectorClock::Component::ClusterTime, currentTime);
 
     auto generateStatus = generator.generateNewKeysIfNeeded(operationContext());
     ASSERT_OK(generateStatus);
@@ -103,7 +106,8 @@ TEST_F(KeyGeneratorUpdateTest, ShouldPropagateWriteError) {
     KeyGenerator generator("dummy", catalogClient(), Seconds(5));
 
     const LogicalTime currentTime(LogicalTime(Timestamp(100, 2)));
-    LogicalClock::get(operationContext())->setClusterTimeFromTrustedSource(currentTime);
+    VectorClockMutable::get(operationContext())
+        ->tickTo(VectorClock::Component::ClusterTime, currentTime);
 
     FailPointEnableBlock failWriteBlock("failCollectionInserts");
 
@@ -114,8 +118,8 @@ TEST_F(KeyGeneratorUpdateTest, ShouldPropagateWriteError) {
 TEST_F(KeyGeneratorUpdateTest, ShouldCreateAnotherKeyIfOnlyOneKeyExists) {
     KeyGenerator generator("dummy", catalogClient(), Seconds(5));
 
-    LogicalClock::get(operationContext())
-        ->setClusterTimeFromTrustedSource(LogicalTime(Timestamp(100, 2)));
+    VectorClockMutable::get(operationContext())
+        ->tickTo(VectorClock::Component::ClusterTime, LogicalTime(Timestamp(100, 2)));
 
     KeysCollectionDocument origKey1(
         1, "dummy", TimeProofService::generateRandomKey(), LogicalTime(Timestamp(105, 0)));
@@ -133,7 +137,8 @@ TEST_F(KeyGeneratorUpdateTest, ShouldCreateAnotherKeyIfOnlyOneKeyExists) {
         ASSERT_EQ(Timestamp(105, 0), key1.getExpiresAt().asTimestamp());
     }
 
-    auto currentTime = LogicalClock::get(operationContext())->getClusterTime();
+    auto currentTime =
+        VectorClock::get(operationContext())->getTime()[VectorClock::Component::ClusterTime];
 
     auto generateStatus = generator.generateNewKeysIfNeeded(operationContext());
     ASSERT_OK(generateStatus);
@@ -161,8 +166,8 @@ TEST_F(KeyGeneratorUpdateTest, ShouldCreateAnotherKeyIfOnlyOneKeyExists) {
 TEST_F(KeyGeneratorUpdateTest, ShouldCreateAnotherKeyIfNoValidKeyAfterCurrent) {
     KeyGenerator generator("dummy", catalogClient(), Seconds(5));
 
-    LogicalClock::get(operationContext())
-        ->setClusterTimeFromTrustedSource(LogicalTime(Timestamp(108, 2)));
+    VectorClockMutable::get(operationContext())
+        ->tickTo(VectorClock::Component::ClusterTime, LogicalTime(Timestamp(108, 2)));
 
     KeysCollectionDocument origKey1(
         1, "dummy", TimeProofService::generateRandomKey(), LogicalTime(Timestamp(105, 0)));
@@ -190,7 +195,8 @@ TEST_F(KeyGeneratorUpdateTest, ShouldCreateAnotherKeyIfNoValidKeyAfterCurrent) {
         ASSERT_EQ(Timestamp(110, 0), key2.getExpiresAt().asTimestamp());
     }
 
-    auto currentTime = LogicalClock::get(operationContext())->getClusterTime();
+    auto currentTime =
+        VectorClock::get(operationContext())->getTime()[VectorClock::Component::ClusterTime];
 
     auto generateStatus = generator.generateNewKeysIfNeeded(operationContext());
     ASSERT_OK(generateStatus);
@@ -244,8 +250,8 @@ TEST_F(KeyGeneratorUpdateTest, ShouldCreateAnotherKeyIfNoValidKeyAfterCurrent) {
 TEST_F(KeyGeneratorUpdateTest, ShouldCreate2KeysIfAllKeysAreExpired) {
     KeyGenerator generator("dummy", catalogClient(), Seconds(5));
 
-    LogicalClock::get(operationContext())
-        ->setClusterTimeFromTrustedSource(LogicalTime(Timestamp(120, 2)));
+    VectorClockMutable::get(operationContext())
+        ->tickTo(VectorClock::Component::ClusterTime, LogicalTime(Timestamp(120, 2)));
 
     KeysCollectionDocument origKey1(
         1, "dummy", TimeProofService::generateRandomKey(), LogicalTime(Timestamp(105, 0)));
@@ -273,7 +279,8 @@ TEST_F(KeyGeneratorUpdateTest, ShouldCreate2KeysIfAllKeysAreExpired) {
         ASSERT_EQ(Timestamp(110, 0), key2.getExpiresAt().asTimestamp());
     }
 
-    auto currentTime = LogicalClock::get(operationContext())->getClusterTime();
+    auto currentTime =
+        VectorClock::get(operationContext())->getTime()[VectorClock::Component::ClusterTime];
 
     auto generateStatus = generator.generateNewKeysIfNeeded(operationContext());
     ASSERT_OK(generateStatus);
@@ -342,7 +349,8 @@ TEST_F(KeyGeneratorUpdateTest, ShouldNotCreateNewKeyIfThereAre2UnexpiredKeys) {
     KeyGenerator generator("dummy", catalogClient(), Seconds(5));
 
     const LogicalTime currentTime(LogicalTime(Timestamp(100, 2)));
-    LogicalClock::get(operationContext())->setClusterTimeFromTrustedSource(currentTime);
+    VectorClockMutable::get(operationContext())
+        ->tickTo(VectorClock::Component::ClusterTime, currentTime);
 
     KeysCollectionDocument origKey1(
         1, "dummy", TimeProofService::generateRandomKey(), LogicalTime(Timestamp(105, 0)));
@@ -401,7 +409,8 @@ TEST_F(KeyGeneratorUpdateTest, ShouldNotCreateKeysWithDisableKeyGenerationFailPo
     KeyGenerator generator("dummy", catalogClient(), Seconds(5));
 
     const LogicalTime currentTime(LogicalTime(Timestamp(100, 0)));
-    LogicalClock::get(operationContext())->setClusterTimeFromTrustedSource(currentTime);
+    VectorClockMutable::get(operationContext())
+        ->tickTo(VectorClock::Component::ClusterTime, currentTime);
 
     {
         FailPointEnableBlock failKeyGenerationBlock("disableKeyGeneration");
@@ -415,4 +424,5 @@ TEST_F(KeyGeneratorUpdateTest, ShouldNotCreateKeysWithDisableKeyGenerationFailPo
     ASSERT_EQ(0U, allKeys.size());
 }
 
+}  // namespace
 }  // namespace mongo

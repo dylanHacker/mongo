@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,18 +27,21 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
+#include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_shard.h"
+#include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/config_server_test_fixture.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -60,7 +64,12 @@ public:
         _shard2.setName("shard0002");
         _shard2.setHost("s:2");
 
-        ASSERT_OK(setupShards({_shard1, _shard2}));
+        _zoneName = "zoneName";
+        _shardKey = "x";
+        _min = BSON(_shardKey << 0);
+        _max = BSON(_shardKey << 10);
+
+        setupShards({_shard1, _shard2});
 
         auto shard1Targeter = RemoteCommandTargeterMock::get(
             uassertStatusOK(shardRegistry()->getShard(operationContext(), _shard1.getName()))
@@ -71,15 +80,38 @@ public:
             uassertStatusOK(shardRegistry()->getShard(operationContext(), _shard2.getName()))
                 ->getTargeter());
         shard2Targeter->setFindHostReturnValue(HostAndPort(_shard2.getHost()));
+
+        // insert documents into the config database
+        CollectionType shardedCollection;
+        shardedCollection.setNs(dropNS());
+        shardedCollection.setEpoch(OID::gen());
+        shardedCollection.setKeyPattern(BSON(_shardKey << 1));
+        ASSERT_OK(insertToConfigCollection(
+            operationContext(), CollectionType::ConfigNS, shardedCollection.toBSON()));
+
+        BSONObjBuilder tagDocBuilder;
+        tagDocBuilder.append("_id", BSON(TagsType::ns(dropNS().ns()) << TagsType::min(_min)));
+        tagDocBuilder.append(TagsType::ns(), dropNS().ns());
+        tagDocBuilder.append(TagsType::min(), _min);
+        tagDocBuilder.append(TagsType::max(), _max);
+        tagDocBuilder.append(TagsType::tag(), _zoneName);
+        ASSERT_OK(
+            insertToConfigCollection(operationContext(), TagsType::ConfigNS, tagDocBuilder.obj()));
+
+        BSONObjBuilder chunkDocBuilder;
+        chunkDocBuilder.append("ns", dropNS().ns());
+        chunkDocBuilder.append("min", _min);
+        chunkDocBuilder.append("max", _max);
+        chunkDocBuilder.append("shard", _shard1.getName());
+        ASSERT_OK(insertToConfigCollection(
+            operationContext(), ChunkType::ConfigNS, chunkDocBuilder.obj()));
     }
 
     void expectDrop(const ShardType& shard) {
         onCommand([this, shard](const RemoteCommandRequest& request) {
             ASSERT_EQ(HostAndPort(shard.getHost()), request.target);
             ASSERT_EQ(_dropNS.db(), request.dbname);
-            ASSERT_BSONOBJ_EQ(BSON("drop" << _dropNS.coll() << "writeConcern"
-                                          << BSON("w" << 0 << "wtimeout" << 0)),
-                              request.cmdObj);
+            ASSERT_BSONOBJ_EQ(BSON("drop" << _dropNS.coll()), request.cmdObj);
 
             ASSERT_BSONOBJ_EQ(rpc::makeEmptyMetadata(),
                               rpc::TrackingMetadata::removeTrackingData(request.metadata));
@@ -93,28 +125,33 @@ public:
             HostAndPort(shard.getHost()), shard, dropNS(), ChunkVersion::DROPPED());
     }
 
-    void expectUnsetSharding(const ShardType& shard) {
-        onCommand([shard](const RemoteCommandRequest& request) {
-            ASSERT_EQ(HostAndPort(shard.getHost()), request.target);
-            ASSERT_EQ("admin", request.dbname);
-            ASSERT_BSONOBJ_EQ(BSON("unsetSharding" << 1), request.cmdObj);
+    void expectCollectionDocMarkedAsDropped() {
+        auto findStatus =
+            findOneOnConfigCollection(operationContext(), CollectionType::ConfigNS, BSONObj());
+        ASSERT_OK(findStatus.getStatus());
+        ASSERT_TRUE(findStatus.getValue().getField("dropped"));
+    }
 
-            ASSERT_BSONOBJ_EQ(rpc::makeEmptyMetadata(),
-                              rpc::TrackingMetadata::removeTrackingData(request.metadata));
+    void expectNoChunkDocs() {
+        auto findStatus =
+            findOneOnConfigCollection(operationContext(), ChunkType::ConfigNS, BSONObj());
+        ASSERT_EQ(ErrorCodes::NoMatchingDocument, findStatus);
+    }
 
-            return BSON("n" << 1 << "ok" << 1);
-        });
+    void expectNoTagDocs() {
+        auto findStatus =
+            findOneOnConfigCollection(operationContext(), TagsType::ConfigNS, BSONObj());
+        ASSERT_EQ(ErrorCodes::NoMatchingDocument, findStatus);
     }
 
     void shutdownExecutor() {
         ConfigServerTestFixture::executor()->shutdown();
     }
 
-    Status doDrop() {
-        ON_BLOCK_EXIT([&] { Client::destroy(); });
-        Client::initThreadIfNotAlready("Test");
+    void doDrop() {
+        ThreadClient tc("Test", getGlobalServiceContext());
         auto opCtx = cc().makeOperationContext();
-        return ShardingCatalogManager::get(opCtx.get())->dropCollection(opCtx.get(), dropNS());
+        ShardingCatalogManager::get(opCtx.get())->dropCollection(opCtx.get(), dropNS());
     }
 
     const NamespaceString& dropNS() const {
@@ -133,38 +170,35 @@ private:
     const NamespaceString _dropNS{"test.user"};
     ShardType _shard1;
     ShardType _shard2;
+    string _zoneName;
+    string _shardKey;
+    BSONObj _min;
+    BSONObj _max;
 };
 
 TEST_F(DropColl2ShardTest, Basic) {
-    auto future = launchAsync([this] {
-        auto status = doDrop();
-        ASSERT_OK(status);
-    });
+    auto future = launchAsync([this] { doDrop(); });
 
     expectDrop(shard1());
     expectDrop(shard2());
 
     expectSetShardVersionZero(shard1());
-    expectUnsetSharding(shard1());
-
     expectSetShardVersionZero(shard2());
-    expectUnsetSharding(shard2());
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
+
+    expectCollectionDocMarkedAsDropped();
+    expectNoChunkDocs();
+    expectNoTagDocs();
 }
 
 TEST_F(DropColl2ShardTest, NSNotFound) {
-    auto future = launchAsync([this] {
-        auto status = doDrop();
-        ASSERT_OK(status);
-    });
+    auto future = launchAsync([this] { doDrop(); });
 
     onCommand([this](const RemoteCommandRequest& request) {
         ASSERT_EQ(HostAndPort(shard1().getHost()), request.target);
         ASSERT_EQ(dropNS().db(), request.dbname);
-        ASSERT_BSONOBJ_EQ(
-            BSON("drop" << dropNS().coll() << "writeConcern" << BSON("w" << 0 << "wtimeout" << 0)),
-            request.cmdObj);
+        ASSERT_BSONOBJ_EQ(BSON("drop" << dropNS().coll()), request.cmdObj);
 
         ASSERT_BSONOBJ_EQ(rpc::makeEmptyMetadata(),
                           rpc::TrackingMetadata::removeTrackingData(request.metadata));
@@ -175,9 +209,7 @@ TEST_F(DropColl2ShardTest, NSNotFound) {
     onCommand([this](const RemoteCommandRequest& request) {
         ASSERT_EQ(HostAndPort(shard2().getHost()), request.target);
         ASSERT_EQ(dropNS().db(), request.dbname);
-        ASSERT_BSONOBJ_EQ(
-            BSON("drop" << dropNS().coll() << "writeConcern" << BSON("w" << 0 << "wtimeout" << 0)),
-            request.cmdObj);
+        ASSERT_BSONOBJ_EQ(BSON("drop" << dropNS().coll()), request.cmdObj);
 
         ASSERT_BSONOBJ_EQ(rpc::makeEmptyMetadata(),
                           rpc::TrackingMetadata::removeTrackingData(request.metadata));
@@ -186,12 +218,13 @@ TEST_F(DropColl2ShardTest, NSNotFound) {
     });
 
     expectSetShardVersionZero(shard1());
-    expectUnsetSharding(shard1());
-
     expectSetShardVersionZero(shard2());
-    expectUnsetSharding(shard2());
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
+
+    expectCollectionDocMarkedAsDropped();
+    expectNoChunkDocs();
+    expectNoTagDocs();
 }
 
 TEST_F(DropColl2ShardTest, FirstShardTargeterError) {
@@ -200,45 +233,22 @@ TEST_F(DropColl2ShardTest, FirstShardTargeterError) {
             ->getTargeter());
     shard1Targeter->setFindHostReturnValue({ErrorCodes::HostUnreachable, "bad test network"});
 
-    auto future = launchAsync([this] {
-        auto status = doDrop();
-        ASSERT_EQ(ErrorCodes::HostUnreachable, status.code());
-        ASSERT_FALSE(status.reason().empty());
-    });
+    auto future = launchAsync(
+        [this] { ASSERT_THROWS_CODE(doDrop(), AssertionException, ErrorCodes::HostUnreachable); });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DropColl2ShardTest, FirstShardDropError) {
-    auto future = launchAsync([this] {
-        auto status = doDrop();
-        ASSERT_EQ(ErrorCodes::CallbackCanceled, status.code());
-        ASSERT_FALSE(status.reason().empty());
-    });
+    auto future = launchAsync(
+        [this] { ASSERT_THROWS_CODE(doDrop(), AssertionException, ErrorCodes::CallbackCanceled); });
 
     onCommand([this](const RemoteCommandRequest& request) {
         shutdownExecutor();  // shutdown executor so drop command will fail.
         return BSON("ok" << 1);
     });
 
-    future.timed_get(kFutureTimeout);
-}
-
-TEST_F(DropColl2ShardTest, FirstShardDropCmdError) {
-    auto future = launchAsync([this] {
-        auto status = doDrop();
-        ASSERT_EQ(ErrorCodes::OperationFailed, status.code());
-        ASSERT_FALSE(status.reason().empty());
-    });
-
-    // drop command will be sent to all shards even if we get a not ok response from one shard.
-    onCommand([](const RemoteCommandRequest& request) {
-        return BSON("ok" << 0 << "code" << ErrorCodes::Unauthorized);
-    });
-
-    expectDrop(shard2());
-
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DropColl2ShardTest, SecondShardTargeterError) {
@@ -247,23 +257,17 @@ TEST_F(DropColl2ShardTest, SecondShardTargeterError) {
             ->getTargeter());
     shard2Targeter->setFindHostReturnValue({ErrorCodes::HostUnreachable, "bad test network"});
 
-    auto future = launchAsync([this] {
-        auto status = doDrop();
-        ASSERT_EQ(ErrorCodes::HostUnreachable, status.code());
-        ASSERT_FALSE(status.reason().empty());
-    });
+    auto future = launchAsync(
+        [this] { ASSERT_THROWS_CODE(doDrop(), AssertionException, ErrorCodes::HostUnreachable); });
 
     expectDrop(shard1());
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DropColl2ShardTest, SecondShardDropError) {
-    auto future = launchAsync([this] {
-        auto status = doDrop();
-        ASSERT_EQ(ErrorCodes::CallbackCanceled, status.code());
-        ASSERT_FALSE(status.reason().empty());
-    });
+    auto future = launchAsync(
+        [this] { ASSERT_THROWS_CODE(doDrop(), AssertionException, ErrorCodes::CallbackCanceled); });
 
     expectDrop(shard1());
 
@@ -272,15 +276,12 @@ TEST_F(DropColl2ShardTest, SecondShardDropError) {
         return BSON("ok" << 1);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DropColl2ShardTest, SecondShardDropCmdError) {
-    auto future = launchAsync([this] {
-        auto status = doDrop();
-        ASSERT_EQ(ErrorCodes::OperationFailed, status.code());
-        ASSERT_FALSE(status.reason().empty());
-    });
+    auto future = launchAsync(
+        [this] { ASSERT_THROWS_CODE(doDrop(), AssertionException, ErrorCodes::Unauthorized); });
 
     expectDrop(shard1());
 
@@ -288,15 +289,12 @@ TEST_F(DropColl2ShardTest, SecondShardDropCmdError) {
         return BSON("ok" << 0 << "code" << ErrorCodes::Unauthorized);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DropColl2ShardTest, CleanupChunkError) {
-    auto future = launchAsync([this] {
-        auto status = doDrop();
-        ASSERT_EQ(ErrorCodes::Unauthorized, status.code());
-        ASSERT_FALSE(status.reason().empty());
-    });
+    auto future = launchAsync(
+        [this] { ASSERT_THROWS_CODE(doDrop(), AssertionException, ErrorCodes::Unauthorized); });
 
     expectDrop(shard1());
     expectDrop(shard2());
@@ -306,15 +304,16 @@ TEST_F(DropColl2ShardTest, CleanupChunkError) {
                          << "bad delete");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
+
+    expectCollectionDocMarkedAsDropped();
+    expectNoChunkDocs();
+    expectNoTagDocs();
 }
 
 TEST_F(DropColl2ShardTest, SSVCmdErrorOnShard1) {
-    auto future = launchAsync([this] {
-        auto status = doDrop();
-        ASSERT_EQ(ErrorCodes::Unauthorized, status.code());
-        ASSERT_FALSE(status.reason().empty());
-    });
+    auto future = launchAsync(
+        [this] { ASSERT_THROWS_CODE(doDrop(), AssertionException, ErrorCodes::Unauthorized); });
 
     expectDrop(shard1());
     expectDrop(shard2());
@@ -324,15 +323,16 @@ TEST_F(DropColl2ShardTest, SSVCmdErrorOnShard1) {
                          << "bad");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
+
+    expectCollectionDocMarkedAsDropped();
+    expectNoChunkDocs();
+    expectNoTagDocs();
 }
 
 TEST_F(DropColl2ShardTest, SSVErrorOnShard1) {
-    auto future = launchAsync([this] {
-        auto status = doDrop();
-        ASSERT_EQ(ErrorCodes::CallbackCanceled, status.code());
-        ASSERT_FALSE(status.reason().empty());
-    });
+    auto future = launchAsync(
+        [this] { ASSERT_THROWS_CODE(doDrop(), AssertionException, ErrorCodes::CallbackCanceled); });
 
     expectDrop(shard1());
     expectDrop(shard2());
@@ -342,136 +342,142 @@ TEST_F(DropColl2ShardTest, SSVErrorOnShard1) {
         return BSON("ok" << 1);
     });
 
-    future.timed_get(kFutureTimeout);
-}
+    future.default_timed_get();
 
-TEST_F(DropColl2ShardTest, UnsetCmdErrorOnShard1) {
-    auto future = launchAsync([this] {
-        auto status = doDrop();
-        ASSERT_EQ(ErrorCodes::Unauthorized, status.code());
-        ASSERT_FALSE(status.reason().empty());
-    });
-
-    expectDrop(shard1());
-    expectDrop(shard2());
-
-    expectSetShardVersionZero(shard1());
-
-    onCommand([](const RemoteCommandRequest& request) {
-        return BSON("ok" << 0 << "code" << ErrorCodes::Unauthorized << "errmsg"
-                         << "bad");
-    });
-
-    future.timed_get(kFutureTimeout);
-}
-
-TEST_F(DropColl2ShardTest, UnsetErrorOnShard1) {
-    auto future = launchAsync([this] {
-        auto status = doDrop();
-        ASSERT_EQ(ErrorCodes::CallbackCanceled, status.code());
-        ASSERT_FALSE(status.reason().empty());
-    });
-
-    expectDrop(shard1());
-    expectDrop(shard2());
-
-    expectSetShardVersionZero(shard1());
-
-    onCommand([this](const RemoteCommandRequest& request) {
-        shutdownExecutor();  // shutdown executor so unsetSharding command will fail.
-        return BSON("ok" << 1);
-    });
-
-    future.timed_get(kFutureTimeout);
+    expectCollectionDocMarkedAsDropped();
+    expectNoChunkDocs();
+    expectNoTagDocs();
 }
 
 TEST_F(DropColl2ShardTest, SSVCmdErrorOnShard2) {
-    auto future = launchAsync([this] {
-        auto status = doDrop();
-        ASSERT_EQ(ErrorCodes::Unauthorized, status.code());
-        ASSERT_FALSE(status.reason().empty());
-    });
+    auto future = launchAsync(
+        [this] { ASSERT_THROWS_CODE(doDrop(), AssertionException, ErrorCodes::Unauthorized); });
 
     expectDrop(shard1());
     expectDrop(shard2());
 
     expectSetShardVersionZero(shard1());
-    expectUnsetSharding(shard1());
 
     onCommand([](const RemoteCommandRequest& request) {
         return BSON("ok" << 0 << "code" << ErrorCodes::Unauthorized << "errmsg"
                          << "bad");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
+
+    expectCollectionDocMarkedAsDropped();
+    expectNoChunkDocs();
+    expectNoTagDocs();
 }
 
 TEST_F(DropColl2ShardTest, SSVErrorOnShard2) {
-    auto future = launchAsync([this] {
-        auto status = doDrop();
-        ASSERT_EQ(ErrorCodes::CallbackCanceled, status.code());
-        ASSERT_FALSE(status.reason().empty());
-    });
+    auto future = launchAsync(
+        [this] { ASSERT_THROWS_CODE(doDrop(), AssertionException, ErrorCodes::CallbackCanceled); });
 
     expectDrop(shard1());
     expectDrop(shard2());
 
     expectSetShardVersionZero(shard1());
-    expectUnsetSharding(shard1());
 
     onCommand([this](const RemoteCommandRequest& request) {
         shutdownExecutor();  // shutdown executor so ssv command will fail.
         return BSON("ok" << 1);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
+
+    expectCollectionDocMarkedAsDropped();
+    expectNoChunkDocs();
+    expectNoTagDocs();
 }
 
-TEST_F(DropColl2ShardTest, UnsetCmdErrorOnShard2) {
-    auto future = launchAsync([this] {
-        auto status = doDrop();
-        ASSERT_EQ(ErrorCodes::Unauthorized, status.code());
-        ASSERT_FALSE(status.reason().empty());
-    });
+/**
+ * Tests of dropCollection retry behavior.
+ */
+
+TEST_F(DropColl2ShardTest, AfterSuccessRetryWillStillSendDropSSV) {
+    auto firstDropFuture = launchAsync([this] { doDrop(); });
 
     expectDrop(shard1());
     expectDrop(shard2());
 
     expectSetShardVersionZero(shard1());
-    expectUnsetSharding(shard1());
-
     expectSetShardVersionZero(shard2());
 
-    onCommand([](const RemoteCommandRequest& request) {
-        return BSON("ok" << 0 << "code" << ErrorCodes::Unauthorized << "errmsg"
-                         << "bad");
-    });
+    firstDropFuture.default_timed_get();
 
-    future.timed_get(kFutureTimeout);
-}
+    expectCollectionDocMarkedAsDropped();
+    expectNoChunkDocs();
+    expectNoTagDocs();
 
-TEST_F(DropColl2ShardTest, UnsetErrorOnShard2) {
-    auto future = launchAsync([this] {
-        auto status = doDrop();
-        ASSERT_EQ(ErrorCodes::CallbackCanceled, status.code());
-        ASSERT_FALSE(status.reason().empty());
-    });
+    auto secondDropFuture = launchAsync([this] { doDrop(); });
 
     expectDrop(shard1());
     expectDrop(shard2());
 
     expectSetShardVersionZero(shard1());
-    expectUnsetSharding(shard1());
-
     expectSetShardVersionZero(shard2());
+
+    secondDropFuture.default_timed_get();
+
+    expectCollectionDocMarkedAsDropped();
+    expectNoChunkDocs();
+    expectNoTagDocs();
+}
+
+TEST_F(DropColl2ShardTest, AfterFailedDropRetryWillStillSendDropSSV) {
+    auto firstDropFuture = launchAsync(
+        [this] { ASSERT_THROWS_CODE(doDrop(), AssertionException, ErrorCodes::Unauthorized); });
 
     onCommand([this](const RemoteCommandRequest& request) {
-        shutdownExecutor();  // shutdown executor so unset command will fail.
-        return BSON("ok" << 1);
+        return BSON("ok" << 0 << "code" << ErrorCodes::Unauthorized);
     });
 
-    future.timed_get(kFutureTimeout);
+    firstDropFuture.default_timed_get();
+
+    auto secondDropFuture = launchAsync([this] { doDrop(); });
+
+    expectDrop(shard1());
+    expectDrop(shard2());
+
+    expectSetShardVersionZero(shard1());
+    expectSetShardVersionZero(shard2());
+
+    secondDropFuture.default_timed_get();
+
+    expectCollectionDocMarkedAsDropped();
+    expectNoChunkDocs();
+    expectNoTagDocs();
+    expectNoTagDocs();
 }
 
+TEST_F(DropColl2ShardTest, AfterFailedSSVRetryWillStillSendDropSSV) {
+    auto firstDropFuture = launchAsync(
+        [this] { ASSERT_THROWS_CODE(doDrop(), AssertionException, ErrorCodes::Unauthorized); });
+
+    expectDrop(shard1());
+    expectDrop(shard2());
+
+    onCommand([this](const RemoteCommandRequest& request) {
+        return BSON("ok" << 0 << "code" << ErrorCodes::Unauthorized);
+    });
+
+    firstDropFuture.default_timed_get();
+
+    auto secondDropFuture = launchAsync([this] { doDrop(); });
+
+    expectDrop(shard1());
+    expectDrop(shard2());
+
+    expectSetShardVersionZero(shard1());
+    expectSetShardVersionZero(shard2());
+
+    secondDropFuture.default_timed_get();
+
+    expectCollectionDocMarkedAsDropped();
+    expectNoChunkDocs();
+    expectNoTagDocs();
+    expectNoTagDocs();
+}
 }  // unnamed namespace
 }  // namespace mongo

@@ -1,32 +1,33 @@
 /**
- * Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -39,7 +40,6 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/s/is_mongos.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -85,13 +85,11 @@ TEST(ClientMetadatTest, TestLoopbackTest) {
         ASSERT_EQUALS("g", swParseStatus.getValue().get().getApplicationName());
 
         BSONObj outDoc =
-            BSON(kMetadataDoc << BSON(
-                     kApplication << BSON(kName << "g") << kDriver
-                                  << BSON(kName << "a" << kVersion << "b")
-                                  << kOperatingSystem
-                                  << BSON(kType << "c" << kName << "d" << kArchitecture << "e"
-                                                << kVersion
-                                                << "f")));
+            BSON(kMetadataDoc << BSON(kApplication
+                                      << BSON(kName << "g") << kDriver
+                                      << BSON(kName << "a" << kVersion << "b") << kOperatingSystem
+                                      << BSON(kType << "c" << kName << "d" << kArchitecture << "e"
+                                                    << kVersion << "f")));
         ASSERT_BSONOBJ_EQ(obj, outDoc);
     }
 
@@ -104,11 +102,11 @@ TEST(ClientMetadatTest, TestLoopbackTest) {
         auto swParseStatus = ClientMetadata::parse(obj[kMetadataDoc]);
         ASSERT_OK(swParseStatus.getStatus());
 
-        BSONObj outDoc = BSON(
-            kMetadataDoc << BSON(
-                kDriver << BSON(kName << "a" << kVersion << "b") << kOperatingSystem
-                        << BSON(kType << "c" << kName << "d" << kArchitecture << "e" << kVersion
-                                      << "f")));
+        BSONObj outDoc =
+            BSON(kMetadataDoc << BSON(kDriver
+                                      << BSON(kName << "a" << kVersion << "b") << kOperatingSystem
+                                      << BSON(kType << "c" << kName << "d" << kArchitecture << "e"
+                                                    << kVersion << "f")));
         ASSERT_BSONOBJ_EQ(obj, outDoc);
     }
 
@@ -149,8 +147,7 @@ TEST(ClientMetadatTest, TestRequiredOnlyFields) {
 
     // With AppName
     ASSERT_DOC_OK(kApplication << BSON(kName << "1") << kDriver
-                               << BSON(kName << "n1" << kVersion << "v1")
-                               << kOperatingSystem
+                               << BSON(kName << "n1" << kVersion << "v1") << kOperatingSystem
                                << BSON(kType << kUnknown));
 }
 
@@ -159,24 +156,20 @@ TEST(ClientMetadatTest, TestRequiredOnlyFields) {
 TEST(ClientMetadatTest, TestWithAppNameSpelledWrong) {
     ASSERT_DOC_OK(kApplication << BSON("extra"
                                        << "1")
-                               << kDriver
-                               << BSON(kName << "n1" << kVersion << "v1")
-                               << kOperatingSystem
-                               << BSON(kType << kUnknown));
+                               << kDriver << BSON(kName << "n1" << kVersion << "v1")
+                               << kOperatingSystem << BSON(kType << kUnknown));
 }
 
 // Positive: test with empty application document
 TEST(ClientMetadatTest, TestWithEmptyApplication) {
     ASSERT_DOC_OK(kApplication << BSONObj() << kDriver << BSON(kName << "n1" << kVersion << "v1")
-                               << kOperatingSystem
-                               << BSON(kType << kUnknown));
+                               << kOperatingSystem << BSON(kType << kUnknown));
 }
 
 // Negative: test with appplication wrong type
 TEST(ClientMetadatTest, TestNegativeWithAppNameWrongType) {
     ASSERT_DOC_NOT_OK(kApplication << "1" << kDriver << BSON(kName << "n1" << kVersion << "v1")
-                                   << kOperatingSystem
-                                   << BSON(kType << kUnknown));
+                                   << kOperatingSystem << BSON(kType << kUnknown));
 }
 
 // Positive: test with extra fields
@@ -184,10 +177,8 @@ TEST(ClientMetadatTest, TestExtraFields) {
     ASSERT_DOC_OK(kApplication << BSON(kName << "1"
                                              << "extra"
                                              << "v1")
-                               << kDriver
-                               << BSON(kName << "n1" << kVersion << "v1")
-                               << kOperatingSystem
-                               << BSON(kType << kUnknown));
+                               << kDriver << BSON(kName << "n1" << kVersion << "v1")
+                               << kOperatingSystem << BSON(kType << kUnknown));
     ASSERT_DOC_OK(kApplication << BSON(kName << "1"
                                              << "extra"
                                              << "v1")
@@ -195,24 +186,19 @@ TEST(ClientMetadatTest, TestExtraFields) {
                                << BSON(kName << "n1" << kVersion << "v1"
                                              << "extra"
                                              << "v1")
-                               << kOperatingSystem
-                               << BSON(kType << kUnknown));
+                               << kOperatingSystem << BSON(kType << kUnknown));
     ASSERT_DOC_OK(kApplication << BSON(kName << "1"
                                              << "extra"
                                              << "v1")
-                               << kDriver
-                               << BSON(kName << "n1" << kVersion << "v1")
+                               << kDriver << BSON(kName << "n1" << kVersion << "v1")
                                << kOperatingSystem
                                << BSON(kType << kUnknown << "extra"
                                              << "v1"));
     ASSERT_DOC_OK(kApplication << BSON(kName << "1"
                                              << "extra"
                                              << "v1")
-                               << kDriver
-                               << BSON(kName << "n1" << kVersion << "v1")
-                               << kOperatingSystem
-                               << BSON(kType << kUnknown)
-                               << "extra"
+                               << kDriver << BSON(kName << "n1" << kVersion << "v1")
+                               << kOperatingSystem << BSON(kType << kUnknown) << "extra"
                                << "v1");
 }
 
@@ -235,46 +221,36 @@ TEST(ClientMetadatTest, TestNegativeMissingRequiredOneField) {
 // Negative: document with wrong types for required fields
 TEST(ClientMetadatTest, TestNegativeWrongTypes) {
     ASSERT_DOC_NOT_OK(kApplication << BSON(kName << 1) << kDriver
-                                   << BSON(kName << "n1" << kVersion << "v1")
-                                   << kOperatingSystem
+                                   << BSON(kName << "n1" << kVersion << "v1") << kOperatingSystem
                                    << BSON(kType << kUnknown));
     ASSERT_DOC_NOT_OK(kApplication << BSON(kName << "1") << kDriver
-                                   << BSON(kName << 1 << kVersion << "v1")
-                                   << kOperatingSystem
+                                   << BSON(kName << 1 << kVersion << "v1") << kOperatingSystem
                                    << BSON(kType << kUnknown));
     ASSERT_DOC_NOT_OK(kApplication << BSON(kName << "1") << kDriver
-                                   << BSON(kName << "n1" << kVersion << 1)
-                                   << kOperatingSystem
+                                   << BSON(kName << "n1" << kVersion << 1) << kOperatingSystem
                                    << BSON(kType << kUnknown));
     ASSERT_DOC_NOT_OK(kApplication << BSON(kName << "1") << kDriver
-                                   << BSON(kName << "n1" << kVersion << "v1")
-                                   << kOperatingSystem
+                                   << BSON(kName << "n1" << kVersion << "v1") << kOperatingSystem
                                    << BSON(kType << 1));
 }
 
 // Negative: document larger than 512 bytes
 TEST(ClientMetadatTest, TestNegativeLargeDocument) {
     bool savedMongos = isMongos();
-    auto unsetMongoS = MakeGuard(&setMongos, savedMongos);
+    auto unsetMongoS = makeGuard([&] { setMongos(savedMongos); });
 
     setMongos(true);
     {
         std::string str(350, 'x');
         ASSERT_DOC_OK(kApplication << BSON(kName << "1") << kDriver
-                                   << BSON(kName << "n1" << kVersion << "1")
-                                   << kOperatingSystem
-                                   << BSON(kType << kUnknown)
-                                   << "extra"
-                                   << str);
+                                   << BSON(kName << "n1" << kVersion << "1") << kOperatingSystem
+                                   << BSON(kType << kUnknown) << "extra" << str);
     }
     {
         std::string str(512, 'x');
         ASSERT_DOC_NOT_OK(kApplication << BSON(kName << "1") << kDriver
-                                       << BSON(kName << "n1" << kVersion << "1")
-                                       << kOperatingSystem
-                                       << BSON(kType << kUnknown)
-                                       << "extra"
-                                       << str);
+                                       << BSON(kName << "n1" << kVersion << "1") << kOperatingSystem
+                                       << BSON(kType << kUnknown) << "extra" << str);
     }
 }
 
@@ -283,8 +259,7 @@ TEST(ClientMetadatTest, TestNegativeLargeAppName) {
     {
         std::string str(128, 'x');
         ASSERT_DOC_OK(kApplication << BSON(kName << str) << kDriver
-                                   << BSON(kName << "n1" << kVersion << "1")
-                                   << kOperatingSystem
+                                   << BSON(kName << "n1" << kVersion << "1") << kOperatingSystem
                                    << BSON(kType << kUnknown));
 
         BSONObjBuilder builder;
@@ -293,8 +268,7 @@ TEST(ClientMetadatTest, TestNegativeLargeAppName) {
     {
         std::string str(129, 'x');
         ASSERT_DOC_NOT_OK(kApplication << BSON(kName << str) << kDriver
-                                       << BSON(kName << "n1" << kVersion << "1")
-                                       << kOperatingSystem
+                                       << BSON(kName << "n1" << kVersion << "1") << kOperatingSystem
                                        << BSON(kType << kUnknown));
 
         BSONObjBuilder builder;
@@ -326,8 +300,7 @@ TEST(ClientMetadatTest, TestMongoSAppend) {
                           << kOperatingSystem
                           << BSON(kType << "c" << kName << "d" << kArchitecture << "e" << kVersion
                                         << "f")
-                          << kMongos
-                          << BSON(kHost << "h" << kClient << "i" << kVersion << "j"));
+                          << kMongos << BSON(kHost << "h" << kClient << "i" << kVersion << "j"));
     ASSERT_BSONOBJ_EQ(doc, outDoc);
 }
 

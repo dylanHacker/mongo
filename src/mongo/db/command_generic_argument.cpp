@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,6 +30,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/command_generic_argument.h"
+#include "mongo/util/string_map.h"
 
 #include <algorithm>
 #include <array>
@@ -41,16 +43,16 @@ namespace {
 
 struct SpecialArgRecord {
     StringData name;
-    bool isGeneric : 1;
-    bool stripFromRequest : 1;
-    bool stripFromReply : 1;
+    bool isGeneric;
+    bool stripFromRequest;
+    bool stripFromReply;
 };
 
 // Not including "help" since we don't pass help requests through to the command parser.
 // If that changes, it should be added. When you add to this list, consider whether you
 // should also change the filterCommandRequestForPassthrough() function.
 // clang-format off
-static constexpr std::array<SpecialArgRecord, 24> specials{{
+static constexpr std::array<SpecialArgRecord, 31> specials{{
     //                                       /-isGeneric
     //                                       |  /-stripFromRequest
     //                                       |  |  /-stripFromReply
@@ -71,37 +73,52 @@ static constexpr std::array<SpecialArgRecord, 24> specials{{
     {"tracking_info"_sd,                     1, 1, 0},
     {"writeConcern"_sd,                      1, 0, 0},
     {"lsid"_sd,                              1, 0, 0},
+    {"clientOperationKey"_sd,                1, 0, 0},
     {"txnNumber"_sd,                         1, 0, 0},
-    {"autocommit"_sd,                        1, 1, 0},
-    {"startTransaction"_sd,                  1, 1, 0},
+    {"autocommit"_sd,                        1, 0, 0},
+    {"coordinator"_sd,                       1, 0, 0},
+    {"startTransaction"_sd,                  1, 0, 0},
     {"stmtId"_sd,                            1, 0, 0},
     {"$gleStats"_sd,                         0, 0, 1},
     {"operationTime"_sd,                     0, 0, 1},
-    {"lastCommittedOpTime"_sd,               0, 0, 1}}};
+    {"lastCommittedOpTime"_sd,               0, 0, 1},
+    {"readOnly"_sd,                          0, 0, 1},
+    {"comment"_sd,                           1, 0, 0},
+    {"maxTimeMSOpOnly"_sd,                   1, 0, 0},
+    {"$configTime"_sd,                       1, 1, 1},
+    {"$topologyTime"_sd,                     1, 1, 1}}};
 // clang-format on
 
-const SpecialArgRecord* findSpecialArg(StringData arg) {
-    for (const auto& e : specials)
-        if (e.name == arg)
-            return &e;
-    return nullptr;
+template <bool SpecialArgRecord::*pmo>
+bool filteredSpecialsContains(StringData arg) {
+    static const auto& filteredNames = *new auto([] {
+        StringSet s;
+        for (const auto& e : specials) {
+            if (e.*pmo) {
+                s.insert(e.name.toString());
+            }
+        }
+        return s;
+    }());
+    return filteredNames.count(arg) > 0;
 }
 
 }  // namespace
 
 bool isGenericArgument(StringData arg) {
-    auto p = findSpecialArg(arg);
-    return p && p->isGeneric;
+    return filteredSpecialsContains<&SpecialArgRecord::isGeneric>(arg);
 }
 
 bool isRequestStripArgument(StringData arg) {
-    auto p = findSpecialArg(arg);
-    return p && p->stripFromRequest;
+    return filteredSpecialsContains<&SpecialArgRecord::stripFromRequest>(arg);
 }
 
 bool isReplyStripArgument(StringData arg) {
-    auto p = findSpecialArg(arg);
-    return p && p->stripFromReply;
+    return filteredSpecialsContains<&SpecialArgRecord::stripFromReply>(arg);
+}
+
+bool isMongocryptdArgument(StringData arg) {
+    return arg == "jsonSchema"_sd;
 }
 
 }  // namespace mongo

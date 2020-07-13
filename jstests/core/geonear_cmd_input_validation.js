@@ -23,9 +23,18 @@ indexTypes.forEach(function(indexType) {
                     pointDescription = (isLegacy ? "legacy coordinates" : "GeoJSON point");
 
                 function makeCommand(distance) {
-                    var command = {geoNear: t.getName(), near: pointType, spherical: spherical};
-                    command[optionName] = distance;
-                    return command;
+                    let geoNearSpec = {
+                        near: pointType,
+                        distanceField: "dist",
+                        spherical: spherical
+                    };
+                    geoNearSpec[optionName] = distance;
+
+                    return {
+                        aggregate: t.getName(),
+                        cursor: {},
+                        pipeline: [{$geoNear: geoNearSpec}],
+                    };
                 }
 
                 // Unsupported combinations should return errors.
@@ -40,22 +49,26 @@ indexTypes.forEach(function(indexType) {
                     return;
                 }
 
-                // This is a supported combination. No error.
-                assert.commandWorked(
-                    db.runCommand({geoNear: t.getName(), near: pointType, spherical: spherical}));
+                // Test that there is no error when not specifying a min or max distance.
+                assert.commandWorked(db.runCommand({
+                    aggregate: t.getName(),
+                    cursor: {},
+                    pipeline: [
+                        {$geoNear: {near: pointType, distanceField: "dist", spherical: spherical}}
+                    ],
+                }));
 
                 // No error with min/maxDistance 1.
-                db.runCommand(makeCommand(1));
+                assert.commandWorked(db.runCommand(makeCommand(1)));
 
                 var outOfRangeDistances = [];
                 if (indexType == '2d') {
                     // maxDistance unlimited; no error.
-                    db.runCommand(makeCommand(1e10));
+                    assert.commandWorked(db.runCommand(makeCommand(1e10)));
                 }
 
                 // Try several bad values for min/maxDistance.
                 badNumbers.concat(outOfRangeDistances).forEach(function(badDistance) {
-
                     var msg = ("geoNear with spherical=" + spherical + " and " + pointDescription +
                                " and " + indexType + " index should've failed with " + optionName +
                                " " + badDistance);
@@ -66,7 +79,6 @@ indexTypes.forEach(function(indexType) {
                 // Bad values for limit / num.
                 ['num', 'limit'].forEach(function(limitOptionName) {
                     [-1, 'foo'].forEach(function(badLimit) {
-
                         var msg =
                             ("geoNear with spherical=" + spherical + " and " + pointDescription +
                              " and " + indexType + " index should've failed with '" +
@@ -80,7 +92,6 @@ indexTypes.forEach(function(indexType) {
 
                 // Bad values for distanceMultiplier.
                 badNumbers.forEach(function(badNumber) {
-
                     var msg = ("geoNear with spherical=" + spherical + " and " + pointDescription +
                                " and " + indexType +
                                " index should've failed with distanceMultiplier " + badNumber);

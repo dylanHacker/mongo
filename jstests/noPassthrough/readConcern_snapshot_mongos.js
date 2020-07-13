@@ -1,161 +1,152 @@
-// Test parsing of readConcern level 'snapshot'.
-// @tags: [requires_replication,requires_sharding]
+// Test parsing of readConcern level 'snapshot' and the presence of the 'atClusterTime' field in
+// snapshot cursor responses on mongos.
+// @tags: [
+//    requires_persistence,
+//    requires_replication,
+//    requires_sharding,
+//    uses_atclustertime,
+//    uses_transactions,
+// ]
 (function() {
-    "use strict";
+"use strict";
 
-    const dbName = "test";
-    const collName = "coll";
+load("jstests/sharding/libs/sharded_transactions_helpers.js");
 
-    let st = new ShardingTest({shards: 1, rs: {nodes: 2}, config: 2, mongos: 1});
-    let testDB = st.getDB(dbName);
-    let coll = testDB.coll;
-
-    let shardDB = st.rs0.getPrimary().getDB(dbName);
-    if (!shardDB.serverStatus().storageEngine.supportsSnapshotReadConcern) {
-        st.stop();
-        return;
+// Runs the command as the first in a multi statement txn that is aborted right after, expecting
+// success.
+function expectSuccessInTxnThenAbort(session, sessionConn, cmdObj) {
+    session.startTransaction();
+    let res = assert.commandWorked(sessionConn.runCommand(cmdObj));
+    // Transaction reads should not have 'atClusterTime' field in responses.
+    if (res.hasOwnProperty("cursor")) {
+        assert(!res.cursor.hasOwnProperty("atClusterTime"), tojson(res));
+    } else {
+        assert(!res.hasOwnProperty("atClusterTime"), tojson(res));
     }
+    assert.commandWorked(session.abortTransaction_forTesting());
+}
 
-    // noPassthrough tests
-    // readConcern 'snapshot' is not allowed outside session context.
-    assert.commandFailedWithCode(
-        testDB.runCommand({find: collName, readConcern: {level: "snapshot"}}),
-        ErrorCodes.InvalidOptions);
+const dbName = "test";
+const collName = "coll";
 
-    let session = testDB.getMongo().startSession({causalConsistency: false});
-    let sessionDb = session.getDatabase(dbName);
+let st = new ShardingTest({shards: 1, rs: {nodes: 2}, config: 2, mongos: 1});
+let testDB = st.getDB(dbName);
 
-    // readConcern 'snapshot' is not allowed outside transaction context.
-    assert.commandFailedWithCode(sessionDb.runCommand({
-        find: collName,
-        readConcern: {level: "snapshot"},
-    }),
-                                 ErrorCodes.InvalidOptions);
+// Insert data to create the collection.
+assert.commandWorked(testDB[collName].insert({x: 1}));
 
-    // readConcern 'snapshot' is not allowed with 'atClusterTime'.
-    let pingRes = assert.commandWorked(st.s0.adminCommand({ping: 1}));
-    assert(pingRes.hasOwnProperty("$clusterTime"), tojson(pingRes));
-    assert(pingRes.$clusterTime.hasOwnProperty("clusterTime"), tojson(pingRes));
-    const clusterTime = pingRes.$clusterTime.clusterTime;
-    let txnNumber = 0;
+flushRoutersAndRefreshShardMetadata(st, {ns: dbName + "." + collName, dbNames: [dbName]});
 
-    assert.commandFailedWithCode(sessionDb.runCommand({
-        find: collName,
-        readConcern: {level: "snapshot", atClusterTime: clusterTime},
-        txnNumber: NumberLong(txnNumber++)
-    }),
-                                 ErrorCodes.InvalidOptions);
+// Test snapshot in a transaction.
+let session = testDB.getMongo().startSession({causalConsistency: false});
+let sessionDb = session.getDatabase(dbName);
 
-    // readConcern 'snapshot' is not supported by insert on mongos.
-    assert.commandFailedWithCode(sessionDb.runCommand({
-        insert: collName,
-        documents: [{_id: "single-insert"}],
-        readConcern: {level: "snapshot"},
-        txnNumber: NumberLong(txnNumber++)
-    }),
-                                 ErrorCodes.InvalidOptions);
+// readConcern 'snapshot' is supported by insert on mongos in a transaction.
+expectSuccessInTxnThenAbort(session, sessionDb, {
+    insert: collName,
+    documents: [{_id: "single-insert"}],
+    readConcern: {level: "snapshot"},
+});
 
-    // readConcern 'snapshot' is not supported by update on mongos.
-    assert.commandFailedWithCode(sessionDb.runCommand({
-        update: collName,
-        updates: [{q: {_id: 0}, u: {$inc: {a: 1}}}],
-        readConcern: {level: "snapshot"},
-        txnNumber: NumberLong(txnNumber++)
-    }),
-                                 ErrorCodes.InvalidOptions);
+// readConcern 'snapshot' is supported by update on mongos in a transaction.
+expectSuccessInTxnThenAbort(session, sessionDb, {
+    update: collName,
+    updates: [{q: {_id: 0}, u: {$inc: {a: 1}}}],
+    readConcern: {level: "snapshot"},
+});
 
-    // readConcern 'snapshot' is not supported by delete on mongos.
-    assert.commandFailedWithCode(sessionDb.runCommand({
-        delete: collName,
-        deletes: [{q: {}, limit: 1}],
-        readConcern: {level: "snapshot"},
-        txnNumber: NumberLong(txnNumber++)
-    }),
-                                 ErrorCodes.InvalidOptions);
+// readConcern 'snapshot' is supported by delete on mongos in a transaction.
+expectSuccessInTxnThenAbort(session, sessionDb, {
+    delete: collName,
+    deletes: [{q: {}, limit: 1}],
+    readConcern: {level: "snapshot"},
+});
 
-    // readConcern 'snapshot' is not supported by findAndModify on mongos.
-    assert.commandFailedWithCode(sessionDb.runCommand({
-        findAndModify: collName,
-        filter: {},
-        update: {$set: {a: 1}},
-        readConcern: {level: "snapshot"},
-        txnNumber: NumberLong(txnNumber++)
-    }),
-                                 ErrorCodes.InvalidOptions);
+// readConcern 'snapshot' is supported by findAndModify on mongos in a transaction.
+expectSuccessInTxnThenAbort(session, sessionDb, {
+    findAndModify: collName,
+    query: {},
+    update: {$set: {a: 1}},
+    readConcern: {level: "snapshot"},
+});
 
-    // readConcern 'snapshot' is not supported by non-CRUD commands.
-    assert.commandFailedWithCode(sessionDb.runCommand({
-        createIndexes: collName,
-        indexes: [{key: {a: 1}, name: "a_1"}],
-        readConcern: {level: "snapshot"},
-        txnNumber: NumberLong(txnNumber++)
-    }),
-                                 ErrorCodes.InvalidOptions);
+// readConcern 'snapshot' is supported by aggregate on mongos in a transaction.
+expectSuccessInTxnThenAbort(session, sessionDb, {
+    aggregate: collName,
+    pipeline: [],
+    cursor: {},
+    readConcern: {level: "snapshot"},
+});
 
-    // Passthrough tests. There are parts not implemented on mongod and mongos, they are tracked by
-    // separate jiras
-    assert.commandWorked(sessionDb.runCommand({
-        aggregate: collName,
-        pipeline: [],
-        cursor: {},
-        readConcern: {level: "snapshot"},
-        txnNumber: NumberLong(txnNumber++)
-    }));
+// readConcern 'snapshot' is supported by find and getMore on mongos in a transaction.
+session.startTransaction();
+let res = assert.commandWorked(
+    sessionDb.runCommand({find: collName, batchSize: 0, readConcern: {level: "snapshot"}}));
+assert(!res.cursor.hasOwnProperty("atClusterTime"));
+res = assert.commandWorked(sessionDb.runCommand({getMore: res.cursor.id, collection: collName}));
+assert(!res.cursor.hasOwnProperty("atClusterTime"));
+assert.commandWorked(session.abortTransaction_forTesting());
 
-    // readConcern 'snapshot' is supported by find on mongos.
-    assert.commandWorked(sessionDb.runCommand(
-        {find: collName, readConcern: {level: "snapshot"}, txnNumber: NumberLong(txnNumber++)}));
+// readConcern 'snapshot' is supported by distinct on mongos in a transaction.
+expectSuccessInTxnThenAbort(session, sessionDb, {
+    distinct: collName,
+    key: "x",
+    readConcern: {level: "snapshot"},
+});
 
-    assert.commandWorked(sessionDb.coll.insert({}, {w: 2}));
-    assert.commandWorked(coll.createIndex({geo: "2d"}));
-    assert.commandWorked(coll.createIndex({haystack: "geoHaystack", a: 1}, {bucketSize: 1}));
+let pingRes = assert.commandWorked(st.s0.adminCommand({ping: 1}));
+assert(pingRes.hasOwnProperty("$clusterTime"), tojson(pingRes));
+assert(pingRes.$clusterTime.hasOwnProperty("clusterTime"), tojson(pingRes));
+const clusterTime = pingRes.$clusterTime.clusterTime;
 
-    // Passthrough tests that are not implemented yet.
-    //
-    // readConcern 'snapshot' is allowed with 'afterClusterTime'.
-    // TODO SERVER-33989: Add support for afterClusterTime for snapshot reads through mongos.
-    assert.commandFailedWithCode(sessionDb.runCommand({
-        find: collName,
-        readConcern: {level: "snapshot", afterClusterTime: clusterTime},
-        txnNumber: NumberLong(txnNumber++)
-    }),
-                                 ErrorCodes.InvalidOptions);
-    // TODO SERVER-33709: Add snapshot support for cluster count on mongos.
-    assert.commandFailedWithCode(sessionDb.runCommand({
-        count: collName,
-        readConcern: {level: "snapshot"},
-        txnNumber: NumberLong(txnNumber++)
-    }),
-                                 ErrorCodes.InvalidOptions);
+// readConcern 'snapshot' is allowed with 'afterClusterTime'.
+expectSuccessInTxnThenAbort(session, sessionDb, {
+    find: collName,
+    readConcern: {level: "snapshot", afterClusterTime: clusterTime},
+});
 
-    // TODO SERVER-33354: Add snapshot support for distinct on mongod.
-    // TODO SERVER-33710: Add snapshot support for distinct on mongos.
-    assert.commandFailedWithCode(sessionDb.runCommand({
-        distinct: collName,
-        key: "x",
-        readConcern: {level: "snapshot"},
-        txnNumber: NumberLong(txnNumber++)
-    }),
-                                 ErrorCodes.InvalidOptions);
+expectSuccessInTxnThenAbort(session, sessionDb, {
+    aggregate: collName,
+    pipeline: [],
+    cursor: {},
+    readConcern: {level: "snapshot", afterClusterTime: clusterTime},
+});
 
-    // TODO SERVER-33354: Add snapshot support for geoNear on mongod.
-    // TODO SERVER-33712: Add snapshot support for geoNear on mongos.
-    assert.commandFailedWithCode(sessionDb.runCommand({
-        geoNear: collName,
-        near: [0, 0],
-        readConcern: {level: "snapshot"},
-        txnNumber: NumberLong(txnNumber++)
-    }),
-                                 ErrorCodes.InvalidOptions);
+// Test snapshot outside of transactions on mongos.
+const snapshotReadConcern = {
+    level: "snapshot"
+};
+// readConcern 'snapshot' is supported by find outside of transactions on mongos.
+res = assert.commandWorked(
+    testDB.runCommand({find: collName, batchSize: 0, readConcern: snapshotReadConcern}));
+assert(res.cursor.hasOwnProperty("atClusterTime"), tojson(res));
 
-    // TODO SERVER-33354: Add snapshot support for group on mongod.
-    // TODO SERVER-33711: Add snapshot support for group on mongos.
-    assert.commandFailedWithCode(sessionDb.runCommand({
-        group: {ns: collName, key: {_id: 1}, $reduce: function(curr, result) {}, initial: {}},
-        readConcern: {level: "snapshot"},
-        txnNumber: NumberLong(txnNumber++)
-    }),
-                                 ErrorCodes.InvalidOptions);
+// readConcern 'snapshot' is supported by getMore outside of transactions on mongos.
+res = assert.commandWorked(testDB.runCommand({getMore: res.cursor.id, collection: collName}));
+assert(res.cursor.hasOwnProperty("atClusterTime"), tojson(res));
 
-    st.stop();
+// readConcern 'snapshot' is supported by aggregate outside of transactions on mongos.
+res = assert.commandWorked(testDB.runCommand(
+    {aggregate: collName, pipeline: [], cursor: {}, readConcern: snapshotReadConcern}));
+assert(res.cursor.hasOwnProperty("atClusterTime"), tojson(res));
+
+// readConcern 'snapshot' is supported by distinct outside of transactions on mongos.
+res = assert.commandWorked(
+    testDB.runCommand({distinct: collName, key: "x", readConcern: snapshotReadConcern}));
+assert(res.hasOwnProperty("atClusterTime"), tojson(res));
+
+// readConcern 'snapshot' is not supported by count on mongos.
+assert.commandFailedWithCode(testDB.runCommand({count: collName, readConcern: snapshotReadConcern}),
+                             ErrorCodes.InvalidOptions);
+
+// readConcern 'snapshot' is not supported by findAndModify outside of transactions on mongos.
+assert.commandFailedWithCode(testDB.runCommand({
+    findAndModify: collName,
+    query: {},
+    update: {$set: {a: 1}},
+    readConcern: snapshotReadConcern,
+}),
+                             ErrorCodes.InvalidOptions);
+
+st.stop();
 }());

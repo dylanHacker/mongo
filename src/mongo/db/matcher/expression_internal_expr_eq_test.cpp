@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -263,7 +264,7 @@ TEST(InternalExprEqMatchExpression, SerializesCorrectly) {
                                      operand.firstElement());
 
     BSONObjBuilder bob;
-    eq.serialize(&bob);
+    eq.serialize(&bob, true);
 
     ASSERT_BSONOBJ_EQ(BSON("x" << BSON("$_internalExprEq" << 5)), bob.obj());
 }
@@ -290,7 +291,7 @@ TEST(InternalExprEqMatchExpression, EquivalentToClone) {
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
     Matcher eq(query, expCtx);
     eq.getMatchExpression()->setCollator(&collator);
-    auto relevantTag = stdx::make_unique<RelevantTag>();
+    auto relevantTag = std::make_unique<RelevantTag>();
     relevantTag->first.push_back(0u);
     relevantTag->notFirst.push_back(1u);
     eq.getMatchExpression()->setTag(relevantTag.release());
@@ -299,23 +300,23 @@ TEST(InternalExprEqMatchExpression, EquivalentToClone) {
     ASSERT_TRUE(eq.getMatchExpression()->equivalent(clone.get()));
 }
 
-DEATH_TEST(InternalExprEqMatchExpression,
-           CannotCompareToArray,
-           "Invariant failure _rhs.type() != BSONType::Array") {
+DEATH_TEST_REGEX(InternalExprEqMatchExpression,
+                 CannotCompareToArray,
+                 R"#(Invariant failure.*_rhs.type\(\) != BSONType::Array)#") {
     auto operand = BSON("a" << BSON_ARRAY(1 << 2));
     InternalExprEqMatchExpression eq(operand.firstElement().fieldNameStringData(),
                                      operand.firstElement());
 }
 
-DEATH_TEST(InternalExprEqMatchExpression,
-           CannotCompareToUndefined,
-           "Invariant failure _rhs.type() != BSONType::Undefined") {
+DEATH_TEST_REGEX(InternalExprEqMatchExpression,
+                 CannotCompareToUndefined,
+                 R"#(Invariant failure.*_rhs.type\(\) != BSONType::Undefined)#") {
     auto operand = BSON("a" << BSONUndefined);
     InternalExprEqMatchExpression eq(operand.firstElement().fieldNameStringData(),
                                      operand.firstElement());
 }
 
-DEATH_TEST(InternalExprEqMatchExpression, CannotCompareToMissing, "Invariant failure _rhs") {
+DEATH_TEST_REGEX(InternalExprEqMatchExpression, CannotCompareToMissing, "Invariant failure.*_rhs") {
     InternalExprEqMatchExpression eq("a"_sd, BSONElement());
 }
 }  // namespace

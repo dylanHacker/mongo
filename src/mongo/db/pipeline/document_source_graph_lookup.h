@@ -1,49 +1,87 @@
 /**
- * Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
+#include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_unwind.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/lookup_set_cache.h"
-#include "mongo/db/pipeline/value_comparator.h"
 
 namespace mongo {
 
 class DocumentSourceGraphLookUp final : public DocumentSource {
 public:
-    static std::unique_ptr<LiteParsedDocumentSourceForeignCollections> liteParse(
-        const AggregationRequest& request, const BSONElement& spec);
+    static constexpr StringData kStageName = "$graphLookup"_sd;
 
-    GetNextResult getNext() final;
+    class LiteParsed : public LiteParsedDocumentSourceForeignCollection {
+    public:
+        LiteParsed(std::string parseTimeName, NamespaceString foreignNss)
+            : LiteParsedDocumentSourceForeignCollection(std::move(parseTimeName),
+                                                        std::move(foreignNss)) {}
+
+        static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
+                                                 const BSONElement& spec);
+
+
+        bool allowShardedForeignCollection(NamespaceString nss) const override {
+            return _foreignNss != nss;
+        }
+
+        PrivilegeVector requiredPrivileges(bool isMongos, bool bypassDocumentValidation) const {
+            return {Privilege(ResourcePattern::forExactNamespace(_foreignNss), ActionType::find)};
+        }
+    };
+
     const char* getSourceName() const final;
-    BSONObjSet getOutputSorts() final;
+
+    const FieldPath& getConnectFromField() const {
+        return _connectFromField;
+    }
+
+    const FieldPath& getConnectToField() const {
+        return _connectToField;
+    }
+
+    Expression* getStartWithField() const {
+        return _startWith.get();
+    }
+
+    boost::optional<BSONObj> getAdditionalFilter() const {
+        return _additionalFilter;
+    };
+
+    void setAdditionalFilter(boost::optional<BSONObj> additionalFilter) {
+        _additionalFilter = additionalFilter ? additionalFilter->getOwned() : additionalFilter;
+    };
+
     void serializeToArray(
         std::vector<Value>& array,
         boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
@@ -59,20 +97,25 @@ public:
                                      HostTypeRequirement::kPrimaryShard,
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kAllowed,
-                                     TransactionRequirement::kAllowed);
+                                     TransactionRequirement::kAllowed,
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed);
 
         constraints.canSwapWithMatch = true;
         return constraints;
     }
 
-    GetDepsReturn getDependencies(DepsTracker* deps) const final {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
+        // {shardsStage, mergingStage, sortPattern}
+        return DistributedPlanLogic{nullptr, this, boost::none};
+    }
+
+    DepsTracker::State getDependencies(DepsTracker* deps) const final {
         _startWith->addDependencies(deps);
-        return SEE_NEXT;
+        return DepsTracker::State::SEE_NEXT;
     };
 
-    void addInvolvedCollections(std::vector<NamespaceString>* collections) const final {
-        collections->push_back(_from);
-    }
+    void addInvolvedCollections(stdx::unordered_set<NamespaceString>* collectionNames) const final;
 
     void detachFromOperationContext() final;
 
@@ -94,6 +137,7 @@ public:
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
 protected:
+    GetNextResult doGetNext() final;
     void doDispose() final;
 
     /**
@@ -214,6 +258,12 @@ private:
     // If we absorbed a $unwind that specified 'includeArrayIndex', this is used to populate that
     // field, tracking how many results we've returned so far for the current input document.
     long long _outputIndex;
+
+    // Holds variables defined both in this stage and in parent pipelines. These are copied to the
+    // '_fromExpCtx' ExpressionContext's 'variables' and 'variablesParseState' for use in the
+    // '_fromPipeline' execution.
+    Variables _variables;
+    VariablesParseState _variablesParseState;
 };
 
 }  // namespace mongo

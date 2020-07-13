@@ -1,29 +1,30 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -97,8 +98,12 @@ StatusWith<MigrationSecondaryThrottleOptions> MigrationSecondaryThrottleOptions:
         }
 
         if (secondaryThrottle != kOn) {
-            return Status(ErrorCodes::UnsupportedFormat,
-                          "Cannot specify write concern when secondaryThrottle is not set");
+            // Ignore the specified writeConcern, since it won't be used.  This is necessary
+            // to normalize the otherwise non-standard way that moveChunk uses writeConcern (ie.
+            // only using it when secondaryThrottle: true), so that shardsvrs can enforce always
+            // receiving writeConcern on internalClient connections (at the ServiceEntryPoint
+            // layer).
+            return MigrationSecondaryThrottleOptions(secondaryThrottle, boost::none);
         }
 
         writeConcernBSON = writeConcernElem.Obj().getOwned();
@@ -107,10 +112,9 @@ StatusWith<MigrationSecondaryThrottleOptions> MigrationSecondaryThrottleOptions:
     invariant(writeConcernBSON.is_initialized());
 
     // Make sure the write concern parses correctly
-    WriteConcernOptions writeConcern;
-    Status status = writeConcern.parse(*writeConcernBSON);
-    if (!status.isOK()) {
-        return status;
+    auto sw = WriteConcernOptions::parse(*writeConcernBSON);
+    if (!sw.isOK()) {
+        return sw.getStatus();
     }
 
     return MigrationSecondaryThrottleOptions(secondaryThrottle, std::move(writeConcernBSON));
@@ -134,24 +138,21 @@ MigrationSecondaryThrottleOptions::createFromBalancerConfig(const BSONObj& obj) 
     // Try to load it as a BSON document
     BSONElement elem;
     Status status = bsonExtractTypedField(obj, kSecondaryThrottleMongos, BSONType::Object, &elem);
+    if (!status.isOK())
+        return status;
 
-    WriteConcernOptions writeConcern;
-    Status writeConcernParseStatus = writeConcern.parse(elem.Obj());
-    if (!writeConcernParseStatus.isOK()) {
-        return writeConcernParseStatus;
+    auto sw = WriteConcernOptions::parse(elem.Obj());
+    if (!sw.isOK()) {
+        return sw.getStatus();
     }
-
-    return MigrationSecondaryThrottleOptions::createWithWriteConcern(writeConcern);
+    return MigrationSecondaryThrottleOptions::createWithWriteConcern(sw.getValue());
 }
 
 WriteConcernOptions MigrationSecondaryThrottleOptions::getWriteConcern() const {
     invariant(_secondaryThrottle != kOff);
     invariant(_writeConcernBSON);
 
-    WriteConcernOptions writeConcern;
-    fassert(34414, writeConcern.parse(*_writeConcernBSON));
-
-    return writeConcern;
+    return fassert(34414, WriteConcernOptions::parse(*_writeConcernBSON));
 }
 
 void MigrationSecondaryThrottleOptions::append(BSONObjBuilder* builder) const {

@@ -1,29 +1,30 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/auth/role_graph.h"
@@ -36,33 +37,27 @@
 
 namespace mongo {
 
-const std::string RoleGraph::BUILTIN_ROLE_V0_READ = "read";
-const std::string RoleGraph::BUILTIN_ROLE_V0_READ_WRITE = "dbOwner";
-const std::string RoleGraph::BUILTIN_ROLE_V0_ADMIN_READ = "readAnyDatabase";
-const std::string RoleGraph::BUILTIN_ROLE_V0_ADMIN_READ_WRITE = "root";
-
 namespace {
-const std::string ADMIN_DBNAME = "admin";
-
-const std::string BUILTIN_ROLE_READ = "read";
-const std::string BUILTIN_ROLE_READ_WRITE = "readWrite";
-const std::string BUILTIN_ROLE_USER_ADMIN = "userAdmin";
-const std::string BUILTIN_ROLE_DB_ADMIN = "dbAdmin";
-const std::string BUILTIN_ROLE_CLUSTER_ADMIN = "clusterAdmin";
-const std::string BUILTIN_ROLE_READ_ANY_DB = "readAnyDatabase";
-const std::string BUILTIN_ROLE_READ_WRITE_ANY_DB = "readWriteAnyDatabase";
-const std::string BUILTIN_ROLE_USER_ADMIN_ANY_DB = "userAdminAnyDatabase";
-const std::string BUILTIN_ROLE_DB_ADMIN_ANY_DB = "dbAdminAnyDatabase";
-const std::string BUILTIN_ROLE_ROOT = "root";
-const std::string BUILTIN_ROLE_INTERNAL = "__system";
-const std::string BUILTIN_ROLE_DB_OWNER = "dbOwner";
-const std::string BUILTIN_ROLE_CLUSTER_MONITOR = "clusterMonitor";
-const std::string BUILTIN_ROLE_HOST_MANAGEMENT = "hostManager";
-const std::string BUILTIN_ROLE_CLUSTER_MANAGEMENT = "clusterManager";
-const std::string BUILTIN_ROLE_BACKUP = "backup";
-const std::string BUILTIN_ROLE_RESTORE = "restore";
-const std::string BUILTIN_ROLE_ENABLE_SHARDING = "enableSharding";
-const std::string BUILTIN_ROLE_QUERYABLE_BACKUP = "__queryableBackup";
+constexpr StringData ADMIN_DBNAME = "admin"_sd;
+constexpr StringData BUILTIN_ROLE_READ = "read"_sd;
+constexpr StringData BUILTIN_ROLE_READ_WRITE = "readWrite"_sd;
+constexpr StringData BUILTIN_ROLE_USER_ADMIN = "userAdmin"_sd;
+constexpr StringData BUILTIN_ROLE_DB_ADMIN = "dbAdmin"_sd;
+constexpr StringData BUILTIN_ROLE_CLUSTER_ADMIN = "clusterAdmin"_sd;
+constexpr StringData BUILTIN_ROLE_READ_ANY_DB = "readAnyDatabase"_sd;
+constexpr StringData BUILTIN_ROLE_READ_WRITE_ANY_DB = "readWriteAnyDatabase"_sd;
+constexpr StringData BUILTIN_ROLE_USER_ADMIN_ANY_DB = "userAdminAnyDatabase"_sd;
+constexpr StringData BUILTIN_ROLE_DB_ADMIN_ANY_DB = "dbAdminAnyDatabase"_sd;
+constexpr StringData BUILTIN_ROLE_ROOT = "root"_sd;
+constexpr StringData BUILTIN_ROLE_INTERNAL = "__system"_sd;
+constexpr StringData BUILTIN_ROLE_DB_OWNER = "dbOwner"_sd;
+constexpr StringData BUILTIN_ROLE_CLUSTER_MONITOR = "clusterMonitor"_sd;
+constexpr StringData BUILTIN_ROLE_HOST_MANAGEMENT = "hostManager"_sd;
+constexpr StringData BUILTIN_ROLE_CLUSTER_MANAGEMENT = "clusterManager"_sd;
+constexpr StringData BUILTIN_ROLE_BACKUP = "backup"_sd;
+constexpr StringData BUILTIN_ROLE_RESTORE = "restore"_sd;
+constexpr StringData BUILTIN_ROLE_ENABLE_SHARDING = "enableSharding"_sd;
+constexpr StringData BUILTIN_ROLE_QUERYABLE_BACKUP = "__queryableBackup"_sd;
 
 /// Actions that the "read" role may perform on a normal resources of a specific database, and
 /// that the "readAnyDatabase" role may perform on normal resources of any database.
@@ -176,19 +171,19 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
         << ActionType::planCacheWrite
         << ActionType::reIndex
         << ActionType::renameCollectionSameDB  // read_write gets this also
-        << ActionType::repairDatabase
         << ActionType::storageDetails
         << ActionType::validate;
 
     // clusterMonitor role actions that target the cluster resource
     clusterMonitorRoleClusterActions
+        << ActionType::checkFreeMonitoringStatus
         << ActionType::connPoolStats
         << ActionType::getCmdLineOpts
+        << ActionType::getDefaultRWConcern // clusterManager gets this also
         << ActionType::getLog
         << ActionType::getParameter
         << ActionType::getShardMap
         << ActionType::hostInfo
-        << ActionType::listCursors // clusterManager gets this also
         << ActionType::listDatabases
         << ActionType::listSessions // clusterManager gets this also
         << ActionType::listShards  // clusterManager gets this also
@@ -213,7 +208,7 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
     hostManagerRoleClusterActions
         << ActionType::applicationMessage  // clusterManager gets this also
         << ActionType::connPoolSync
-        << ActionType::cpuProfiler
+        << ActionType::dropConnections
         << ActionType::logRotate
         << ActionType::setParameter
         << ActionType::shutdown
@@ -226,12 +221,12 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
         << ActionType::killAnySession
         << ActionType::killop
         << ActionType::replSetResizeOplog
-        << ActionType::resync;  // clusterManager gets this also
+        << ActionType::resync  // clusterManager gets this also
+        << ActionType::trafficRecord;
 
     // hostManager role actions that target the database resource
     hostManagerRoleDatabaseActions
-        << ActionType::killCursors
-        << ActionType::repairDatabase;
+        << ActionType::killCursors;
 
 
     // clusterManager role actions that target the cluster resource
@@ -245,18 +240,22 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
         << ActionType::resync  // hostManager gets this also
         << ActionType::addShard 
         << ActionType::removeShard
-        << ActionType::listCursors // clusterManager gets this also
         << ActionType::listSessions  // clusterMonitor gets this also
         << ActionType::listShards  // clusterMonitor gets this also
         << ActionType::flushRouterConfig  // hostManager gets this also
         << ActionType::cleanupOrphaned
-        << ActionType::setFeatureCompatibilityVersion;
+        << ActionType::getDefaultRWConcern // clusterMonitor gets this also
+        << ActionType::setDefaultRWConcern
+        << ActionType::setFeatureCompatibilityVersion
+        << ActionType::setFreeMonitoring;
 
     clusterManagerRoleDatabaseActions
+        << ActionType::clearJumboFlag
         << ActionType::splitChunk
         << ActionType::moveChunk
         << ActionType::enableSharding
-        << ActionType::splitVector;
+        << ActionType::splitVector
+        << ActionType::refineCollectionShardKey;
 
     return Status::OK();
 }
@@ -267,15 +266,7 @@ void addReadOnlyDbPrivileges(PrivilegeVector* privileges, StringData dbName) {
         privileges, Privilege(ResourcePattern::forDatabaseName(dbName), readRoleActions));
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
-        Privilege(ResourcePattern::forExactNamespace(NamespaceString(dbName, "system.indexes")),
-                  readRoleActions));
-    Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
         Privilege(ResourcePattern::forExactNamespace(NamespaceString(dbName, "system.js")),
-                  readRoleActions));
-    Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(ResourcePattern::forExactNamespace(NamespaceString(dbName, "system.namespaces")),
                   readRoleActions));
 }
 
@@ -297,14 +288,6 @@ void addUserAdminDbPrivileges(PrivilegeVector* privileges, StringData dbName) {
 void addDbAdminDbPrivileges(PrivilegeVector* privileges, StringData dbName) {
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forDatabaseName(dbName), dbAdminRoleActions));
-    Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(ResourcePattern::forExactNamespace(NamespaceString(dbName, "system.indexes")),
-                  readRoleActions));
-    Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(ResourcePattern::forExactNamespace(NamespaceString(dbName, "system.namespaces")),
-                  readRoleActions));
 
     ActionSet profileActions = readRoleActions;
     profileActions.addAction(ActionType::convertToCapped);
@@ -325,6 +308,7 @@ void addDbOwnerPrivileges(PrivilegeVector* privileges, StringData dbName) {
 void addEnableShardingPrivileges(PrivilegeVector* privileges) {
     ActionSet enableShardingActions;
     enableShardingActions.addAction(ActionType::enableSharding);
+    enableShardingActions.addAction(ActionType::refineCollectionShardKey);
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forAnyNormalResource(), enableShardingActions));
 }
@@ -335,13 +319,7 @@ void addReadOnlyAnyDbPrivileges(PrivilegeVector* privileges) {
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forClusterResource(), ActionType::listDatabases));
     Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(ResourcePattern::forCollectionName("system.indexes"), readRoleActions));
-    Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forCollectionName("system.js"), readRoleActions));
-    Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(ResourcePattern::forCollectionName("system.namespaces"), readRoleActions));
 }
 
 void addReadWriteAnyDbPrivileges(PrivilegeVector* privileges) {
@@ -357,6 +335,10 @@ void addUserAdminAnyDbPrivileges(PrivilegeVector* privileges) {
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forAnyNormalResource(), userAdminRoleActions));
     Privilege::addPrivilegeToPrivilegeVector(
+        privileges, Privilege(ResourcePattern::forDatabaseName("local"), userAdminRoleActions));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges, Privilege(ResourcePattern::forDatabaseName("config"), userAdminRoleActions));
+    Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forClusterResource(), ActionType::listDatabases));
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
@@ -364,7 +346,11 @@ void addUserAdminAnyDbPrivileges(PrivilegeVector* privileges) {
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
         Privilege(ResourcePattern::forClusterResource(), ActionType::invalidateUserCache));
-
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges, Privilege(ResourcePattern::forClusterResource(), ActionType::viewUser));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges,
+        Privilege(ResourcePattern::forAnyNormalResource(), ActionType::listCachedAndActiveUsers));
 
     ActionSet readRoleAndIndexActions;
     readRoleAndIndexActions += readRoleActions;
@@ -389,11 +375,6 @@ void addUserAdminAnyDbPrivileges(PrivilegeVector* privileges) {
             readRoleActions));
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
-        Privilege(
-            ResourcePattern::forExactNamespace(AuthorizationManager::usersAltCollectionNamespace),
-            readRoleActions));
-    Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
         Privilege(ResourcePattern::forExactNamespace(
                       AuthorizationManager::usersBackupCollectionNamespace),
                   readRoleActions));
@@ -404,12 +385,6 @@ void addDbAdminAnyDbPrivileges(PrivilegeVector* privileges) {
         privileges, Privilege(ResourcePattern::forClusterResource(), ActionType::listDatabases));
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forAnyNormalResource(), dbAdminRoleActions));
-    Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(ResourcePattern::forCollectionName("system.indexes"), readRoleActions));
-    Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(ResourcePattern::forCollectionName("system.namespaces"), readRoleActions));
     ActionSet profileActions = readRoleActions;
     profileActions.addAction(ActionType::convertToCapped);
     profileActions.addAction(ActionType::createCollection);
@@ -432,11 +407,19 @@ void addClusterMonitorPrivileges(PrivilegeVector* privileges) {
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
         Privilege(ResourcePattern::forDatabaseName("local"), clusterMonitorRoleDatabaseActions));
-    addReadOnlyDbPrivileges(privileges, "local");
     addReadOnlyDbPrivileges(privileges, "config");
+    addReadOnlyDbPrivileges(privileges, "local");
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
         Privilege(ResourcePattern::forExactNamespace(NamespaceString("local", "system.replset")),
+                  ActionType::find));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges,
+        Privilege(ResourcePattern::forExactNamespace(NamespaceString("local", "replset.election")),
+                  ActionType::find));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges,
+        Privilege(ResourcePattern::forExactNamespace(NamespaceString("local", "replset.minvalid")),
                   ActionType::find));
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
@@ -477,6 +460,14 @@ void addClusterManagerPrivileges(PrivilegeVector* privileges) {
         privileges, Privilege(ResourcePattern::forDatabaseName("config"), writeActions));
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forDatabaseName("local"), writeActions));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges,
+        Privilege(ResourcePattern::forExactNamespace(NamespaceString("local", "replset.election")),
+                  writeActions));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges,
+        Privilege(ResourcePattern::forExactNamespace(NamespaceString("local", "replset.minvalid")),
+                  writeActions));
 }
 
 void addClusterAdminPrivileges(PrivilegeVector* privileges) {
@@ -512,11 +503,12 @@ void addQueryableBackupPrivileges(PrivilegeVector* privileges) {
 
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
-        Privilege(ResourcePattern::forCollectionName("system.indexes"), ActionType::find));
-
+        Privilege(ResourcePattern::forExactNamespace(NamespaceString("local", "replset.election")),
+                  ActionType::find));
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
-        Privilege(ResourcePattern::forCollectionName("system.namespaces"), ActionType::find));
+        Privilege(ResourcePattern::forExactNamespace(NamespaceString("local", "replset.minvalid")),
+                  ActionType::find));
 
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forCollectionName("system.js"), ActionType::find));
@@ -528,12 +520,6 @@ void addQueryableBackupPrivileges(PrivilegeVector* privileges) {
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
         Privilege(ResourcePattern::forCollectionName("system.profile"), ActionType::find));
-
-    Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(
-            ResourcePattern::forExactNamespace(AuthorizationManager::usersAltCollectionNamespace),
-            ActionType::find));
 
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
@@ -562,6 +548,7 @@ void addQueryableBackupPrivileges(PrivilegeVector* privileges) {
 void addBackupPrivileges(PrivilegeVector* privileges) {
     ActionSet clusterActions;
     clusterActions << ActionType::appendOplogNote;  // For BRS
+    clusterActions << ActionType::serverStatus;     // For push based initial sync
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forClusterResource(), clusterActions));
 
@@ -587,15 +574,24 @@ void addRestorePrivileges(PrivilegeVector* privileges) {
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forCollectionName("system.js"), actions));
 
-    // Need to be able to query system.namespaces to check existing collection options.
-    Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(ResourcePattern::forCollectionName("system.namespaces"), ActionType::find));
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forAnyResource(), ActionType::listCollections));
 
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forDatabaseName("config"), actions));
+
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges,
+        Privilege(ResourcePattern::forExactNamespace(NamespaceString("local", "system.replset")),
+                  actions));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges,
+        Privilege(ResourcePattern::forExactNamespace(NamespaceString("local", "replset.election")),
+                  actions));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges,
+        Privilege(ResourcePattern::forExactNamespace(NamespaceString("local", "replset.minvalid")),
+                  actions));
 
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forDatabaseName("local"), actions));
@@ -615,12 +611,6 @@ void addRestorePrivileges(PrivilegeVector* privileges) {
         Privilege(ResourcePattern::forExactNamespace(
                       AuthorizationManager::defaultTempRolesCollectionNamespace),
                   ActionType::find));
-
-    Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(
-            ResourcePattern::forExactNamespace(AuthorizationManager::usersAltCollectionNamespace),
-            actions));
 
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
@@ -781,7 +771,7 @@ bool RoleGraph::isBuiltinRole(const RoleName& role) {
     return false;
 }
 
-void RoleGraph::_createBuiltinRolesForDBIfNeeded(const std::string& dbname) {
+void RoleGraph::_createBuiltinRolesForDBIfNeeded(StringData dbname) {
     _createBuiltinRoleIfNeeded(RoleName(BUILTIN_ROLE_READ, dbname));
     _createBuiltinRoleIfNeeded(RoleName(BUILTIN_ROLE_READ_WRITE, dbname));
     _createBuiltinRoleIfNeeded(RoleName(BUILTIN_ROLE_USER_ADMIN, dbname));

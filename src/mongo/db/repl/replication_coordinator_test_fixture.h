@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -33,6 +34,8 @@
 #include "mongo/db/client.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_coordinator_impl.h"
+#include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/unittest/unittest.h"
@@ -55,20 +58,13 @@ using executor::NetworkInterfaceMock;
 /**
  * Fixture for testing ReplicationCoordinatorImpl behaviors.
  */
-class ReplCoordTest : public mongo::unittest::Test {
+class ReplCoordTest : public ServiceContextMongoDTest {
 public:
     /**
      * Makes a command response with the given "doc" response and optional elapsed time "millis".
      */
     static executor::RemoteCommandResponse makeResponseStatus(
         const BSONObj& doc, Milliseconds millis = Milliseconds(0));
-
-    /**
-     * Makes a command response with the given "doc" response, metadata and optional elapsed time
-     * "millis".
-     */
-    static executor::RemoteCommandResponse makeResponseStatus(
-        const BSONObj& doc, const BSONObj& metadata, Milliseconds millis = Milliseconds(0));
 
     /**
      * Constructs a ReplSetConfig from the given BSON, or raises a test failure exception.
@@ -80,9 +76,23 @@ public:
      */
     static BSONObj addProtocolVersion(const BSONObj& configDoc, int protocolVersion);
 
+    /**
+     * Helpers to construct a config.
+     */
+    static BSONObj member(int id, std::string host, int votes = 1) {
+        return BSON("_id" << id << "host" << host << "votes" << votes << "priority" << votes);
+    }
+
+    static BSONObj configWithMembers(int version, long long term, BSONArray members) {
+        return BSON("_id"
+                    << "mySet"
+                    << "protocolVersion" << 1 << "version" << version << "term" << term << "members"
+                    << members);
+    }
+
 protected:
-    virtual void setUp();
-    virtual void tearDown();
+    ReplCoordTest();
+    virtual ~ReplCoordTest();
 
     /**
      * Asserts that calling start(configDoc, selfHost) successfully initiates the
@@ -109,6 +119,55 @@ protected:
         return _repl.get();
     }
 
+    void replCoordSetMyLastAppliedOpTime(const OpTime& opTime, Date_t wallTime = Date_t()) {
+        if (wallTime == Date_t()) {
+            wallTime = Date_t() + Seconds(opTime.getSecs());
+        }
+        getReplCoord()->setMyLastAppliedOpTimeAndWallTime({opTime, wallTime});
+    }
+
+    void replCoordSetMyLastAppliedOpTimeForward(const OpTime& opTime,
+                                                ReplicationCoordinator::DataConsistency consistency,
+                                                Date_t wallTime = Date_t()) {
+        if (wallTime == Date_t()) {
+            wallTime = Date_t() + Seconds(opTime.getSecs());
+        }
+        getReplCoord()->setMyLastAppliedOpTimeAndWallTimeForward({opTime, wallTime}, consistency);
+    }
+
+    void replCoordSetMyLastDurableOpTime(const OpTime& opTime, Date_t wallTime = Date_t()) {
+        if (wallTime == Date_t()) {
+            wallTime = Date_t() + Seconds(opTime.getSecs());
+        }
+        getReplCoord()->setMyLastDurableOpTimeAndWallTime({opTime, wallTime});
+    }
+
+    void replCoordSetMyLastDurableOpTimeForward(const OpTime& opTime, Date_t wallTime = Date_t()) {
+        if (wallTime == Date_t()) {
+            wallTime = Date_t() + Seconds(opTime.getSecs());
+        }
+        getReplCoord()->setMyLastDurableOpTimeAndWallTimeForward({opTime, wallTime});
+    }
+
+    void replCoordSetMyLastAppliedAndDurableOpTime(const OpTime& opTime,
+                                                   Date_t wallTime = Date_t()) {
+        replCoordSetMyLastAppliedOpTime(opTime, wallTime);
+        replCoordSetMyLastDurableOpTime(opTime, wallTime);
+    }
+
+    void replCoordAdvanceCommitPoint(const OpTime& opTime,
+                                     Date_t wallTime = Date_t(),
+                                     bool fromSyncSource = false) {
+        if (wallTime == Date_t()) {
+            wallTime = Date_t() + Seconds(opTime.getSecs());
+        }
+        getReplCoord()->advanceCommitPoint({opTime, wallTime}, fromSyncSource);
+    }
+
+    void replCoordAdvanceCommitPoint(const OpTimeAndWallTime& opTime, bool fromSyncSource = false) {
+        getReplCoord()->advanceCommitPoint(opTime, fromSyncSource);
+    }
+
     /**
      * Gets the storage interface.
      */
@@ -128,27 +187,6 @@ protected:
      */
     ReplicationCoordinatorExternalStateMock* getExternalState() {
         return _externalState;
-    }
-
-    /**
-     * Makes a new OperationContext on the default Client for this test.
-     */
-    ServiceContext::UniqueOperationContext makeOperationContext() {
-        return _client->makeOperationContext();
-    }
-
-    /**
-     * Returns the ServiceContext for this test.
-     */
-    ServiceContext* getServiceContext() {
-        return getGlobalServiceContext();
-    }
-
-    /**
-     * Returns the default Client for this test.
-     */
-    Client* getClient() {
-        return _client.get();
     }
 
     /**
@@ -215,7 +253,7 @@ protected:
      * Applicable to protocol version 1 only.
      */
     void simulateSuccessfulDryRun(
-        stdx::function<void(const executor::RemoteCommandRequest& request)> onDryRunRequest);
+        std::function<void(const executor::RemoteCommandRequest& request)> onDryRunRequest);
     void simulateSuccessfulDryRun();
 
     /**
@@ -243,7 +281,8 @@ protected:
      * Same as simulateSuccessfulV1ElectionAt, but stops short of signaling drain completion,
      * so the node stays in drain mode.
      */
-    void simulateSuccessfulV1ElectionWithoutExitingDrainMode(Date_t electionTime);
+    void simulateSuccessfulV1ElectionWithoutExitingDrainMode(Date_t electionTime,
+                                                             OperationContext* opCtx);
 
     /**
      * Transition the ReplicationCoordinator from drain mode to being fully primary/master.
@@ -258,7 +297,6 @@ protected:
     /**
      * Receive the heartbeat request from replication coordinator and reply with a response.
      */
-    void replyToReceivedHeartbeat();
     void replyToReceivedHeartbeatV1();
     /**
      * Consumes the network operation and responds if it's a heartbeat request.
@@ -298,7 +336,6 @@ private:
 
     ReplSettings _settings;
     bool _callShutdown = false;
-    ServiceContext::UniqueClient _client = getGlobalServiceContext()->makeClient("testClient");
 };
 
 }  // namespace repl

@@ -10,14 +10,7 @@ function runTest(admindb) {
     admindb.createUser({user: "admin", pwd: "pwd", roles: ["userAdminAnyDatabase"]});
     assert.eq(1, admindb.auth("admin", "pwd"));
 
-    var sysCollections = [
-        "system.indexes",
-        "system.js",
-        "system.namespaces",
-        "system.profile",
-        "system.roles",
-        "system.users"
-    ];
+    var sysCollections = ["system.js", "system.profile", "system.roles", "system.users"];
     var sysPrivs = new Array();
     for (var i in sysCollections) {
         sysPrivs.push(
@@ -61,8 +54,6 @@ runTest(conn.getDB("admin"));
 MongoRunner.stopMongod(conn);
 
 jsTest.log('Test sharding');
-// TODO: Remove 'shardAsReplicaSet: false' when SERVER-32672 is fixed.
-var st = new ShardingTest(
-    {shards: 2, config: 3, keyFile: 'jstests/libs/key1', other: {shardAsReplicaSet: false}});
+var st = new ShardingTest({shards: 2, config: 3, keyFile: 'jstests/libs/key1'});
 runTest(st.s.getDB("admin"));
 st.stop();

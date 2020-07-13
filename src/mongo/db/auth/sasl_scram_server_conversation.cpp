@@ -1,23 +1,24 @@
-/*
- *    Copyright (C) 2014 MongoDB Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/sasl_scram_server_conversation.h"
@@ -35,31 +34,30 @@
 #include <boost/algorithm/string/join.hpp>
 #include <boost/algorithm/string/replace.hpp>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/crypto/mechanism_scram.h"
 #include "mongo/crypto/sha1_block.h"
+#include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/auth/sasl_mechanism_policies.h"
 #include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/db/auth/sasl_options.h"
 #include "mongo/platform/random.h"
 #include "mongo/util/base64.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/sequence_util.h"
+#include "mongo/util/str.h"
 #include "mongo/util/text.h"
 
 namespace mongo {
-
 
 template <typename Policy>
 StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::stepImpl(
     OperationContext* opCtx, StringData inputData) {
     _step++;
 
-    if (_step > 3 || _step <= 0) {
+    const int numSteps = (_skipEmptyExchange ? 2 : 3);
+    if (_step > numSteps || _step <= 0) {
         return Status(ErrorCodes::AuthenticationFailed,
                       str::stream() << "Invalid SCRAM authentication step: " << _step);
     }
@@ -99,8 +97,7 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_fir
         return Status(ErrorCodes::BadValue,
                       str::stream()
                           << "Incorrect number of arguments for first SCRAM client message, got "
-                          << got
-                          << " expected at least 3");
+                          << got << " expected at least 3");
     };
 
     /**
@@ -165,17 +162,10 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_fir
     ServerMechanismBase::_principalName = input[0].substr(2);
     decodeSCRAMUsername(ServerMechanismBase::_principalName);
 
-    auto swUser = saslPrep(ServerMechanismBase::ServerMechanismBase::_principalName);
-    if (!swUser.isOK()) {
-        return swUser.getStatus();
-    }
-    ServerMechanismBase::ServerMechanismBase::_principalName = std::move(swUser.getValue());
-
     if (!authzId.empty() && ServerMechanismBase::_principalName != authzId) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "SCRAM user name " << ServerMechanismBase::_principalName
-                                    << " does not match authzid "
-                                    << authzId);
+                                    << " does not match authzid " << authzId);
     }
 
     if (!str::startsWith(input[1], "r=") || input[1].size() < 6) {
@@ -184,71 +174,81 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_fir
     }
     const auto clientNonce = input[1].substr(2);
 
-
-    // SERVER-16534, SCRAM-SHA-1 must be enabled for authenticating the internal user, so that
-    // cluster members may communicate with each other. Hence ignore disabled auth mechanism
-    // for the internal user.
     UserName user(ServerMechanismBase::ServerMechanismBase::_principalName,
                   ServerMechanismBase::getAuthenticationDatabase());
-    if (!sequenceContains(saslGlobalParams.authenticationMechanisms, "SCRAM-SHA-1") &&
+
+    // SERVER-16534, some mechanisms must be enabled for authenticating the internal user, so that
+    // cluster members may communicate with each other. Hence ignore disabled auth mechanism
+    // for the internal user.
+    if (Policy::isInternalAuthMech() &&
+        !sequenceContains(saslGlobalParams.authenticationMechanisms, Policy::getName()) &&
         user != internalSecurity.user->getName()) {
-        return Status(ErrorCodes::BadValue, "SCRAM-SHA-1 authentication is disabled");
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << Policy::getName() << " authentication is disabled");
     }
 
     // The authentication database is also the source database for the user.
-    User* userObj;
     auto authManager = AuthorizationManager::get(opCtx->getServiceContext());
 
-    Status status = authManager->acquireUser(opCtx, user, &userObj);
-    if (!status.isOK()) {
-        return status;
+    auto swUser = authManager->acquireUser(opCtx, user);
+    if (!swUser.isOK()) {
+        return swUser.getStatus();
     }
+    auto userObj = std::move(swUser.getValue());
 
     User::CredentialData credentials = userObj->getCredentials();
     UserName userName = userObj->getName();
 
-    authManager->releaseUser(userObj);
+    auto scramCredentials = credentials.scram<HashBlock>();
 
-    _scramCredentials = credentials.scram<HashBlock>();
-
-    if (!_scramCredentials.isValid()) {
+    if (!scramCredentials.isValid()) {
         // Check for authentication attempts of the __system user on
         // systems started without a keyfile.
         if (userName == internalSecurity.user->getName()) {
             return Status(ErrorCodes::AuthenticationFailed,
                           "It is not possible to authenticate as the __system user "
                           "on servers started without a --keyFile parameter");
+        } else if (scramCredentials.empty()) {
+            return {ErrorCodes::AuthenticationFailed,
+                    str::stream() << "Unable to use " << Policy::getName()
+                                  << " based authentication for user without any "
+                                  << Policy::getName() << " credentials registered"};
         } else {
-            return Status(ErrorCodes::AuthenticationFailed,
-                          "Unable to perform SCRAM authentication for a user with missing "
-                          "or invalid SCRAM credentials");
+            return {ErrorCodes::AuthenticationFailed,
+                    str::stream() << "Unable to validate " << Policy::getName()
+                                  << " authentication due to corrupted stored credentials"};
         }
     }
 
-    _secrets = scram::Secrets<HashBlock>("",
-                                         base64::decode(_scramCredentials.storedKey),
-                                         base64::decode(_scramCredentials.serverKey));
+    _secrets.push_back(scram::Secrets<HashBlock, scram::UnlockedSecretsPolicy>(
+        "",
+        base64::decode(scramCredentials.storedKey),
+        base64::decode(scramCredentials.serverKey)));
+
+    if (userName == internalSecurity.user->getName() && internalSecurity.alternateCredentials) {
+        auto altCredentials = internalSecurity.alternateCredentials->scram<HashBlock>();
+        _secrets.push_back(scram::Secrets<HashBlock, scram::UnlockedSecretsPolicy>(
+            "",
+            base64::decode(altCredentials.storedKey),
+            base64::decode(altCredentials.serverKey)));
+    }
 
     // Generate server-first-message
     // Create text-based nonce as base64 encoding of a binary blob of length multiple of 3
     const int nonceLenQWords = 3;
     uint64_t binaryNonce[nonceLenQWords];
 
-    std::unique_ptr<SecureRandom> sr(SecureRandom::create());
+    SecureRandom().fill(binaryNonce, sizeof(binaryNonce));
 
-    binaryNonce[0] = sr->nextInt64();
-    binaryNonce[1] = sr->nextInt64();
-    binaryNonce[2] = sr->nextInt64();
-
-    _nonce =
-        clientNonce + base64::encode(reinterpret_cast<char*>(binaryNonce), sizeof(binaryNonce));
+    _nonce = clientNonce +
+        base64::encode(StringData(reinterpret_cast<char*>(binaryNonce), sizeof(binaryNonce)));
     StringBuilder sb;
-    sb << "r=" << _nonce << ",s=" << _scramCredentials.salt
-       << ",i=" << _scramCredentials.iterationCount;
+    sb << "r=" << _nonce << ",s=" << scramCredentials.salt
+       << ",i=" << scramCredentials.iterationCount;
     std::string outputData = sb.str();
 
     // add client-first-message-bare and server-first-message to _authMessage
-    _authMessage = client_first_message_bare.toString() + "," + outputData;
+    _authMessage = str::stream() << client_first_message_bare.toString() << "," << outputData;
 
     return std::make_tuple(false, std::move(outputData));
 }
@@ -264,7 +264,7 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_fir
  * e=message
  *
  * NOTE: we are ignoring the channel binding part of the message
-**/
+ **/
 template <typename Policy>
 StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_secondStep(
     OperationContext* opCtx, StringData inputData) {
@@ -272,8 +272,7 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_sec
         return Status(ErrorCodes::BadValue,
                       str::stream()
                           << "Incorrect number of arguments for second SCRAM client message, got "
-                          << got
-                          << " expected at least 3");
+                          << got << " expected at least 3");
     };
 
     /**
@@ -319,9 +318,7 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_sec
         return Status(ErrorCodes::BadValue,
                       str::stream()
                           << "Unmatched SCRAM nonce received from client in second step, expected "
-                          << _nonce
-                          << " but received "
-                          << nonce);
+                          << _nonce << " but received " << nonce);
     }
 
     // Do server side computations, compare storedKeys and generate client-final-message
@@ -332,28 +329,47 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_sec
     // ClientKey := ClientSignature XOR ClientProof
     // ServerSignature := HMAC(ServerKey, AuthMessage)
 
-    if (!_secrets.verifyClientProof(_authMessage, base64::decode(proof.toString()))) {
+    const auto decodedProof = base64::decode(proof.toString());
+    std::string serverSignature;
+    const auto checkSecret =
+        [&](const scram::Secrets<HashBlock, scram::UnlockedSecretsPolicy>& secret) {
+            if (!secret.verifyClientProof(_authMessage, decodedProof))
+                return false;
+
+            serverSignature = secret.generateServerSignature(_authMessage);
+            return true;
+        };
+
+    if (!std::any_of(_secrets.begin(), _secrets.end(), checkSecret)) {
         return Status(ErrorCodes::AuthenticationFailed,
                       "SCRAM authentication failed, storedKey mismatch");
     }
 
-    StringBuilder sb;
     // ServerSignature := HMAC(ServerKey, AuthMessage)
-    sb << "v=" << _secrets.generateServerSignature(_authMessage);
+    invariant(!serverSignature.empty());
+    std::string reply("v=" + serverSignature);
+    return std::make_tuple(_skipEmptyExchange, reply);
+}
 
-    return std::make_tuple(false, sb.str());
+template <typename Policy>
+Status SaslSCRAMServerMechanism<Policy>::setOptions(BSONObj options) {
+    auto see = options[saslCommandOptionSkipEmptyExchange];
+    if (!see.eoo()) {
+        if (!see.isBoolean()) {
+            return {ErrorCodes::BadValue,
+                    str::stream() << saslCommandOptionSkipEmptyExchange << " must be boolean"};
+        }
+        _skipEmptyExchange = see.boolean();
+    }
+
+    return Status::OK();
 }
 
 template class SaslSCRAMServerMechanism<SCRAMSHA1Policy>;
 template class SaslSCRAMServerMechanism<SCRAMSHA256Policy>;
 
-MONGO_INITIALIZER_WITH_PREREQUISITES(SASLSCRAMServerMechanism,
-                                     ("CreateSASLServerMechanismRegistry"))
-(::mongo::InitializerContext* context) {
-    auto& registry = SASLServerMechanismRegistry::get(getGlobalServiceContext());
-    registry.registerFactory<SCRAMSHA1ServerFactory>();
-    registry.registerFactory<SCRAMSHA256ServerFactory>();
-    return Status::OK();
-}
-
+namespace {
+GlobalSASLMechanismRegisterer<SCRAMSHA1ServerFactory> scramsha1Registerer;
+GlobalSASLMechanismRegisterer<SCRAMSHA256ServerFactory> scramsha256Registerer;
+}  // namespace
 }  // namespace mongo

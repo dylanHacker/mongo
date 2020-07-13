@@ -1,32 +1,33 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -41,18 +42,17 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/update.h"
-#include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/repl/bson_extract_optime.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/s/sharding_logging.h"
 #include "mongo/db/s/sharding_state.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -60,12 +60,10 @@ namespace {
 const char kRecoveryDocumentId[] = "minOpTimeRecovery";
 const char kMinOpTime[] = "minOpTime";
 const char kMinOpTimeUpdaters[] = "minOpTimeUpdaters";
-const char kConfigsvrConnString[] = "configsvrConnectionString";  // TODO SERVER-34166: Remove.
-const char kShardName[] = "shardName";                            // TODO SERVER-34166: Remove.
 
 const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
                                                 WriteConcernOptions::SyncMode::UNSET,
-                                                Seconds(15));
+                                                WriteConcernOptions::kWriteConcernTimeoutSharding);
 
 const WriteConcernOptions kLocalWriteConcern(1,
                                              WriteConcernOptions::SyncMode::UNSET,
@@ -92,16 +90,11 @@ public:
         return recDoc;
     }
 
-    static BSONObj createChangeObj(ConnectionString configsvr,
-                                   std::string shardName,
-                                   repl::OpTime minOpTime,
-                                   ChangeType change) {
+    static BSONObj createChangeObj(repl::OpTime minOpTime, ChangeType change) {
         BSONObjBuilder cmdBuilder;
 
         {
             BSONObjBuilder setBuilder(cmdBuilder.subobjStart("$set"));
-            setBuilder.append(kConfigsvrConnString, configsvr.toString());
-            setBuilder.append(kShardName, shardName);
             minOpTime.append(&setBuilder, kMinOpTime);
         }
 
@@ -155,24 +148,20 @@ Status modifyRecoveryDocument(OperationContext* opCtx,
         autoGetOrCreateDb.emplace(
             opCtx, NamespaceString::kServerConfigurationNamespace.db(), MODE_X);
 
-        // The config server connection string and shard name are no longer parsed in 4.0, but 3.6
-        // nodes still expect to find them, so we must include them until after 4.0 ships.
-        //
-        // TODO SERVER-34166: Stop writing config server connection string and shard name.
-        BSONObj updateObj = RecoveryDocument::createChangeObj(
-            Grid::get(opCtx)->shardRegistry()->getConfigServerConnectionString(),
-            ShardingState::get(opCtx)->getShardName(),
-            Grid::get(opCtx)->configOpTime(),
-            change);
+        auto const grid = Grid::get(opCtx);
+        BSONObj updateObj = RecoveryDocument::createChangeObj(grid->configOpTime(), change);
 
-        LOG(1) << "Changing sharding recovery document " << redact(updateObj);
+        LOGV2_DEBUG(22083,
+                    1,
+                    "Changing sharding recovery document {update}",
+                    "Changing sharding recovery document",
+                    "update"_attr = redact(updateObj));
 
-        UpdateRequest updateReq(NamespaceString::kServerConfigurationNamespace);
+        auto updateReq = UpdateRequest();
+        updateReq.setNamespaceString(NamespaceString::kServerConfigurationNamespace);
         updateReq.setQuery(RecoveryDocument::getQuery());
-        updateReq.setUpdates(updateObj);
+        updateReq.setUpdateModification(updateObj);
         updateReq.setUpsert();
-        UpdateLifecycleImpl updateLifecycle(NamespaceString::kServerConfigurationNamespace);
-        updateReq.setLifecycle(&updateLifecycle);
 
         UpdateResult result = update(opCtx, autoGetOrCreateDb->getDb(), updateReq);
         invariant(result.numDocsModified == 1 || !result.upserted.isEmpty());
@@ -212,14 +201,17 @@ void ShardingStateRecovery::endMetadataOp(OperationContext* opCtx) {
     Status status =
         modifyRecoveryDocument(opCtx, RecoveryDocument::Decrement, WriteConcernOptions());
     if (!status.isOK()) {
-        warning() << "Failed to decrement minOpTimeUpdaters due to " << redact(status);
+        LOGV2_WARNING(22088,
+                      "Failed to decrement minOpTimeUpdaters due to {error}",
+                      "Failed to decrement minOpTimeUpdaters",
+                      "error"_attr = redact(status));
     }
 }
 
 Status ShardingStateRecovery::recover(OperationContext* opCtx) {
-    if (serverGlobalParams.clusterRole != ClusterRole::ShardServer) {
-        return Status::OK();
-    }
+    Grid* const grid = Grid::get(opCtx);
+    ShardingState* const shardingState = ShardingState::get(opCtx);
+    invariant(shardingState->enabled());
 
     BSONObj recoveryDocBSON;
 
@@ -239,39 +231,57 @@ Status ShardingStateRecovery::recover(OperationContext* opCtx) {
 
     const auto recoveryDoc = std::move(recoveryDocStatus.getValue());
 
-    log() << "Sharding state recovery process found document " << redact(recoveryDoc.toBSON());
-
-    Grid* const grid = Grid::get(opCtx);
-    ShardingState* const shardingState = ShardingState::get(opCtx);
-    invariant(shardingState->enabled());
+    LOGV2(22084,
+          "Sharding state recovery process found document {recoveryDoc}",
+          "Sharding state recovery process found document",
+          "recoveryDoc"_attr = redact(recoveryDoc.toBSON()));
 
     if (!recoveryDoc.getMinOpTimeUpdaters()) {
         // Treat the minOpTime as up-to-date
-        grid->advanceConfigOpTime(recoveryDoc.getMinOpTime());
+        const auto prevOpTime = grid->advanceConfigOpTime(
+            opCtx, recoveryDoc.getMinOpTime(), "sharding state recovery document");
+        if (prevOpTime) {
+            LOGV2(22085,
+                  "No in flight metadata change operations, so config server optime updated from "
+                  "{prevConfigServerMinOpTime} to {newConfigServerMinOpTime}",
+                  "No in flight metadata change operations, so config server optime updated",
+                  "prevConfigServerMinOpTime"_attr = *prevOpTime,
+                  "newConfigServerMinOpTime"_attr = recoveryDoc.getMinOpTime());
+        }
         return Status::OK();
     }
 
-    log() << "Sharding state recovery document indicates there were "
-          << recoveryDoc.getMinOpTimeUpdaters()
-          << " metadata change operations in flight. Contacting the config server primary in order "
-             "to retrieve the most recent opTime.";
+    LOGV2(
+        22086,
+        "Sharding state recovery document indicates there were {inProgressMetadataOperationCount} "
+        "metadata change operations in flight. Contacting the config server primary in order "
+        "to retrieve the most recent opTime.",
+        "Sharding state recovery document indicates there were metadata change operations in "
+        "flight. Contacting the config server primary in order to retrieve the most recent opTime",
+        "inProgressMetadataOperationCount"_attr = recoveryDoc.getMinOpTimeUpdaters());
 
     // Need to fetch the latest uptime from the config server, so do a logging write
-    Status status =
-        grid->catalogClient()->logChange(opCtx,
-                                         "Sharding minOpTime recovery",
-                                         NamespaceString::kServerConfigurationNamespace.ns(),
-                                         recoveryDocBSON,
-                                         ShardingCatalogClient::kMajorityWriteConcern);
+    Status status = ShardingLogging::get(opCtx)->logChangeChecked(
+        opCtx,
+        "Sharding minOpTime recovery",
+        NamespaceString::kServerConfigurationNamespace.ns(),
+        recoveryDocBSON,
+        ShardingCatalogClient::kMajorityWriteConcern);
     if (!status.isOK())
         return status;
 
-    log() << "Sharding state recovered. New config server opTime is " << grid->configOpTime();
+    LOGV2(22087,
+          "Sharding state recovered. New config server opTime is {newConfigServerOpTime}",
+          "Sharding state recovered",
+          "newConfigServerOpTime"_attr = grid->configOpTime());
 
     // Finally, clear the recovery document so next time we don't need to recover
     status = modifyRecoveryDocument(opCtx, RecoveryDocument::Clear, kLocalWriteConcern);
     if (!status.isOK()) {
-        warning() << "Failed to reset sharding state recovery document due to " << redact(status);
+        LOGV2_WARNING(22089,
+                      "Failed to reset sharding state recovery document due to {error}",
+                      "Failed to reset sharding state recovery document",
+                      "error"_attr = redact(status));
     }
 
     return Status::OK();

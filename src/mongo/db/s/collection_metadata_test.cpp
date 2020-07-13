@@ -1,39 +1,41 @@
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
+
+#include <memory>
 
 #include "mongo/base/status.h"
 #include "mongo/db/range_arithmetic.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/chunk_version.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -81,7 +83,7 @@ std::unique_ptr<CollectionMetadata> makeCollectionMetadataImpl(
     auto rt =
         RoutingTableHistory::makeNew(kNss, uuid, shardKeyPattern, nullptr, false, epoch, allChunks);
     std::shared_ptr<ChunkManager> cm = std::make_shared<ChunkManager>(rt, kChunkManager);
-    return stdx::make_unique<CollectionMetadata>(cm, kThisShard);
+    return std::make_unique<CollectionMetadata>(cm, kThisShard);
 }
 
 struct ConstructedRangeMap : public RangeMap {
@@ -110,8 +112,7 @@ TEST_F(NoChunkFixture, IsValidKey) {
     ASSERT(makeCollectionMetadata()->isValidKey(BSON("a" << 3)));
     ASSERT(!makeCollectionMetadata()->isValidKey(BSON("a"
                                                       << "abcde"
-                                                      << "b"
-                                                      << 1)));
+                                                      << "b" << 1)));
     ASSERT(!makeCollectionMetadata()->isValidKey(BSON("c"
                                                       << "abcde")));
 }
@@ -120,12 +121,6 @@ TEST_F(NoChunkFixture, GetNextChunk) {
     ChunkType nextChunk;
     ASSERT(
         !makeCollectionMetadata()->getNextChunk(makeCollectionMetadata()->getMinKey(), &nextChunk));
-}
-
-TEST_F(NoChunkFixture, GetDifferentChunk) {
-    ChunkType differentChunk;
-    ASSERT(!makeCollectionMetadata()->getDifferentChunk(makeCollectionMetadata()->getMinKey(),
-                                                        &differentChunk));
 }
 
 TEST_F(NoChunkFixture, RangeOverlapsChunk) {
@@ -209,11 +204,6 @@ TEST_F(SingleChunkFixture, GetNextChunkShouldFindNothing) {
     ChunkType nextChunk;
     ASSERT(
         !makeCollectionMetadata()->getNextChunk(makeCollectionMetadata()->getMaxKey(), &nextChunk));
-}
-
-TEST_F(SingleChunkFixture, GetDifferentChunkShouldFindNothing) {
-    ChunkType differentChunk;
-    ASSERT(!makeCollectionMetadata()->getDifferentChunk(BSON("a" << 10), &differentChunk));
 }
 
 TEST_F(SingleChunkFixture, RangeOverlapsChunk) {
@@ -377,29 +367,6 @@ TEST_F(ThreeChunkWithRangeGapFixture, GetNextChunkFromLast) {
     ASSERT(makeCollectionMetadata()->getNextChunk(BSON("a" << 30), &nextChunk));
     ASSERT_EQUALS(0, nextChunk.getMin().woCompare(BSON("a" << 30)));
     ASSERT_EQUALS(0, nextChunk.getMax().woCompare(BSON("a" << MAXKEY)));
-}
-
-TEST_F(ThreeChunkWithRangeGapFixture, GetDifferentChunkFromBeginning) {
-    auto metadata(makeCollectionMetadata());
-
-    ChunkType differentChunk;
-    ASSERT(metadata->getDifferentChunk(metadata->getMinKey(), &differentChunk));
-    ASSERT_BSONOBJ_EQ(BSON("a" << 10), differentChunk.getMin());
-    ASSERT_BSONOBJ_EQ(BSON("a" << 20), differentChunk.getMax());
-}
-
-TEST_F(ThreeChunkWithRangeGapFixture, GetDifferentChunkFromMiddle) {
-    ChunkType differentChunk;
-    ASSERT(makeCollectionMetadata()->getDifferentChunk(BSON("a" << 10), &differentChunk));
-    ASSERT_EQUALS(0, differentChunk.getMin().woCompare(BSON("a" << MINKEY)));
-    ASSERT_EQUALS(0, differentChunk.getMax().woCompare(BSON("a" << 10)));
-}
-
-TEST_F(ThreeChunkWithRangeGapFixture, GetDifferentChunkFromLast) {
-    ChunkType differentChunk;
-    ASSERT(makeCollectionMetadata()->getDifferentChunk(BSON("a" << 30), &differentChunk));
-    ASSERT_EQUALS(0, differentChunk.getMin().woCompare(BSON("a" << MINKEY)));
-    ASSERT_EQUALS(0, differentChunk.getMax().woCompare(BSON("a" << 10)));
 }
 
 /**

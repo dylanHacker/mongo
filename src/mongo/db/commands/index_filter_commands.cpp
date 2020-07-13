@@ -1,32 +1,33 @@
 /**
-*    Copyright (C) 2014 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -48,8 +49,10 @@
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/collection_query_info.h"
+#include "mongo/db/query/query_settings_decoration.h"
+#include "mongo/logv2/log.h"
 #include "mongo/stdx/unordered_set.h"
-#include "mongo/util/log.h"
 
 
 namespace {
@@ -66,21 +69,18 @@ static Status getQuerySettingsAndPlanCache(OperationContext* opCtx,
                                            const string& ns,
                                            QuerySettings** querySettingsOut,
                                            PlanCache** planCacheOut) {
-    *querySettingsOut = NULL;
-    *planCacheOut = NULL;
-    if (NULL == collection) {
+    *querySettingsOut = nullptr;
+    *planCacheOut = nullptr;
+    if (nullptr == collection) {
         return Status(ErrorCodes::BadValue, "no such collection");
     }
 
-    CollectionInfoCache* infoCache = collection->infoCache();
-    invariant(infoCache);
-
-    QuerySettings* querySettings = infoCache->getQuerySettings();
+    QuerySettings* querySettings = QuerySettingsDecoration::get(collection->getSharedDecorations());
     invariant(querySettings);
 
     *querySettingsOut = querySettings;
 
-    PlanCache* planCache = infoCache->getPlanCache();
+    PlanCache* planCache = CollectionQueryInfo::get(collection).getPlanCache();
     invariant(planCache);
 
     *planCacheOut = planCache;
@@ -109,8 +109,8 @@ namespace mongo {
 
 using std::string;
 using std::stringstream;
-using std::vector;
 using std::unique_ptr;
+using std::vector;
 
 IndexFilterCommand::IndexFilterCommand(const string& name, const string& helpText)
     : BasicCommand(name), helpText(helpText) {}
@@ -121,7 +121,8 @@ bool IndexFilterCommand::run(OperationContext* opCtx,
                              BSONObjBuilder& result) {
     const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
     Status status = runIndexFilterCommand(opCtx, nss.ns(), cmdObj, &result);
-    return CommandHelpers::appendCommandStatus(result, status);
+    uassertStatusOK(status);
+    return true;
 }
 
 
@@ -253,18 +254,21 @@ Status ClearFilters::clear(OperationContext* opCtx,
     // - clear hints for single query shape when a query shape is described in the
     //   command arguments.
     if (cmdObj.hasField("query")) {
-        auto statusWithCQ = PlanCacheCommand::canonicalize(opCtx, ns, cmdObj);
+        auto statusWithCQ = plan_cache_commands::canonicalize(opCtx, ns, cmdObj);
         if (!statusWithCQ.isOK()) {
             return statusWithCQ.getStatus();
         }
 
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
-        querySettings->removeAllowedIndices(planCache->computeKey(*cq));
+        querySettings->removeAllowedIndices(cq->encodeKey());
 
         // Remove entry from plan cache
         planCache->remove(*cq).transitional_ignore();
 
-        LOG(0) << "Removed index filter on " << ns << " " << redact(cq->toStringShort());
+        LOGV2(20479,
+              "Removed index filter on {query}",
+              "Removed index filter on query",
+              "query"_attr = redact(cq->toStringShort()));
 
         return Status::OK();
     }
@@ -301,7 +305,7 @@ Status ClearFilters::clear(OperationContext* opCtx,
         AllowedIndexEntry entry = *i;
 
         // Create canonical query.
-        auto qr = stdx::make_unique<QueryRequest>(nss);
+        auto qr = std::make_unique<QueryRequest>(nss);
         qr->setFilter(entry.query);
         qr->setSort(entry.sort);
         qr->setProj(entry.projection);
@@ -313,14 +317,17 @@ Status ClearFilters::clear(OperationContext* opCtx,
                                          expCtx,
                                          extensionsCallback,
                                          MatchExpressionParser::kAllowAllSpecialFeatures);
-        invariantOK(statusWithCQ.getStatus());
+        invariant(statusWithCQ.getStatus());
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
         // Remove plan cache entry.
         planCache->remove(*cq).transitional_ignore();
     }
 
-    LOG(0) << "Removed all index filters for collection: " << ns;
+    LOGV2(20480,
+          "Removed all index filters for collection: {namespace}",
+          "Removed all index filters for collection",
+          "namespace"_attr = ns);
 
     return Status::OK();
 }
@@ -385,20 +392,23 @@ Status SetFilter::set(OperationContext* opCtx,
         }
     }
 
-    auto statusWithCQ = PlanCacheCommand::canonicalize(opCtx, ns, cmdObj);
+    auto statusWithCQ = plan_cache_commands::canonicalize(opCtx, ns, cmdObj);
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();
     }
     unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
     // Add allowed indices to query settings, overriding any previous entries.
-    querySettings->setAllowedIndices(*cq, planCache->computeKey(*cq), indexes, indexNames);
+    querySettings->setAllowedIndices(*cq, indexes, indexNames);
 
     // Remove entry from plan cache.
     planCache->remove(*cq).transitional_ignore();
 
-    LOG(0) << "Index filter set on " << ns << " " << redact(cq->toStringShort()) << " "
-           << indexesElt;
+    LOGV2(20481,
+          "Index filter set on {query} {indexes}",
+          "Index filter set on query",
+          "query"_attr = redact(cq->toStringShort()),
+          "indexes"_attr = indexesElt);
 
     return Status::OK();
 }

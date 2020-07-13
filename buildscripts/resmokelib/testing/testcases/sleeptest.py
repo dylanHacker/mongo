@@ -1,10 +1,8 @@
 """The unittest.TestCase for sleeping a given amount of time."""
 
-from __future__ import absolute_import
-
 import time
 
-from . import interface
+from buildscripts.resmokelib.testing.testcases import interface
 
 
 class SleepTestCase(interface.TestCase):

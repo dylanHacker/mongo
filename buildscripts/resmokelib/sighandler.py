@@ -1,7 +1,5 @@
 """Utility to support asynchronously signaling the current process."""
 
-from __future__ import absolute_import
-
 import atexit
 import os
 import signal
@@ -10,13 +8,13 @@ import threading
 import time
 import traceback
 
+from buildscripts.resmokelib import reportfile
+from buildscripts.resmokelib import testing
+
 _IS_WINDOWS = (sys.platform == "win32")
 if _IS_WINDOWS:
     import win32api
     import win32event
-
-from . import reportfile  # pylint: disable=wrong-import-position
-from . import testing  # pylint: disable=wrong-import-position
 
 
 def register(logger, suites, start_time):

@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -34,11 +35,8 @@
 namespace mongo {
 
 /**
- * Part of the change stream API machinery used to look up the post-image of a document. Uses
- * the "documentKey" field of the input to look up the new version of the document.
- *
- * Uses the ExpressionContext to determine what collection to look up into.
- * TODO SERVER-29134 When we allow change streams on multiple collections, this will need to change.
+ * Part of the change stream API machinery used to look up the post-image of a document. Uses the
+ * "documentKey" field of the input to look up the new version of the document.
  */
 class DocumentSourceLookupChangePostImage final : public DocumentSource {
 public:
@@ -65,19 +63,26 @@ public:
         invariant(pipeState != Pipeline::SplitState::kSplitForShards);
         StageConstraints constraints(StreamType::kStreaming,
                                      PositionRequirement::kNone,
-                                     pipeState == Pipeline::SplitState::kUnsplit
-                                         ? HostTypeRequirement::kNone
-                                         : HostTypeRequirement::kMongoS,
+                                     // If this is parsed on mongos it should stay on mongos. If
+                                     // we're not in a sharded cluster then it's okay to run on
+                                     // mongod.
+                                     HostTypeRequirement::kLocalOnly,
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kNotAllowed,
                                      TransactionRequirement::kNotAllowed,
+                                     LookupRequirement::kNotAllowed,
+                                     UnionRequirement::kNotAllowed,
                                      ChangeStreamRequirement::kChangeStreamStage);
 
         constraints.canSwapWithMatch = true;
         return constraints;
     }
 
-    GetDepsReturn getDependencies(DepsTracker* deps) const {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
+        return boost::none;
+    }
+
+    DepsTracker::State getDependencies(DepsTracker* deps) const {
         // The namespace is not technically needed yet, but we will if there is more than one
         // collection involved.
         deps->fields.insert(DocumentSourceChangeStream::kNamespaceField.toString());
@@ -86,13 +91,8 @@ public:
         deps->fields.insert(DocumentSourceChangeStream::kIdField.toString());
         // This stage does not restrict the output fields to a finite set, and has no impact on
         // whether metadata is available or needed.
-        return SEE_NEXT;
+        return DepsTracker::State::SEE_NEXT;
     }
-
-    /**
-     * Performs the lookup to retrieve the full document.
-     */
-    GetNextResult getNext() final;
 
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final {
         if (explain) {
@@ -107,7 +107,12 @@ public:
 
 private:
     DocumentSourceLookupChangePostImage(const boost::intrusive_ptr<ExpressionContext>& expCtx)
-        : DocumentSource(expCtx) {}
+        : DocumentSource(kStageName, expCtx) {}
+
+    /**
+     * Performs the lookup to retrieve the full document.
+     */
+    GetNextResult doGetNext() final;
 
     /**
      * Uses the "documentKey" field from 'updateOp' to look up the current version of the document.

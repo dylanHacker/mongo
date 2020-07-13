@@ -3,30 +3,17 @@ test_kind: js_test
 selector:
   roots:
   - jstests/change_streams/**/*.js
-  exclude_files:
-  # This test exercises an internal detail of mongos<->mongod communication and is not expected
-  # to work against a mongos.
-  - jstests/change_streams/report_latest_observed_oplog_timestamp.js
-  # Whole database change stream not supported on sharded clusters.
-  - jstests/change_streams/change_stream_shell_helper.js
-  - jstests/change_streams/change_stream_whole_db.js
-  - jstests/change_streams/change_stream_whole_db_invalidations.js
-  - jstests/change_streams/change_stream_whole_db_resumability.js
-  - jstests/change_streams/lookup_post_image.js
   exclude_with_any_tags:
   ##
-  # The next three tags correspond to the special errors thrown by the
+  # The next tags correspond to the special errors thrown by the
   # set_read_and_write_concerns.js override when it refuses to replace the readConcern or
   # writeConcern of a particular command. Above each tag are the message(s) that cause the tag to be
   # warranted.
   ##
-  # "Cowardly refusing to override read concern of command: ..."
-  - assumes_read_concern_unchanged
   # "Cowardly refusing to override write concern of command: ..."
   - assumes_write_concern_unchanged
-  # "Cowardly refusing to run test with overridden write concern when it uses a command that can
-  #  only perform w=1 writes: ..."
-  - requires_eval_command
+  # Exclude any that assume sharding is disabled
+  - assumes_against_mongod_not_mongos
 
 executor:
   archive:
@@ -37,9 +24,14 @@ executor:
     shell_options:
       global_vars:
         TestData:
-          defaultReadConcernLevel: majority
+          defaultReadConcernLevel: null
           enableMajorityReadConcern: ''
-      eval: "var testingReplication = true; load('jstests/libs/override_methods/set_read_and_write_concerns.js');"
+      # Enable causal consistency for change streams suites using 1 node replica sets. See
+      # change_streams.yml for detailed explanation.
+      eval: >-
+        var testingReplication = true;
+        load('jstests/libs/override_methods/set_read_and_write_concerns.js');
+        load('jstests/libs/override_methods/enable_causal_consistency_without_read_pref.js');
       readMode: commands
   hooks:
   - class: CheckReplDBHash
@@ -57,12 +49,7 @@ executor:
         enableTestCommands: 1
     mongod_options:
       bind_ip_all: ''
-      nopreallocj: ''
       set_parameters:
         enableTestCommands: 1
-        numInitialSyncAttempts: 1
-    num_rs_nodes_per_shard: 1
-    # This test suite doesn't actually shard any collections, but enabling sharding will prevent
-    # read commands against non-existent databases from unconditionally returning a CursorId of 0.
-    enable_sharding:
-    - test
+        periodicNoopIntervalSecs: 1
+        writePeriodicNoops: true

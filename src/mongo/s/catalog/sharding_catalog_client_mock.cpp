@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,6 +31,8 @@
 
 #include "mongo/s/catalog/sharding_catalog_client_mock.h"
 
+#include <memory>
+
 #include "mongo/base/status.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/s/catalog/type_chunk.h"
@@ -38,7 +41,6 @@
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -61,17 +63,6 @@ void ShardingCatalogClientMock::shutDown(OperationContext* opCtx) {
     if (_distLockManager) {
         _distLockManager->shutDown(opCtx);
     }
-}
-
-Status ShardingCatalogClientMock::enableSharding(OperationContext* opCtx,
-                                                 const std::string& dbName) {
-    return {ErrorCodes::InternalError, "Method not implemented"};
-}
-
-Status ShardingCatalogClientMock::updateDatabase(OperationContext* opCtx,
-                                                 const string& dbName,
-                                                 const DatabaseType& db) {
-    return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
 StatusWith<repl::OpTimeWith<DatabaseType>> ShardingCatalogClientMock::getDatabase(
@@ -127,14 +118,6 @@ StatusWith<repl::OpTimeWith<std::vector<ShardType>>> ShardingCatalogClientMock::
     return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
-bool ShardingCatalogClientMock::runUserManagementWriteCommand(OperationContext* opCtx,
-                                                              const string& commandName,
-                                                              const string& dbname,
-                                                              const BSONObj& cmdObj,
-                                                              BSONObjBuilder* result) {
-    return true;
-}
-
 bool ShardingCatalogClientMock::runUserManagementReadCommand(OperationContext* opCtx,
                                                              const string& dbname,
                                                              const BSONObj& cmdObj,
@@ -149,21 +132,6 @@ Status ShardingCatalogClientMock::applyChunkOpsDeprecated(OperationContext* opCt
                                                           const ChunkVersion& lastChunkVersion,
                                                           const WriteConcernOptions& writeConcern,
                                                           repl::ReadConcernLevel readConcern) {
-    return {ErrorCodes::InternalError, "Method not implemented"};
-}
-
-Status ShardingCatalogClientMock::logAction(OperationContext* opCtx,
-                                            const std::string& what,
-                                            const std::string& ns,
-                                            const BSONObj& detail) {
-    return {ErrorCodes::InternalError, "Method not implemented"};
-}
-
-Status ShardingCatalogClientMock::logChange(OperationContext* opCtx,
-                                            const std::string& what,
-                                            const std::string& ns,
-                                            const BSONObj& detail,
-                                            const WriteConcernOptions& writeConcern) {
     return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
@@ -188,6 +156,12 @@ Status ShardingCatalogClientMock::insertConfigDocument(OperationContext* opCtx,
     return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
+void ShardingCatalogClientMock::insertConfigDocumentsAsRetryableWrite(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    std::vector<BSONObj> docs,
+    const WriteConcernOptions& writeConcern) {}
+
 StatusWith<bool> ShardingCatalogClientMock::updateConfigDocument(
     OperationContext* opCtx,
     const NamespaceString& nss,
@@ -206,7 +180,8 @@ Status ShardingCatalogClientMock::removeConfigDocuments(OperationContext* opCtx,
 }
 
 Status ShardingCatalogClientMock::createDatabase(OperationContext* opCtx,
-                                                 const std::string& dbName) {
+                                                 StringData dbName,
+                                                 ShardId primaryShard) {
     return {ErrorCodes::InternalError, "Method not implemented"};
 }
 

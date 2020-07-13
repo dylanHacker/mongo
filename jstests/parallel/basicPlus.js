@@ -1,5 +1,4 @@
 // perform basic js tests in parallel & some other tasks as well
-// @tags: [SERVER-32993]
 load('jstests/libs/parallelTester.js');
 
 var c = db.jstests_parallel_basicPlus;
@@ -29,4 +28,4 @@ for (var i = 4; i < 8; ++i) {
     t.add(EventGenerator.dispatch, g.getEvents());
 }
 
-t.run("one or more tests failed", true);
+t.run("one or more tests failed");

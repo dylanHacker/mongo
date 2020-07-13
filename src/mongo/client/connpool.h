@@ -1,30 +1,30 @@
-/** @file connpool.h */
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -32,11 +32,13 @@
 #include <cstdint>
 #include <stack>
 
-#include "mongo/client/dbclientinterface.h"
+#include "mongo/client/dbclient_base.h"
 #include "mongo/client/mongo_uri.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/stdx/condition_variable.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/mutex.h"
+#include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -69,7 +71,8 @@ struct ConnectionPoolStats;
  * PoolForHost is not thread-safe; thread safety is handled by DBConnectionPool.
  */
 class PoolForHost {
-    MONGO_DISALLOW_COPYING(PoolForHost);
+    PoolForHost(const PoolForHost&) = delete;
+    PoolForHost& operator=(const PoolForHost&) = delete;
 
 public:
     // Sentinel value indicating pool has no cleanup limit
@@ -148,7 +151,19 @@ public:
     // Deletes all connections in the pool
     void clear();
 
-    void done(DBConnectionPool* pool, DBClientBase* c);
+    /**
+     * A concrete statement about the health of a DBClientBase connection
+     */
+    enum class ConnectionHealth {
+        kReuseable,
+        kTooMany,
+        kFailed,
+    };
+
+    /**
+     * Attempt to reclaim the underlying connection behind the DBClientBase
+     */
+    ConnectionHealth done(DBConnectionPool* pool, DBClientBase* c);
 
     void flush();
 
@@ -178,7 +193,7 @@ public:
      * throw if a free connection cannot be acquired within that amount of
      * time. Timeout is in seconds.
      */
-    void waitForFreeConnection(int timeout, stdx::unique_lock<stdx::mutex>& lk);
+    void waitForFreeConnection(int timeout, stdx::unique_lock<Latch>& lk);
 
     /**
      * Notifies any waiters that there are new connections available.
@@ -331,6 +346,7 @@ public:
     int getNumBadConns(const std::string& host, double socketTimeout = 0) const;
 
     void release(const std::string& host, DBClientBase* c);
+    void decrementEgress(const std::string& host, DBClientBase* c);
 
     void addHook(DBConnectionHook* hook);  // we take ownership
     void appendConnectionStats(executor::ConnectionPoolStats* stats) const;
@@ -390,7 +406,8 @@ private:
 
     typedef std::map<PoolKey, PoolForHost, poolKeyCompare> PoolMap;  // servername -> pool
 
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex =
+        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "DBConnectionPool::_mutex");
     std::string _name;
 
     // The maximum number of connections we'll save in the pool per-host
@@ -411,7 +428,8 @@ private:
 };
 
 class AScopedConnection {
-    MONGO_DISALLOW_COPYING(AScopedConnection);
+    AScopedConnection(const AScopedConnection&) = delete;
+    AScopedConnection& operator=(const AScopedConnection&) = delete;
 
 public:
     AScopedConnection() {
@@ -438,7 +456,7 @@ public:
     }
 
 private:
-    static AtomicInt32 _numConnections;
+    static AtomicWord<int> _numConnections;
 };
 
 /** Use to get a connection from the pool.  On exceptions things
@@ -454,7 +472,7 @@ public:
     explicit ScopedDbConnection(const ConnectionString& host, double socketTimeout = 0);
     explicit ScopedDbConnection(const MongoURI& host, double socketTimeout = 0);
 
-    ScopedDbConnection() : _host(""), _conn(0), _socketTimeoutSecs(0) {}
+    ScopedDbConnection() : _host(""), _conn(nullptr), _socketTimeoutSecs(0) {}
 
     /* @param conn - bind to an existing connection */
     ScopedDbConnection(const std::string& host, DBClientBase* conn, double socketTimeout = 0)
@@ -485,7 +503,7 @@ public:
     }
 
     bool ok() const {
-        return _conn != NULL;
+        return _conn != nullptr;
     }
 
     std::string getHost() const {
@@ -495,10 +513,7 @@ public:
     /** Force closure of the connection.  You should call this if you leave it in
         a bad state.  Destructor will do this too, but it is verbose.
     */
-    void kill() {
-        delete _conn;
-        _conn = 0;
-    }
+    void kill();
 
     /** Call this when you are done with the connection.
 

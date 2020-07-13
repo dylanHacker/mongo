@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -38,12 +39,15 @@
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/logv2/log_attr.h"
 
 namespace mongo {
 
 namespace repl {
+class CollectionInfo;
 class OplogEntryBase;
-class ReplOperation;
+class DurableReplOperation;
+class InitialSyncIdDocument;
 }  // namespace repl
 
 namespace idl {
@@ -61,16 +65,30 @@ class UUID {
 
     // Make the IDL generated parser a friend
     friend class ConfigsvrShardCollectionResponse;
+    friend class ShardsvrShardCollectionResponse;
+    friend class ShardsvrRenameCollection;
     friend class DatabaseVersion;
     friend class DbCheckOplogCollection;
+    friend class EncryptionPlaceholder;
     friend class idl::import::One_UUID;
+    friend class IndexBuildEntry;
+    friend class KeyStoreRecord;
     friend class LogicalSessionId;
     friend class LogicalSessionToClient;
     friend class LogicalSessionIdToClient;
     friend class LogicalSessionFromClient;
+    friend class MigrationCoordinatorDocument;
+    friend class MigrationDestinationManager;
+    friend class RangeDeletionTask;
+    friend class ResolvedKeyId;
+    friend class repl::CollectionInfo;
     friend class repl::OplogEntryBase;
-    friend class repl::ReplOperation;
+    friend class repl::DurableReplOperation;
+    friend class repl::InitialSyncIdDocument;
     friend class ResumeTokenInternal;
+    friend class ShardCollectionTypeBase;
+    friend class TenantMigrationDonorDocument;
+    friend class VoteCommitIndexBuild;
 
 public:
     /**
@@ -118,13 +136,18 @@ public:
      * Returns a ConstDataRange view of the UUID.
      */
     ConstDataRange toCDR() const {
-        return ConstDataRange(reinterpret_cast<const char*>(_uuid.data()), _uuid.size());
+        return ConstDataRange(_uuid);
     }
 
     /**
      * Appends to builder as BinData(4, "...") element with the given name.
      */
     void appendToBuilder(BSONObjBuilder* builder, StringData name) const;
+
+    /**
+     * Appends to array builder as BinData(4, "...").
+     */
+    void appendToArrayBuilder(BSONArrayBuilder* builder) const;
 
     /**
      * Returns a BSON object of the form { uuid: BinData(4, "...") }.
@@ -180,6 +203,10 @@ public:
             return hash;
         }
     };
+
+    friend auto logAttrs(const UUID& uuid) {
+        return "uuid"_attr = uuid;
+    }
 
 private:
     UUID(const UUIDStorage& uuid) : _uuid(uuid) {}

@@ -1,23 +1,24 @@
 /**
- *    Copyright 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,15 +29,16 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/db/catalog/capped_utils.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/unittest/unittest.h"
 
 namespace {
@@ -60,11 +62,11 @@ void CappedUtilsTest::setUp() {
     auto service = getServiceContext();
 
     // Set up ReplicationCoordinator and ensure that we are primary.
-    auto replCoord = stdx::make_unique<repl::ReplicationCoordinatorMock>(service);
+    auto replCoord = std::make_unique<repl::ReplicationCoordinatorMock>(service);
     ASSERT_OK(replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
     repl::ReplicationCoordinator::set(service, std::move(replCoord));
 
-    _storage = stdx::make_unique<repl::StorageInterfaceImpl>();
+    _storage = std::make_unique<repl::StorageInterfaceImpl>();
 }
 
 void CappedUtilsTest::tearDown() {
@@ -96,8 +98,7 @@ CollectionOptions getCollectionOptions(OperationContext* opCtx, const NamespaceS
     auto collection = autoColl.getCollection();
     ASSERT_TRUE(collection) << "Unable to get collections options for " << nss
                             << " because collection does not exist.";
-    auto catalogEntry = collection->getCatalogEntry();
-    return catalogEntry->getCollectionOptions(opCtx);
+    return DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, collection->getCatalogId());
 }
 
 // Size of capped collection to be passed to convertToCapped() which accepts a double.
@@ -109,7 +110,8 @@ TEST_F(CappedUtilsTest, ConvertToCappedReturnsNamespaceNotFoundIfCollectionIsMis
     NamespaceString nss("test.t");
     auto opCtx = makeOpCtx();
     ASSERT_FALSE(collectionExists(opCtx.get(), nss));
-    ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, convertToCapped(opCtx.get(), nss, 1000.0));
+    ASSERT_THROWS_CODE(
+        convertToCapped(opCtx.get(), nss, 1000.0), DBException, ErrorCodes::NamespaceNotFound);
 }
 
 TEST_F(CappedUtilsTest, ConvertToCappedUpdatesCollectionOptionsOnSuccess) {
@@ -120,7 +122,7 @@ TEST_F(CappedUtilsTest, ConvertToCappedUpdatesCollectionOptionsOnSuccess) {
     auto options = getCollectionOptions(opCtx.get(), nss);
     ASSERT_FALSE(options.capped);
 
-    ASSERT_OK(convertToCapped(opCtx.get(), nss, cappedCollectionSize));
+    convertToCapped(opCtx.get(), nss, cappedCollectionSize);
     options = getCollectionOptions(opCtx.get(), nss);
     ASSERT_TRUE(options.capped);
     ASSERT_APPROX_EQUAL(cappedCollectionSize, options.cappedSize, 0.001)
@@ -137,8 +139,9 @@ TEST_F(CappedUtilsTest, ConvertToCappedReturnsNamespaceNotFoundIfCollectionIsDro
     auto options = getCollectionOptions(opCtx.get(), dropPendingNss);
     ASSERT_FALSE(options.capped);
 
-    ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
-                  convertToCapped(opCtx.get(), dropPendingNss, cappedCollectionSize));
+    ASSERT_THROWS_CODE(convertToCapped(opCtx.get(), dropPendingNss, cappedCollectionSize),
+                       DBException,
+                       ErrorCodes::NamespaceNotFound);
     options = getCollectionOptions(opCtx.get(), dropPendingNss);
     ASSERT_FALSE(options.capped);
 }

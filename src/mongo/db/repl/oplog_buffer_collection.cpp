@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -25,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -41,7 +42,6 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace repl {
@@ -65,17 +65,16 @@ std::tuple<BSONObj, Timestamp, std::size_t> OplogBufferCollection::addIdToDocume
     const BSONObj& orig, const Timestamp& lastTimestamp, std::size_t sentinelCount) {
     if (orig.isEmpty()) {
         return std::make_tuple(
-            BSON(kIdFieldName << BSON(
-                     kTimestampFieldName << lastTimestamp << kSentinelFieldName
-                                         << static_cast<long long>(sentinelCount + 1))),
+            BSON(kIdFieldName << BSON(kTimestampFieldName
+                                      << lastTimestamp << kSentinelFieldName
+                                      << static_cast<long long>(sentinelCount + 1))),
             lastTimestamp,
             sentinelCount + 1);
     }
     const auto ts = orig[kTimestampFieldName].timestamp();
     invariant(!ts.isNull());
     auto doc = BSON(kIdFieldName << BSON(kTimestampFieldName << ts << kSentinelFieldName << 0)
-                                 << kOplogEntryFieldName
-                                 << orig);
+                                 << kOplogEntryFieldName << orig);
     return std::make_tuple(doc, ts, 0);
 }
 
@@ -106,7 +105,7 @@ void OplogBufferCollection::startup(OperationContext* opCtx) {
         return;
     }
 
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     // If we are starting from an existing collection, we must populate the in memory state of the
     // buffer.
     auto sizeResult = _storageInterface->getCollectionSize(opCtx, _nss);
@@ -148,7 +147,7 @@ void OplogBufferCollection::startup(OperationContext* opCtx) {
 
 void OplogBufferCollection::shutdown(OperationContext* opCtx) {
     if (_options.dropCollectionAtShutdown) {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         _dropCollection(opCtx);
         _size = 0;
         _count = 0;
@@ -159,24 +158,15 @@ void OplogBufferCollection::shutdown(OperationContext* opCtx) {
     }
 }
 
-void OplogBufferCollection::pushEvenIfFull(OperationContext* opCtx, const Value& value) {
-    Batch valueBatch = {value};
-    pushAllNonBlocking(opCtx, valueBatch.begin(), valueBatch.end());
-}
-
-void OplogBufferCollection::push(OperationContext* opCtx, const Value& value) {
-    pushEvenIfFull(opCtx, value);
-}
-
-void OplogBufferCollection::pushAllNonBlocking(OperationContext* opCtx,
-                                               Batch::const_iterator begin,
-                                               Batch::const_iterator end) {
+void OplogBufferCollection::push(OperationContext* opCtx,
+                                 Batch::const_iterator begin,
+                                 Batch::const_iterator end) {
     if (begin == end) {
         return;
     }
     size_t numDocs = std::distance(begin, end);
     std::vector<InsertStatement> docsToInsert(numDocs);
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     auto ts = _lastPushedTimestamp;
     auto sentinelCount = _sentinelCount;
     std::transform(begin, end, docsToInsert.begin(), [&sentinelCount, &ts](const Value& value) {
@@ -202,7 +192,7 @@ void OplogBufferCollection::pushAllNonBlocking(OperationContext* opCtx,
 void OplogBufferCollection::waitForSpace(OperationContext* opCtx, std::size_t size) {}
 
 bool OplogBufferCollection::isEmpty() const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _count == 0;
 }
 
@@ -211,17 +201,17 @@ std::size_t OplogBufferCollection::getMaxSize() const {
 }
 
 std::size_t OplogBufferCollection::getSize() const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _size;
 }
 
 std::size_t OplogBufferCollection::getCount() const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _count;
 }
 
 void OplogBufferCollection::clear(OperationContext* opCtx) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _dropCollection(opCtx);
     _createCollection(opCtx);
     _size = 0;
@@ -233,7 +223,7 @@ void OplogBufferCollection::clear(OperationContext* opCtx) {
 }
 
 bool OplogBufferCollection::tryPop(OperationContext* opCtx, Value* value) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     if (_count == 0) {
         return false;
     }
@@ -241,7 +231,7 @@ bool OplogBufferCollection::tryPop(OperationContext* opCtx, Value* value) {
 }
 
 bool OplogBufferCollection::waitForData(Seconds waitDuration) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     if (!_cvNoLongerEmpty.wait_for(
             lk, waitDuration.toSystemDuration(), [&]() { return _count != 0; })) {
         return false;
@@ -250,7 +240,7 @@ bool OplogBufferCollection::waitForData(Seconds waitDuration) {
 }
 
 bool OplogBufferCollection::peek(OperationContext* opCtx, Value* value) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     if (_count == 0) {
         return false;
     }
@@ -260,7 +250,7 @@ bool OplogBufferCollection::peek(OperationContext* opCtx, Value* value) {
 
 boost::optional<OplogBuffer::Value> OplogBufferCollection::lastObjectPushed(
     OperationContext* opCtx) const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     auto lastDocumentPushed = _lastDocumentPushed_inlock(opCtx);
     if (lastDocumentPushed) {
         BSONObj entryObj = extractEmbeddedOplogDocument(*lastDocumentPushed);
@@ -355,31 +345,33 @@ BSONObj OplogBufferCollection::_peek_inlock(OperationContext* opCtx, PeekMode pe
 void OplogBufferCollection::_createCollection(OperationContext* opCtx) {
     CollectionOptions options;
     options.temp = true;
+    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
     fassert(40154, _storageInterface->createCollection(opCtx, _nss, options));
 }
 
 void OplogBufferCollection::_dropCollection(OperationContext* opCtx) {
+    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
     fassert(40155, _storageInterface->dropCollection(opCtx, _nss));
 }
 
 std::size_t OplogBufferCollection::getSentinelCount_forTest() const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _sentinelCount;
 }
 
 Timestamp OplogBufferCollection::getLastPushedTimestamp_forTest() const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _lastPushedTimestamp;
 }
 
 Timestamp OplogBufferCollection::getLastPoppedTimestamp_forTest() const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _lastPoppedKey.isEmpty() ? Timestamp()
                                     : _lastPoppedKey[""].Obj()[kTimestampFieldName].timestamp();
 }
 
 std::queue<BSONObj> OplogBufferCollection::getPeekCache_forTest() const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _peekCache;
 }
 

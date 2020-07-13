@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -60,14 +61,15 @@ TEST(MatchExpressionParserLeafTest, NullCollation) {
 TEST(MatchExpressionParserLeafTest, Collation) {
     BSONObj query = BSON("x"
                          << "string");
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kAlwaysEqual);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kAlwaysEqual);
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(&collator);
+    expCtx->setCollator(std::move(collator));
     StatusWithMatchExpression result = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(result.getStatus());
     ASSERT_EQUALS(MatchExpression::EQ, result.getValue()->matchType());
     EqualityMatchExpression* match = static_cast<EqualityMatchExpression*>(result.getValue().get());
-    ASSERT_TRUE(match->getCollator() == &collator);
+    ASSERT_TRUE(match->getCollator() == expCtx->getCollator());
 }
 
 TEST(MatchExpressionParserLeafTest, SimpleEQ2) {
@@ -103,14 +105,15 @@ TEST(MatchExpressionParserLeafTest, EQNullCollation) {
 TEST(MatchExpressionParserLeafTest, EQCollation) {
     BSONObj query = BSON("x" << BSON("$eq"
                                      << "string"));
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kAlwaysEqual);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kAlwaysEqual);
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(&collator);
+    expCtx->setCollator(std::move(collator));
     StatusWithMatchExpression result = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(result.getStatus());
     ASSERT_EQUALS(MatchExpression::EQ, result.getValue()->matchType());
     EqualityMatchExpression* match = static_cast<EqualityMatchExpression*>(result.getValue().get());
-    ASSERT_TRUE(match->getCollator() == &collator);
+    ASSERT_TRUE(match->getCollator() == expCtx->getCollator());
 }
 
 TEST(MatchExpressionParserLeafTest, SimpleGT1) {
@@ -138,14 +141,15 @@ TEST(MatchExpressionParserLeafTest, GTNullCollation) {
 TEST(MatchExpressionParserLeafTest, GTCollation) {
     BSONObj query = BSON("x" << BSON("$gt"
                                      << "abc"));
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(&collator);
+    expCtx->setCollator(std::move(collator));
     StatusWithMatchExpression result = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(result.getStatus());
     ASSERT_EQUALS(MatchExpression::GT, result.getValue()->matchType());
     GTMatchExpression* match = static_cast<GTMatchExpression*>(result.getValue().get());
-    ASSERT_TRUE(match->getCollator() == &collator);
+    ASSERT_TRUE(match->getCollator() == expCtx->getCollator());
 }
 
 TEST(MatchExpressionParserLeafTest, SimpleLT1) {
@@ -174,14 +178,15 @@ TEST(MatchExpressionParserLeafTest, LTNullCollation) {
 TEST(MatchExpressionParserLeafTest, LTCollation) {
     BSONObj query = BSON("x" << BSON("$lt"
                                      << "abc"));
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(&collator);
+    expCtx->setCollator(std::move(collator));
     StatusWithMatchExpression result = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(result.getStatus());
     ASSERT_EQUALS(MatchExpression::LT, result.getValue()->matchType());
     LTMatchExpression* match = static_cast<LTMatchExpression*>(result.getValue().get());
-    ASSERT_TRUE(match->getCollator() == &collator);
+    ASSERT_TRUE(match->getCollator() == expCtx->getCollator());
 }
 
 TEST(MatchExpressionParserLeafTest, SimpleGTE1) {
@@ -210,14 +215,15 @@ TEST(MatchExpressionParserLeafTest, GTENullCollation) {
 TEST(MatchExpressionParserLeafTest, GTECollation) {
     BSONObj query = BSON("x" << BSON("$gte"
                                      << "abc"));
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(&collator);
+    expCtx->setCollator(std::move(collator));
     StatusWithMatchExpression result = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(result.getStatus());
     ASSERT_EQUALS(MatchExpression::GTE, result.getValue()->matchType());
     GTEMatchExpression* match = static_cast<GTEMatchExpression*>(result.getValue().get());
-    ASSERT_TRUE(match->getCollator() == &collator);
+    ASSERT_TRUE(match->getCollator() == expCtx->getCollator());
 }
 
 TEST(MatchExpressionParserLeafTest, SimpleLTE1) {
@@ -246,14 +252,15 @@ TEST(MatchExpressionParserLeafTest, LTENullCollation) {
 TEST(MatchExpressionParserLeafTest, LTECollation) {
     BSONObj query = BSON("x" << BSON("$lte"
                                      << "abc"));
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(&collator);
+    expCtx->setCollator(std::move(collator));
     StatusWithMatchExpression result = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(result.getStatus());
     ASSERT_EQUALS(MatchExpression::LTE, result.getValue()->matchType());
     LTEMatchExpression* match = static_cast<LTEMatchExpression*>(result.getValue().get());
-    ASSERT_TRUE(match->getCollator() == &collator);
+    ASSERT_TRUE(match->getCollator() == expCtx->getCollator());
 }
 
 TEST(MatchExpressionParserLeafTest, SimpleNE1) {
@@ -284,16 +291,17 @@ TEST(MatchExpressionParserLeafTest, NENullCollation) {
 TEST(MatchExpressionParserLeafTest, NECollation) {
     BSONObj query = BSON("x" << BSON("$ne"
                                      << "string"));
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kAlwaysEqual);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kAlwaysEqual);
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(&collator);
+    expCtx->setCollator(std::move(collator));
     StatusWithMatchExpression result = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(result.getStatus());
     ASSERT_EQUALS(MatchExpression::NOT, result.getValue()->matchType());
     MatchExpression* child = result.getValue()->getChild(0);
     ASSERT_EQUALS(MatchExpression::EQ, child->matchType());
     EqualityMatchExpression* eqMatch = static_cast<EqualityMatchExpression*>(child);
-    ASSERT_TRUE(eqMatch->getCollator() == &collator);
+    ASSERT_TRUE(eqMatch->getCollator() == expCtx->getCollator());
 }
 
 TEST(MatchExpressionParserLeafTest, SimpleModBad1) {
@@ -321,6 +329,14 @@ TEST(MatchExpressionParserLeafTest, SimpleModBad1) {
     query = BSON("x" << BSON("$mod" << BSON("a" << 1 << "b" << 2)));
     result = MatchExpressionParser::parse(query, expCtx);
     ASSERT_NOT_OK(result.getStatus());
+
+    query = BSON("x" << BSON("$mod" << BSON_ARRAY(5 << "r")));
+    result = MatchExpressionParser::parse(query, expCtx);
+    ASSERT_NOT_OK(result.getStatus());
+
+    query = BSON("x" << BSON("$mod" << BSON_ARRAY(5 << BSONNULL)));
+    result = MatchExpressionParser::parse(query, expCtx);
+    ASSERT_NOT_OK(result.getStatus());
 }
 
 TEST(MatchExpressionParserLeafTest, SimpleMod1) {
@@ -332,19 +348,6 @@ TEST(MatchExpressionParserLeafTest, SimpleMod1) {
     ASSERT(result.getValue()->matchesBSON(BSON("x" << 5)));
     ASSERT(!result.getValue()->matchesBSON(BSON("x" << 4)));
     ASSERT(result.getValue()->matchesBSON(BSON("x" << 8)));
-}
-
-TEST(MatchExpressionParserLeafTest, SimpleModNotNumber) {
-    BSONObj query = BSON("x" << BSON("$mod" << BSON_ARRAY(2 << "r")));
-    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    StatusWithMatchExpression result = MatchExpressionParser::parse(query, expCtx);
-    ASSERT_OK(result.getStatus());
-
-    ASSERT(result.getValue()->matchesBSON(BSON("x" << 2)));
-    ASSERT(result.getValue()->matchesBSON(BSON("x" << 4)));
-    ASSERT(!result.getValue()->matchesBSON(BSON("x" << 5)));
-    ASSERT(!result.getValue()->matchesBSON(BSON("x"
-                                                << "a")));
 }
 
 TEST(MatchExpressionParserLeafTest, IdCollation) {
@@ -361,22 +364,24 @@ TEST(MatchExpressionParserLeafTest, IdCollation) {
 TEST(MatchExpressionParserLeafTest, IdNullCollation) {
     BSONObj query = BSON("$id"
                          << "string");
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kAlwaysEqual);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kAlwaysEqual);
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(&collator);
+    expCtx->setCollator(std::move(collator));
     StatusWithMatchExpression result = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(result.getStatus());
     ASSERT_EQUALS(MatchExpression::EQ, result.getValue()->matchType());
     EqualityMatchExpression* match = static_cast<EqualityMatchExpression*>(result.getValue().get());
-    ASSERT_TRUE(match->getCollator() == &collator);
+    ASSERT_TRUE(match->getCollator() == expCtx->getCollator());
 }
 
 TEST(MatchExpressionParserLeafTest, RefCollation) {
     BSONObj query = BSON("$ref"
                          << "coll");
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kAlwaysEqual);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kAlwaysEqual);
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(&collator);
+    expCtx->setCollator(std::move(collator));
     StatusWithMatchExpression result = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(result.getStatus());
     ASSERT_EQUALS(MatchExpression::EQ, result.getValue()->matchType());
@@ -387,9 +392,10 @@ TEST(MatchExpressionParserLeafTest, RefCollation) {
 TEST(MatchExpressionParserLeafTest, DbCollation) {
     BSONObj query = BSON("$db"
                          << "db");
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kAlwaysEqual);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kAlwaysEqual);
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(&collator);
+    expCtx->setCollator(std::move(collator));
     StatusWithMatchExpression result = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(result.getStatus());
     ASSERT_EQUALS(MatchExpression::EQ, result.getValue()->matchType());
@@ -420,23 +426,22 @@ TEST(MatchExpressionParserLeafTest, INNullCollation) {
 
 TEST(MatchExpressionParserLeafTest, INCollation) {
     BSONObj query = BSON("x" << BSON("$in" << BSON_ARRAY("string")));
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kAlwaysEqual);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kAlwaysEqual);
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(&collator);
+    expCtx->setCollator(std::move(collator));
     StatusWithMatchExpression result = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(result.getStatus());
     ASSERT_EQUALS(MatchExpression::MATCH_IN, result.getValue()->matchType());
     InMatchExpression* match = static_cast<InMatchExpression*>(result.getValue().get());
-    ASSERT_TRUE(match->getCollator() == &collator);
+    ASSERT_TRUE(match->getCollator() == expCtx->getCollator());
 }
 
 TEST(MatchExpressionParserLeafTest, INSingleDBRef) {
     OID oid = OID::gen();
     BSONObj query = BSON("x" << BSON("$in" << BSON_ARRAY(BSON("$ref"
                                                               << "coll"
-                                                              << "$id"
-                                                              << oid
-                                                              << "$db"
+                                                              << "$id" << oid << "$db"
                                                               << "db"))));
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     StatusWithMatchExpression result = MatchExpressionParser::parse(query, expCtx);
@@ -445,15 +450,11 @@ TEST(MatchExpressionParserLeafTest, INSingleDBRef) {
     OID oidx = OID::gen();
     ASSERT(!result.getValue()->matchesBSON(BSON("x" << BSON("$ref"
                                                             << "collx"
-                                                            << "$id"
-                                                            << oidx
-                                                            << "$db"
+                                                            << "$id" << oidx << "$db"
                                                             << "db"))));
     ASSERT(!result.getValue()->matchesBSON(BSON("x" << BSON("$ref"
                                                             << "coll"
-                                                            << "$id"
-                                                            << oidx
-                                                            << "$db"
+                                                            << "$id" << oidx << "$db"
                                                             << "db"))));
     ASSERT(!result.getValue()->matchesBSON(BSON("x" << BSON("$id" << oid << "$ref"
                                                                   << "coll"
@@ -469,39 +470,28 @@ TEST(MatchExpressionParserLeafTest, INSingleDBRef) {
                                                                              << "db")))));
     ASSERT(!result.getValue()->matchesBSON(BSON("x" << BSON("$ref"
                                                             << "coll"
-                                                            << "$id"
-                                                            << oid
-                                                            << "$db"
+                                                            << "$id" << oid << "$db"
                                                             << "dbx"))));
     ASSERT(!result.getValue()->matchesBSON(BSON("x" << BSON("$db"
                                                             << "db"
                                                             << "$ref"
                                                             << "coll"
-                                                            << "$id"
-                                                            << oid))));
+                                                            << "$id" << oid))));
     ASSERT(result.getValue()->matchesBSON(BSON("x" << BSON("$ref"
                                                            << "coll"
-                                                           << "$id"
-                                                           << oid
-                                                           << "$db"
+                                                           << "$id" << oid << "$db"
                                                            << "db"))));
     ASSERT(result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(BSON("$ref"
                                                                       << "coll"
-                                                                      << "$id"
-                                                                      << oid
-                                                                      << "$db"
+                                                                      << "$id" << oid << "$db"
                                                                       << "db")))));
     ASSERT(result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(BSON("$ref"
                                                                       << "collx"
-                                                                      << "$id"
-                                                                      << oidx
-                                                                      << "$db"
+                                                                      << "$id" << oidx << "$db"
                                                                       << "db")
                                                                  << BSON("$ref"
                                                                          << "coll"
-                                                                         << "$id"
-                                                                         << oid
-                                                                         << "$db"
+                                                                         << "$id" << oid << "$db"
                                                                          << "db")))));
 }
 
@@ -510,15 +500,11 @@ TEST(MatchExpressionParserLeafTest, INMultipleDBRef) {
     OID oidy = OID::gen();
     BSONObj query = BSON("x" << BSON("$in" << BSON_ARRAY(BSON("$ref"
                                                               << "colly"
-                                                              << "$id"
-                                                              << oidy
-                                                              << "$db"
+                                                              << "$id" << oidy << "$db"
                                                               << "db")
                                                          << BSON("$ref"
                                                                  << "coll"
-                                                                 << "$id"
-                                                                 << oid
-                                                                 << "$db"
+                                                                 << "$id" << oid << "$db"
                                                                  << "db"))));
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     StatusWithMatchExpression result = MatchExpressionParser::parse(query, expCtx);
@@ -527,15 +513,11 @@ TEST(MatchExpressionParserLeafTest, INMultipleDBRef) {
     OID oidx = OID::gen();
     ASSERT(!result.getValue()->matchesBSON(BSON("x" << BSON("$ref"
                                                             << "collx"
-                                                            << "$id"
-                                                            << oidx
-                                                            << "$db"
+                                                            << "$id" << oidx << "$db"
                                                             << "db"))));
     ASSERT(!result.getValue()->matchesBSON(BSON("x" << BSON("$ref"
                                                             << "coll"
-                                                            << "$id"
-                                                            << oidx
-                                                            << "$db"
+                                                            << "$id" << oidx << "$db"
                                                             << "db"))));
     ASSERT(!result.getValue()->matchesBSON(BSON("x" << BSON("$id" << oid << "$ref"
                                                                   << "coll"
@@ -543,15 +525,11 @@ TEST(MatchExpressionParserLeafTest, INMultipleDBRef) {
                                                                   << "db"))));
     ASSERT(!result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(BSON("$ref"
                                                                        << "coll"
-                                                                       << "$id"
-                                                                       << oidy
-                                                                       << "$db"
+                                                                       << "$id" << oidy << "$db"
                                                                        << "db")))));
     ASSERT(!result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(BSON("$ref"
                                                                        << "colly"
-                                                                       << "$id"
-                                                                       << oid
-                                                                       << "$db"
+                                                                       << "$id" << oid << "$db"
                                                                        << "db")))));
     ASSERT(!result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(BSON("$id" << oid << "$ref"
                                                                              << "coll"
@@ -559,9 +537,7 @@ TEST(MatchExpressionParserLeafTest, INMultipleDBRef) {
                                                                              << "db")))));
     ASSERT(!result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(BSON("$ref"
                                                                        << "coll"
-                                                                       << "$id"
-                                                                       << oid
-                                                                       << "$db"
+                                                                       << "$id" << oid << "$db"
                                                                        << "dbx")))));
     ASSERT(!result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(BSON("$id" << oidy << "$ref"
                                                                              << "colly"
@@ -569,87 +545,59 @@ TEST(MatchExpressionParserLeafTest, INMultipleDBRef) {
                                                                              << "db")))));
     ASSERT(!result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(BSON("$ref"
                                                                        << "collx"
-                                                                       << "$id"
-                                                                       << oidx
-                                                                       << "$db"
+                                                                       << "$id" << oidx << "$db"
                                                                        << "db")
                                                                   << BSON("$ref"
                                                                           << "coll"
-                                                                          << "$id"
-                                                                          << oidx
-                                                                          << "$db"
+                                                                          << "$id" << oidx << "$db"
                                                                           << "db")))));
     ASSERT(!result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(BSON("$ref"
                                                                        << "collx"
-                                                                       << "$id"
-                                                                       << oidx
-                                                                       << "$db"
+                                                                       << "$id" << oidx << "$db"
                                                                        << "db")
                                                                   << BSON("$ref"
                                                                           << "colly"
-                                                                          << "$id"
-                                                                          << oidx
-                                                                          << "$db"
+                                                                          << "$id" << oidx << "$db"
                                                                           << "db")))));
     ASSERT(!result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(BSON("$ref"
                                                                        << "collx"
-                                                                       << "$id"
-                                                                       << oidx
-                                                                       << "$db"
+                                                                       << "$id" << oidx << "$db"
                                                                        << "db")
                                                                   << BSON("$ref"
                                                                           << "coll"
-                                                                          << "$id"
-                                                                          << oid
-                                                                          << "$db"
+                                                                          << "$id" << oid << "$db"
                                                                           << "dbx")))));
     ASSERT(result.getValue()->matchesBSON(BSON("x" << BSON("$ref"
                                                            << "coll"
-                                                           << "$id"
-                                                           << oid
-                                                           << "$db"
+                                                           << "$id" << oid << "$db"
                                                            << "db"))));
     ASSERT(result.getValue()->matchesBSON(BSON("x" << BSON("$ref"
                                                            << "colly"
-                                                           << "$id"
-                                                           << oidy
-                                                           << "$db"
+                                                           << "$id" << oidy << "$db"
                                                            << "db"))));
     ASSERT(result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(BSON("$ref"
                                                                       << "coll"
-                                                                      << "$id"
-                                                                      << oid
-                                                                      << "$db"
+                                                                      << "$id" << oid << "$db"
                                                                       << "db")))));
     ASSERT(result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(BSON("$ref"
                                                                       << "colly"
-                                                                      << "$id"
-                                                                      << oidy
-                                                                      << "$db"
+                                                                      << "$id" << oidy << "$db"
                                                                       << "db")))));
     ASSERT(result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(BSON("$ref"
                                                                       << "collx"
-                                                                      << "$id"
-                                                                      << oidx
-                                                                      << "$db"
+                                                                      << "$id" << oidx << "$db"
                                                                       << "db")
                                                                  << BSON("$ref"
                                                                          << "coll"
-                                                                         << "$id"
-                                                                         << oid
-                                                                         << "$db"
+                                                                         << "$id" << oid << "$db"
                                                                          << "db")))));
     ASSERT(result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(BSON("$ref"
                                                                       << "collx"
-                                                                      << "$id"
-                                                                      << oidx
-                                                                      << "$db"
+                                                                      << "$id" << oidx << "$db"
                                                                       << "db")
                                                                  << BSON("$ref"
                                                                          << "colly"
-                                                                         << "$id"
-                                                                         << oidy
-                                                                         << "$db"
+                                                                         << "$id" << oidy << "$db"
                                                                          << "db")))));
 }
 
@@ -657,10 +605,7 @@ TEST(MatchExpressionParserLeafTest, INDBRefWithOptionalField1) {
     OID oid = OID::gen();
     BSONObj query = BSON("x" << BSON("$in" << BSON_ARRAY(BSON("$ref"
                                                               << "coll"
-                                                              << "$id"
-                                                              << oid
-                                                              << "foo"
-                                                              << 12345))));
+                                                              << "$id" << oid << "foo" << 12345))));
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     StatusWithMatchExpression result = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(result.getStatus());
@@ -668,28 +613,19 @@ TEST(MatchExpressionParserLeafTest, INDBRefWithOptionalField1) {
     OID oidx = OID::gen();
     ASSERT(!result.getValue()->matchesBSON(BSON("x" << BSON("$ref"
                                                             << "coll"
-                                                            << "$id"
-                                                            << oidx
-                                                            << "$db"
+                                                            << "$id" << oidx << "$db"
                                                             << "db"))));
-    ASSERT(result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(BSON("$ref"
-                                                                      << "coll"
-                                                                      << "$id"
-                                                                      << oid
-                                                                      << "foo"
-                                                                      << 12345)))));
-    ASSERT(result.getValue()->matchesBSON(BSON("x" << BSON_ARRAY(BSON("$ref"
-                                                                      << "collx"
-                                                                      << "$id"
-                                                                      << oidx
-                                                                      << "foo"
-                                                                      << 12345)
-                                                                 << BSON("$ref"
-                                                                         << "coll"
-                                                                         << "$id"
-                                                                         << oid
-                                                                         << "foo"
-                                                                         << 12345)))));
+    ASSERT(result.getValue()->matchesBSON(
+        BSON("x" << BSON_ARRAY(BSON("$ref"
+                                    << "coll"
+                                    << "$id" << oid << "foo" << 12345)))));
+    ASSERT(result.getValue()->matchesBSON(
+        BSON("x" << BSON_ARRAY(BSON("$ref"
+                                    << "collx"
+                                    << "$id" << oidx << "foo" << 12345)
+                               << BSON("$ref"
+                                       << "coll"
+                                       << "$id" << oid << "foo" << 12345)))));
 }
 
 TEST(MatchExpressionParserLeafTest, INInvalidDBRefs) {
@@ -703,8 +639,7 @@ TEST(MatchExpressionParserLeafTest, INInvalidDBRefs) {
     // second field is not $id
     query = BSON("x" << BSON("$in" << BSON_ARRAY(BSON("$ref"
                                                       << "coll"
-                                                      << "$foo"
-                                                      << 1))));
+                                                      << "$foo" << 1))));
     result = MatchExpressionParser::parse(query, expCtx);
     ASSERT_NOT_OK(result.getStatus());
 
@@ -718,8 +653,7 @@ TEST(MatchExpressionParserLeafTest, INInvalidDBRefs) {
     // missing $id and $ref field
     query = BSON("x" << BSON("$in" << BSON_ARRAY(BSON("$db"
                                                       << "test"
-                                                      << "foo"
-                                                      << 3))));
+                                                      << "foo" << 3))));
     result = MatchExpressionParser::parse(query, expCtx);
     ASSERT_NOT_OK(result.getStatus());
 }
@@ -837,16 +771,17 @@ TEST(MatchExpressionParserLeafTest, NINNullCollation) {
 
 TEST(MatchExpressionParserLeafTest, NINCollation) {
     BSONObj query = BSON("x" << BSON("$nin" << BSON_ARRAY("string")));
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kAlwaysEqual);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kAlwaysEqual);
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(&collator);
+    expCtx->setCollator(std::move(collator));
     StatusWithMatchExpression result = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(result.getStatus());
     ASSERT_EQUALS(MatchExpression::NOT, result.getValue()->matchType());
     MatchExpression* child = result.getValue()->getChild(0);
     ASSERT_EQUALS(MatchExpression::MATCH_IN, child->matchType());
     InMatchExpression* inMatch = static_cast<InMatchExpression*>(child);
-    ASSERT_TRUE(inMatch->getCollator() == &collator);
+    ASSERT_TRUE(inMatch->getCollator() == expCtx->getCollator());
 }
 
 TEST(MatchExpressionParserLeafTest, Regex1) {
@@ -1239,10 +1174,10 @@ TEST(MatchExpressionParserLeafTest, InvalidTypeCodeUnusedBetweenMinAndMaxFailsTo
 }
 
 TEST(MatchExpressionParserLeafTest, ValidTypeCodesParseSuccessfully) {
-    std::vector<BSONType> validTypes{
-        MinKey,    EOO,    NumberDouble, String,    Object,        Array,      BinData,
-        Undefined, jstOID, Bool,         Date,      jstNULL,       RegEx,      DBRef,
-        Code,      Symbol, CodeWScope,   NumberInt, bsonTimestamp, NumberLong, MaxKey};
+    std::vector<BSONType> validTypes{MinKey,     NumberDouble, String,        Object,     Array,
+                                     BinData,    Undefined,    jstOID,        Bool,       Date,
+                                     jstNULL,    RegEx,        DBRef,         Code,       Symbol,
+                                     CodeWScope, NumberInt,    bsonTimestamp, NumberLong, MaxKey};
 
     for (auto type : validTypes) {
         BSONObj predicate = BSON("a" << BSON("$type" << type));

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -39,12 +40,13 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -91,36 +93,40 @@ public:
         uassert(ErrorCodes::IllegalOperation,
                 "_configsvrRemoveShard can only be run on config servers",
                 serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+        uassert(
+            ErrorCodes::InvalidOptions,
+            str::stream() << "_configsvrRemoveShard must be called with majority writeConcern, got "
+                          << cmdObj,
+            opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
 
-        uassert(ErrorCodes::TypeMismatch,
-                str::stream() << "Field '" << cmdObj.firstElement().fieldName()
-                              << "' must be of type string",
-                cmdObj.firstElement().type() == BSONType::String);
-        const std::string target = cmdObj.firstElement().str();
+        // Set the operation context read concern level to local for reads into the config database.
+        repl::ReadConcernArgs::get(opCtx) =
+            repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
 
-        uassert(ErrorCodes::InvalidOptions,
-                str::stream() << "removeShard must be called with majority writeConcern, got "
-                              << cmdObj,
-                opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
-
-        const auto shardStatus =
-            Grid::get(opCtx)->shardRegistry()->getShard(opCtx, ShardId(target));
-        if (!shardStatus.isOK()) {
-            std::string msg(str::stream() << "Could not drop shard '" << target
-                                          << "' because it does not exist");
-            log() << msg;
-            return CommandHelpers::appendCommandStatus(result,
-                                                       Status(ErrorCodes::ShardNotFound, msg));
-        }
-        const auto& shard = shardStatus.getValue();
+        const auto shardId = [&] {
+            const auto shardIdOrUrl(cmdObj.firstElement().String());
+            auto shard =
+                uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardIdOrUrl));
+            return shard->getId();
+        }();
 
         const auto shardingCatalogManager = ShardingCatalogManager::get(opCtx);
 
-        const auto shardDrainingStatus =
-            uassertStatusOK(shardingCatalogManager->removeShard(opCtx, shard->getId()));
+        const auto shardDrainingStatus = [&] {
+            try {
+                return shardingCatalogManager->removeShard(opCtx, shardId);
+            } catch (const DBException& ex) {
+                LOGV2(21923,
+                      "Failed to remove shard {shardId} due to {error}",
+                      "Failed to remove shard",
+                      "shardId"_attr = shardId,
+                      "error"_attr = redact(ex));
+                throw;
+            }
+        }();
 
-        std::vector<std::string> databases =
-            uassertStatusOK(shardingCatalogManager->getDatabasesForShard(opCtx, shard->getId()));
+        const auto databases =
+            uassertStatusOK(shardingCatalogManager->getDatabasesForShard(opCtx, shardId));
 
         // Get BSONObj containing:
         // 1) note about moving or dropping databases in a shard
@@ -140,39 +146,28 @@ public:
             return dbInfoBuilder.obj();
         }();
 
-        // TODO: Standardize/separate how we append to the result object
-        switch (shardDrainingStatus) {
-            case ShardDrainingStatus::STARTED:
+        switch (shardDrainingStatus.status) {
+            case RemoveShardProgress::STARTED:
                 result.append("msg", "draining started successfully");
                 result.append("state", "started");
-                result.append("shard", shard->getId().toString());
+                result.append("shard", shardId);
                 result.appendElements(dbInfo);
                 break;
-            case ShardDrainingStatus::ONGOING: {
-                const auto swChunks = Grid::get(opCtx)->catalogClient()->getChunks(
-                    opCtx,
-                    BSON(ChunkType::shard(shard->getId().toString())),
-                    BSONObj(),
-                    boost::none,  // return all
-                    nullptr,
-                    repl::ReadConcernLevel::kMajorityReadConcern);
-                if (!swChunks.isOK()) {
-                    return CommandHelpers::appendCommandStatus(result, swChunks.getStatus());
-                }
-
-                const auto& chunks = swChunks.getValue();
+            case RemoveShardProgress::ONGOING: {
+                const auto& remainingCounts = shardDrainingStatus.remainingCounts;
                 result.append("msg", "draining ongoing");
                 result.append("state", "ongoing");
                 result.append("remaining",
-                              BSON("chunks" << static_cast<long long>(chunks.size()) << "dbs"
-                                            << static_cast<long long>(databases.size())));
+                              BSON("chunks" << remainingCounts->totalChunks << "dbs"
+                                            << remainingCounts->databases << "jumboChunks"
+                                            << remainingCounts->jumboChunks));
                 result.appendElements(dbInfo);
                 break;
             }
-            case ShardDrainingStatus::COMPLETED:
+            case RemoveShardProgress::COMPLETED:
                 result.append("msg", "removeshard completed successfully");
                 result.append("state", "completed");
-                result.append("shard", shard->getId().toString());
+                result.append("shard", shardId);
                 break;
         }
 

@@ -1,32 +1,35 @@
 /**
-*    Copyright (C) 2017 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #include "mongo/platform/basic.h"
+
+#include <memory>
 
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/database_holder.h"
@@ -39,7 +42,7 @@
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/logger/logger.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/unittest/log_test.h"
 
 namespace mongo {
 namespace repl {
@@ -78,6 +81,9 @@ private:
     void tearDown() override;
 
 protected:
+    // Reset default log level when each test is over in case it was changed.
+    unittest::MinimumLoggedSeverityGuard _verbosityGuard{logv2::LogComponent::kReplication};
+
     OpObserverMock* _opObserver = nullptr;
     std::unique_ptr<StorageInterface> _storage;
 };
@@ -90,7 +96,7 @@ void ApplyOpsTest::setUp() {
     auto opCtx = cc().makeOperationContext();
 
     // Set up ReplicationCoordinator and create oplog.
-    ReplicationCoordinator::set(service, stdx::make_unique<ReplicationCoordinatorMock>(service));
+    ReplicationCoordinator::set(service, std::make_unique<ReplicationCoordinatorMock>(service));
     setOplogCollectionName(service);
     createOplog(opCtx.get());
 
@@ -99,22 +105,18 @@ void ApplyOpsTest::setUp() {
     ASSERT_OK(replCoord->setFollowerMode(MemberState::RS_PRIMARY));
 
     // Use OpObserverMock to track notifications for applyOps().
-    auto opObserver = stdx::make_unique<OpObserverMock>();
+    auto opObserver = std::make_unique<OpObserverMock>();
     _opObserver = opObserver.get();
     service->setOpObserver(std::move(opObserver));
 
     // This test uses StorageInterface to create collections and inspect documents inside
     // collections.
-    _storage = stdx::make_unique<StorageInterfaceImpl>();
+    _storage = std::make_unique<StorageInterfaceImpl>();
 }
 
 void ApplyOpsTest::tearDown() {
     _storage = {};
     _opObserver = nullptr;
-
-    // Reset default log level in case it was changed.
-    logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogComponent::kReplication,
-                                                        logger::LogSeverity::Debug(0));
 
     ServiceContextMongoDTest::tearDown();
 }
@@ -140,17 +142,13 @@ TEST_F(ApplyOpsTest, CommandInNestedApplyOpsReturnsSuccess) {
     auto mode = OplogApplication::Mode::kApplyOpsCmd;
     BSONObjBuilder resultBuilder;
     NamespaceString nss("test", "foo");
-    auto innerCmdObj = BSON("op"
-                            << "c"
-                            << "ns"
-                            << nss.getCommandNS().ns()
-                            << "o"
-                            << BSON("create" << nss.coll()));
+    auto innerCmdObj =
+        BSON("op"
+             << "c"
+             << "ns" << nss.getCommandNS().ns() << "o" << BSON("create" << nss.coll()));
     auto innerApplyOpsObj = BSON("op"
                                  << "c"
-                                 << "ns"
-                                 << nss.getCommandNS().ns()
-                                 << "o"
+                                 << "ns" << nss.getCommandNS().ns() << "o"
                                  << BSON("applyOps" << BSON_ARRAY(innerCmdObj)));
     auto cmdObj = BSON("applyOps" << BSON_ARRAY(innerApplyOpsObj));
 
@@ -168,18 +166,13 @@ TEST_F(ApplyOpsTest, InsertInNestedApplyOpsReturnsSuccess) {
     NamespaceString nss("test", "foo");
     auto innerCmdObj = BSON("op"
                             << "i"
-                            << "ns"
-                            << nss.ns()
-                            << "o"
+                            << "ns" << nss.ns() << "o"
                             << BSON("_id"
                                     << "a")
-                            << "ui"
-                            << options.uuid.get());
+                            << "ui" << options.uuid.get());
     auto innerApplyOpsObj = BSON("op"
                                  << "c"
-                                 << "ns"
-                                 << nss.getCommandNS().ns()
-                                 << "o"
+                                 << "ns" << nss.getCommandNS().ns() << "o"
                                  << BSON("applyOps" << BSON_ARRAY(innerCmdObj)));
     auto cmdObj = BSON("applyOps" << BSON_ARRAY(innerApplyOpsObj));
 
@@ -205,18 +198,10 @@ BSONObj makeApplyOpsWithInsertOperation(const NamespaceString& nss,
                                         const BSONObj& documentToInsert) {
     auto insertOp = uuid ? BSON("op"
                                 << "i"
-                                << "ns"
-                                << nss.ns()
-                                << "o"
-                                << documentToInsert
-                                << "ui"
-                                << *uuid)
+                                << "ns" << nss.ns() << "o" << documentToInsert << "ui" << *uuid)
                          : BSON("op"
                                 << "i"
-                                << "ns"
-                                << nss.ns()
-                                << "o"
-                                << documentToInsert);
+                                << "ns" << nss.ns() << "o" << documentToInsert);
     return BSON("applyOps" << BSON_ARRAY(insertOp));
 }
 
@@ -264,7 +249,7 @@ TEST_F(ApplyOpsTest, AtomicApplyOpsInsertWithUuidIntoCollectionWithOtherUuid) {
     // Collection has a different UUID.
     CollectionOptions collectionOptions;
     collectionOptions.uuid = UUID::gen();
-    ASSERT_NOT_EQUALS(applyOpsUuid, collectionOptions.uuid);
+    ASSERT_NOT_EQUALS(applyOpsUuid, *collectionOptions.uuid);
     ASSERT_OK(_storage->createCollection(opCtx.get(), nss, collectionOptions));
 
     // The applyOps returns a NamespaceNotFound error because of the failed UUID lookup
@@ -305,8 +290,8 @@ TEST_F(ApplyOpsTest, ApplyOpsPropagatesOplogApplicationMode) {
     auto opCtx = cc().makeOperationContext();
 
     // Increase log component verbosity to check for op application messages.
-    logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogComponent::kReplication,
-                                                        logger::LogSeverity::Debug(3));
+    auto verbosityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kReplication,
+                                                               logv2::LogSeverity::Debug(3)};
 
     // Test that the 'applyOps' function passes the oplog application mode through correctly to the
     // underlying op application functions.
@@ -331,7 +316,9 @@ TEST_F(ApplyOpsTest, ApplyOpsPropagatesOplogApplicationMode) {
                        cmdObj,
                        OplogApplication::Mode::kInitialSync,
                        &resultBuilder));
-    ASSERT_EQUALS(1, countLogLinesContaining("oplog application mode: InitialSync"));
+    ASSERT_EQUALS(1,
+                  countBSONFormatLogLinesIsSubset(BSON("attr" << BSON("oplogApplicationMode"
+                                                                      << "InitialSync"))));
 
     auto docToInsert1 = BSON("_id" << 1);
     cmdObj = makeApplyOpsWithInsertOperation(nss, uuid, docToInsert1);
@@ -341,7 +328,9 @@ TEST_F(ApplyOpsTest, ApplyOpsPropagatesOplogApplicationMode) {
                        cmdObj,
                        OplogApplication::Mode::kSecondary,
                        &resultBuilder));
-    ASSERT_EQUALS(1, countLogLinesContaining("oplog application mode: Secondary"));
+    ASSERT_EQUALS(1,
+                  countBSONFormatLogLinesIsSubset(BSON("attr" << BSON("oplogApplicationMode"
+                                                                      << "Secondary"))));
 
     stopCapturingLogMessages();
 }
@@ -351,7 +340,7 @@ TEST_F(ApplyOpsTest, ApplyOpsPropagatesOplogApplicationMode) {
  */
 OplogEntry makeOplogEntry(OpTypeEnum opType, const BSONObj& oField) {
     return OplogEntry(OpTime(Timestamp(1, 1), 1),  // optime
-                      1LL,                         // hash
+                      boost::none,                 // hash
                       opType,                      // op type
                       NamespaceString("a.a"),      // namespace
                       boost::none,                 // uuid
@@ -361,7 +350,7 @@ OplogEntry makeOplogEntry(OpTypeEnum opType, const BSONObj& oField) {
                       boost::none,                 // o2
                       {},                          // sessionInfo
                       boost::none,                 // upsert
-                      boost::none,                 // wall clock time
+                      Date_t(),                    // wall clock time
                       boost::none,                 // statement id
                       boost::none,   // optime of previous write within same transaction
                       boost::none,   // pre-image optime
@@ -394,55 +383,37 @@ TEST_F(ApplyOpsTest, ExtractOperationsReturnsOperationsWithSameOpTimeAsApplyOps)
     auto ui1 = UUID::gen();
     auto op1 = BSON("op"
                     << "i"
-                    << "ns"
-                    << ns1.ns()
-                    << "ui"
-                    << ui1
-                    << "o"
-                    << BSON("_id" << 1));
+                    << "ns" << ns1.ns() << "ui" << ui1 << "o" << BSON("_id" << 1));
 
     NamespaceString ns2("test.b");
     auto ui2 = UUID::gen();
     auto op2 = BSON("op"
                     << "i"
-                    << "ns"
-                    << ns2.ns()
-                    << "ui"
-                    << ui2
-                    << "o"
-                    << BSON("_id" << 2));
+                    << "ns" << ns2.ns() << "ui" << ui2 << "o" << BSON("_id" << 2));
 
     NamespaceString ns3("test.c");
     auto ui3 = UUID::gen();
     auto op3 = BSON("op"
                     << "u"
-                    << "ns"
-                    << ns3.ns()
-                    << "ui"
-                    << ui3
-                    << "b"
-                    << true
-                    << "o"
-                    << BSON("x" << 1)
-                    << "o2"
-                    << BSON("_id" << 3));
+                    << "ns" << ns3.ns() << "ui" << ui3 << "b" << true << "o" << BSON("x" << 1)
+                    << "o2" << BSON("_id" << 3));
 
     auto oplogEntry =
         makeOplogEntry(OpTypeEnum::kCommand, BSON("applyOps" << BSON_ARRAY(op1 << op2 << op3)));
 
     auto operations = ApplyOps::extractOperations(oplogEntry);
-    ASSERT_EQUALS(3U, operations.size()) << "Unexpected number of operations extracted: "
-                                         << oplogEntry.toBSON();
+    ASSERT_EQUALS(3U, operations.size())
+        << "Unexpected number of operations extracted: " << oplogEntry.toBSON();
 
     // Check extracted CRUD operations.
     auto it = operations.cbegin();
     {
         ASSERT(operations.cend() != it);
         const auto& operation1 = *(it++);
-        ASSERT(OpTypeEnum::kInsert == operation1.getOpType()) << "Unexpected op type: "
-                                                              << operation1.toBSON();
+        ASSERT(OpTypeEnum::kInsert == operation1.getOpType())
+            << "Unexpected op type: " << operation1.toBSON();
         ASSERT_EQUALS(ui1, *operation1.getUuid());
-        ASSERT_EQUALS(ns1, operation1.getNamespace());
+        ASSERT_EQUALS(ns1, operation1.getNss());
         ASSERT_BSONOBJ_EQ(BSON("_id" << 1), operation1.getOperationToApply());
 
         // OpTime of CRUD operation should match applyOps.
@@ -452,10 +423,10 @@ TEST_F(ApplyOpsTest, ExtractOperationsReturnsOperationsWithSameOpTimeAsApplyOps)
     {
         ASSERT(operations.cend() != it);
         const auto& operation2 = *(it++);
-        ASSERT(OpTypeEnum::kInsert == operation2.getOpType()) << "Unexpected op type: "
-                                                              << operation2.toBSON();
+        ASSERT(OpTypeEnum::kInsert == operation2.getOpType())
+            << "Unexpected op type: " << operation2.toBSON();
         ASSERT_EQUALS(ui2, *operation2.getUuid());
-        ASSERT_EQUALS(ns2, operation2.getNamespace());
+        ASSERT_EQUALS(ns2, operation2.getNss());
         ASSERT_BSONOBJ_EQ(BSON("_id" << 2), operation2.getOperationToApply());
 
         // OpTime of CRUD operation should match applyOps.
@@ -465,11 +436,11 @@ TEST_F(ApplyOpsTest, ExtractOperationsReturnsOperationsWithSameOpTimeAsApplyOps)
     {
         ASSERT(operations.cend() != it);
         const auto& operation3 = *(it++);
-        ASSERT(OpTypeEnum::kUpdate == operation3.getOpType()) << "Unexpected op type: "
-                                                              << operation3.toBSON();
+        ASSERT(OpTypeEnum::kUpdate == operation3.getOpType())
+            << "Unexpected op type: " << operation3.toBSON();
         ASSERT_EQUALS(ui3, *operation3.getUuid());
-        ASSERT_EQUALS(ns3, operation3.getNamespace());
-        ASSERT_BSONOBJ_EQ(BSON("_id" << 3), operation3.getOperationToApply());
+        ASSERT_EQUALS(ns3, operation3.getNss());
+        ASSERT_BSONOBJ_EQ(BSON("x" << 1), operation3.getOperationToApply());
 
         auto optionalUpsertBool = operation3.getUpsert();
         ASSERT(optionalUpsertBool);
@@ -494,9 +465,7 @@ TEST_F(ApplyOpsTest, ApplyOpsFailsToDropAdmin) {
 
     auto dropDatabaseOp = BSON("op"
                                << "c"
-                               << "ns"
-                               << nss.getCommandNS().ns()
-                               << "o"
+                               << "ns" << nss.getCommandNS().ns() << "o"
                                << BSON("dropDatabase" << 1));
 
     auto dropDatabaseCmdObj = BSON("applyOps" << BSON_ARRAY(dropDatabaseOp));

@@ -1,32 +1,33 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -41,9 +42,9 @@
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/split_chunk.h"
-#include "mongo/s/stale_exception.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/logv2/log.h"
+#include "mongo/s/catalog/type_chunk.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -64,7 +65,7 @@ public:
                "splitKeys : [ {a:150} , ... ]}";
     }
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -95,19 +96,11 @@ public:
                    const BSONObj& cmdObj,
                    std::string& errmsg,
                    BSONObjBuilder& result) override {
-
         uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
 
-        //
-        // Check whether parameters passed to splitChunk are sound
-        //
         const NamespaceString nss = NamespaceString(parseNs(dbname, cmdObj));
-        if (!nss.isValid()) {
-            errmsg = str::stream() << "invalid namespace '" << nss.toString()
-                                   << "' specified for command";
-            return false;
-        }
 
+        // Check whether parameters passed to splitChunk are sound
         BSONObj keyPatternObj;
         {
             BSONElement keyPatternElem;
@@ -125,10 +118,12 @@ public:
 
         string shardName;
         auto parseShardNameStatus = bsonExtractStringField(cmdObj, "from", &shardName);
-        if (!parseShardNameStatus.isOK())
-            return CommandHelpers::appendCommandStatus(result, parseShardNameStatus);
+        uassertStatusOK(parseShardNameStatus);
 
-        log() << "received splitChunk request: " << redact(cmdObj);
+        LOGV2(22104,
+              "Received splitChunk request: {request}",
+              "Received splitChunk request",
+              "request"_attr = redact(cmdObj));
 
         vector<BSONObj> splitKeys;
         {
@@ -149,19 +144,17 @@ public:
         OID expectedCollectionEpoch;
         uassertStatusOK(bsonExtractOIDField(cmdObj, "epoch", &expectedCollectionEpoch));
 
-        auto statusWithOptionalChunkRange = splitChunk(
-            opCtx, nss, keyPatternObj, chunkRange, splitKeys, shardName, expectedCollectionEpoch);
+        auto topChunk = uassertStatusOK(splitChunk(
+            opCtx, nss, keyPatternObj, chunkRange, splitKeys, shardName, expectedCollectionEpoch));
 
-        // If the split chunk returns something that is not Status::Ok(), then something failed.
-        uassertStatusOK(statusWithOptionalChunkRange.getStatus());
-
-        // Otherwise, we want to check whether or not top-chunk optimization should be performed.
-        // If yes, then we should have a ChunkRange that was returned. Regardless of whether it
-        // should be performed, we will return true.
-        if (auto topChunk = statusWithOptionalChunkRange.getValue()) {
+        // Otherwise, we want to check whether or not top-chunk optimization should be performed. If
+        // yes, then we should have a ChunkRange that was returned. Regardless of whether it should
+        // be performed, we will return true.
+        if (topChunk) {
             result.append("shouldMigrate",
                           BSON("min" << topChunk->getMin() << "max" << topChunk->getMax()));
         }
+
         return true;
     }
 

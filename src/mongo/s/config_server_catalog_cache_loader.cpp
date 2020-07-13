@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -25,24 +26,25 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/config_server_catalog_cache_loader.h"
 
+#include <memory>
+
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/database_version_helpers.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/versioning.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/log.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 
 using CollectionAndChangedChunks = CatalogCacheLoader::CollectionAndChangedChunks;
-MONGO_FP_DECLARE(callShardServerCallbackFn);
 
 namespace {
 
@@ -140,8 +142,7 @@ ConfigServerCatalogCacheLoader::ConfigServerCatalogCacheLoader()
 }
 
 ConfigServerCatalogCacheLoader::~ConfigServerCatalogCacheLoader() {
-    _threadPool.shutdown();
-    _threadPool.join();
+    shutDown();
 }
 
 void ConfigServerCatalogCacheLoader::initializeReplicaSetRole(bool isPrimary) {
@@ -154,6 +155,20 @@ void ConfigServerCatalogCacheLoader::onStepDown() {
 
 void ConfigServerCatalogCacheLoader::onStepUp() {
     MONGO_UNREACHABLE;
+}
+
+void ConfigServerCatalogCacheLoader::shutDown() {
+    {
+        stdx::lock_guard<Latch> lg(_mutex);
+        if (_inShutdown) {
+            return;
+        }
+
+        _inShutdown = true;
+    }
+
+    _threadPool.shutdown();
+    _threadPool.join();
 }
 
 void ConfigServerCatalogCacheLoader::notifyOfCollectionVersionUpdate(const NamespaceString& nss) {
@@ -171,13 +186,12 @@ void ConfigServerCatalogCacheLoader::waitForDatabaseFlush(OperationContext* opCt
 }
 
 std::shared_ptr<Notification<void>> ConfigServerCatalogCacheLoader::getChunksSince(
-    const NamespaceString& nss,
-    ChunkVersion version,
-    stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)> callbackFn) {
-
+    const NamespaceString& nss, ChunkVersion version, GetChunksSinceCallbackFn callbackFn) {
     auto notify = std::make_shared<Notification<void>>();
 
-    uassertStatusOK(_threadPool.schedule([ nss, version, notify, callbackFn ]() noexcept {
+    _threadPool.schedule([ nss, version, notify, callbackFn ](auto status) noexcept {
+        invariant(status);
+
         auto opCtx = Client::getCurrent()->makeOperationContext();
 
         auto swCollAndChunks = [&]() -> StatusWith<CollectionAndChangedChunks> {
@@ -190,33 +204,34 @@ std::shared_ptr<Notification<void>> ConfigServerCatalogCacheLoader::getChunksSin
 
         callbackFn(opCtx.get(), std::move(swCollAndChunks));
         notify->set();
-    }));
+    });
 
     return notify;
 }
 
 void ConfigServerCatalogCacheLoader::getDatabase(
     StringData dbName,
-    stdx::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn) {
+    std::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn) {
+    _threadPool.schedule([ name = dbName.toString(), callbackFn ](auto status) noexcept {
+        invariant(status);
 
-    if (MONGO_FAIL_POINT(callShardServerCallbackFn)) {
-        uassertStatusOK(_threadPool.schedule([ name = dbName.toString(), callbackFn ]() noexcept {
-            auto opCtx = Client::getCurrent()->makeOperationContext();
+        auto opCtx = Client::getCurrent()->makeOperationContext();
 
-            auto swDbt = [&]() -> StatusWith<DatabaseType> {
-                try {
+        auto swDbt = [&]() -> StatusWith<DatabaseType> {
+            try {
+                return uassertStatusOK(
+                           Grid::get(opCtx.get())
+                               ->catalogClient()
+                               ->getDatabase(
+                                   opCtx.get(), name, repl::ReadConcernLevel::kMajorityReadConcern))
+                    .value;
+            } catch (const DBException& ex) {
+                return ex.toStatus();
+            }
+        }();
 
-                    const auto dbVersion = Versioning::newDatabaseVersion();
-                    DatabaseType dbt(std::move(name), ShardId("PrimaryShard"), false, dbVersion);
-                    return dbt;
-                } catch (const DBException& ex) {
-                    return ex.toStatus();
-                }
-            }();
-
-            callbackFn(opCtx.get(), swDbt);
-        }));
-    }
+        callbackFn(opCtx.get(), std::move(swDbt));
+    });
 }
 
 }  // namespace mongo

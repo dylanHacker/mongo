@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -36,8 +37,10 @@
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/list_databases_gen.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/commands/strategy.h"
 #include "mongo/s/grid.h"
 
@@ -50,6 +53,10 @@ public:
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
+    }
+
+    bool maintenanceOk() const override {
+        return false;
     }
 
     bool adminOnly() const override {
@@ -81,19 +88,46 @@ public:
              const std::string& dbname_unused,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        const bool nameOnly = cmdObj["nameOnly"].trueValue();
+        CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
+
+        IDLParserErrorContext ctx("listDatabases");
+        auto cmd = ListDatabasesCommand::parse(ctx, cmdObj);
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+
+        // { nameOnly: bool } - Default false.
+        const bool nameOnly = cmd.getNameOnly();
+
+        // { authorizedDatabases: bool } - Dynamic default based on perms.
+        const bool authorizedDatabases = ([as](const boost::optional<bool>& authDB) {
+            const bool mayListAllDatabases = as->isAuthorizedForActionsOnResource(
+                ResourcePattern::forClusterResource(), ActionType::listDatabases);
+            if (authDB) {
+                uassert(ErrorCodes::Unauthorized,
+                        "Insufficient permissions to list all databases",
+                        authDB.get() || mayListAllDatabases);
+                return authDB.get();
+            }
+
+            // By default, list all databases if we can, otherwise
+            // only those we're allowed to find on.
+            return !mayListAllDatabases;
+        })(cmd.getAuthorizedDatabases());
+
+        auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
 
         std::map<std::string, long long> sizes;
         std::map<std::string, std::unique_ptr<BSONObjBuilder>> dbShardInfo;
 
         std::vector<ShardId> shardIds;
-        grid.shardRegistry()->getAllShardIdsNoReload(&shardIds);
+        shardRegistry->getAllShardIdsNoReload(&shardIds);
         shardIds.emplace_back(ShardRegistry::kConfigServerShardId);
 
-        auto filteredCmd = CommandHelpers::filterCommandRequestForPassthrough(cmdObj);
+        // { filter: matchExpression }.
+        auto filteredCmd = applyReadWriteConcern(
+            opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj));
 
         for (const ShardId& shardId : shardIds) {
-            const auto shardStatus = grid.shardRegistry()->getShard(opCtx, shardId);
+            const auto shardStatus = shardRegistry->getShard(opCtx, shardId);
             if (!shardStatus.isOK()) {
                 continue;
             }
@@ -144,14 +178,6 @@ public:
             }
         }
 
-        // If we have ActionType::listDatabases,
-        // then we don't need to test each record in the output.
-        // Otherwise, we'll test the database names as we enumerate them.
-        const auto as = AuthorizationSession::get(opCtx->getClient());
-        const bool checkAuth = as &&
-            !as->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                  ActionType::listDatabases);
-
         // Now that we have aggregated results for all the shards, convert to a response,
         // and compute total sizes.
         long long totalSize = 0;
@@ -166,9 +192,7 @@ public:
                 if (name == NamespaceString::kLocalDb)
                     continue;
 
-                if (checkAuth && as &&
-                    !as->isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(name),
-                                                          ActionType::find)) {
+                if (authorizedDatabases && !as->isAuthorizedForAnyActionOnAnyResourceInDB(name)) {
                     // We don't have listDatabases on the cluser or find on this database.
                     continue;
                 }

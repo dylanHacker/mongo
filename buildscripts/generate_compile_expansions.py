@@ -1,12 +1,10 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 Generate the compile expansions file used by Evergreen as part of the push/release process.
 
 Invoke by specifying an output file.
 $ python generate_compile_expansions.py --out compile_expansions.yml
 """
-
-from __future__ import print_function
 
 import argparse
 import json
@@ -64,9 +62,11 @@ def generate_version_expansions():
     if version_parts[0]:
         expansions["suffix"] = "latest"
         expansions["src_suffix"] = "latest"
+        expansions["is_release"] = "false"
     else:
         expansions["suffix"] = version_line
         expansions["src_suffix"] = "r{0}".format(version_line)
+        expansions["is_release"] = "true"
     expansions["version"] = version_line
 
     return expansions

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -43,12 +44,6 @@ public:
     void startup() override;
 
     void shutDown(OperationContext* opCtx) override;
-
-    Status enableSharding(OperationContext* opCtx, const std::string& dbName);
-
-    Status updateDatabase(OperationContext* opCtx,
-                          const std::string& dbName,
-                          const DatabaseType& db) override;
 
     StatusWith<repl::OpTimeWith<DatabaseType>> getDatabase(
         OperationContext* opCtx,
@@ -88,11 +83,13 @@ public:
     StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
         OperationContext* opCtx, repl::ReadConcernLevel readConcern) override;
 
-    bool runUserManagementWriteCommand(OperationContext* opCtx,
-                                       const std::string& commandName,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       BSONObjBuilder* result) override;
+    Status runUserManagementWriteCommand(OperationContext* opCtx,
+                                         StringData commandName,
+                                         StringData dbname,
+                                         const BSONObj& cmdObj,
+                                         BSONObjBuilder* result) override {
+        return Status::OK();
+    }
 
     bool runUserManagementReadCommand(OperationContext* opCtx,
                                       const std::string& dbname,
@@ -106,17 +103,6 @@ public:
                                    const ChunkVersion& lastChunkVersion,
                                    const WriteConcernOptions& writeConcern,
                                    repl::ReadConcernLevel readConcern) override;
-
-    Status logAction(OperationContext* opCtx,
-                     const std::string& what,
-                     const std::string& ns,
-                     const BSONObj& detail) override;
-
-    Status logChange(OperationContext* opCtx,
-                     const std::string& what,
-                     const std::string& ns,
-                     const BSONObj& detail,
-                     const WriteConcernOptions& writeConcern) override;
 
     StatusWith<BSONObj> getGlobalSettings(OperationContext* opCtx, StringData key) override;
 
@@ -132,6 +118,11 @@ public:
                                 const BSONObj& doc,
                                 const WriteConcernOptions& writeConcern) override;
 
+    void insertConfigDocumentsAsRetryableWrite(OperationContext* opCtx,
+                                               const NamespaceString& nss,
+                                               std::vector<BSONObj> docs,
+                                               const WriteConcernOptions& writeConcern) override;
+
     StatusWith<bool> updateConfigDocument(OperationContext* opCtx,
                                           const NamespaceString& nss,
                                           const BSONObj& query,
@@ -144,7 +135,7 @@ public:
                                  const BSONObj& query,
                                  const WriteConcernOptions& writeConcern) override;
 
-    Status createDatabase(OperationContext* opCtx, const std::string& dbName);
+    Status createDatabase(OperationContext* opCtx, StringData dbName, ShardId primaryShard);
 
     DistLockManager* getDistLockManager() override;
 

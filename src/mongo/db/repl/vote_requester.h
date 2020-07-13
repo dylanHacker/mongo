@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,17 +29,15 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/scatter_gather_algorithm.h"
 #include "mongo/db/repl/scatter_gather_runner.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/unordered_set.h"
 
 namespace mongo {
@@ -48,10 +47,17 @@ class Status;
 namespace repl {
 
 class VoteRequester {
-    MONGO_DISALLOW_COPYING(VoteRequester);
+    VoteRequester(const VoteRequester&) = delete;
+    VoteRequester& operator=(const VoteRequester&) = delete;
 
 public:
-    enum class Result { kSuccessfullyElected, kStaleTerm, kInsufficientVotes, kPrimaryRespondedNo };
+    enum class Result {
+        kSuccessfullyElected,
+        kStaleTerm,
+        kInsufficientVotes,
+        kPrimaryRespondedNo,
+        kCancelled
+    };
 
     class Algorithm : public ScatterGatherAlgorithm {
     public:
@@ -59,7 +65,7 @@ public:
                   long long candidateIndex,
                   long long term,
                   bool dryRun,
-                  OpTime lastDurableOpTime,
+                  OpTime lastAppliedOpTime,
                   int primaryIndex);
         virtual ~Algorithm();
         virtual std::vector<executor::RemoteCommandRequest> getRequests() const;
@@ -86,7 +92,7 @@ public:
         const long long _candidateIndex;
         const long long _term;
         bool _dryRun = false;  // this bool indicates this is a mock election when true
-        const OpTime _lastDurableOpTime;
+        const OpTime _lastAppliedOpTime;
         std::vector<HostAndPort> _targets;
         stdx::unordered_set<HostAndPort> _responders;
         bool _staleTerm = false;
@@ -113,7 +119,7 @@ public:
                                                           long long candidateIndex,
                                                           long long term,
                                                           bool dryRun,
-                                                          OpTime lastDurableOpTime,
+                                                          OpTime lastAppliedOpTime,
                                                           int primaryIndex);
 
     /**

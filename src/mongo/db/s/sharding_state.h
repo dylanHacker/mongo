@@ -1,95 +1,86 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
 #include <string>
-#include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/bson/oid.h"
-#include "mongo/db/s/collection_sharding_state.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
+#include "mongo/s/shard_id.h"
 
 namespace mongo {
 
-class BSONObj;
-class BSONObjBuilder;
-class ConnectionString;
 class OperationContext;
 class ServiceContext;
-class ShardIdentityType;
-class Status;
-
-namespace repl {
-class OpTime;
-}  // namespace repl
 
 /**
- * Contains the global sharding state for a running mongod. There is one instance of this object per
- * service context and it is never destroyed for the lifetime of the context.
+ * Contains information about the shardingness of a running mongod. This is a passive class and its
+ * state and concurrency control is driven from outside (specifically ShardingInitializationMongoD,
+ * which should be its only caller).
+ *
+ * There is one instance of this object per service context and once 'setInitialized' is called, it
+ * never gets destroyed or uninitialized.
  */
 class ShardingState {
-    MONGO_DISALLOW_COPYING(ShardingState);
+    ShardingState(const ShardingState&) = delete;
+    ShardingState& operator=(const ShardingState&) = delete;
 
 public:
-    using GlobalInitFunc =
-        stdx::function<Status(OperationContext*, const ConnectionString&, StringData)>;
-
     ShardingState();
     ~ShardingState();
 
-    /**
-     * Retrieves the sharding state object associated with the specified service context. This
-     * method must only be called if ShardingState decoration has been created on the service
-     * context, otherwise it will fassert. In other words, it may only be called on MongoD and
-     * tests, which specifically require and instantiate ShardingState.
-     *
-     * Returns the instance's ShardingState.
-     */
     static ShardingState* get(ServiceContext* serviceContext);
     static ShardingState* get(OperationContext* operationContext);
 
     /**
-     * Returns true if ShardingState has been successfully initialized.
+     * Puts the sharding state singleton in the "initialization completed" state with either
+     * successful initialization or an error. This method may only be called once for the lifetime
+     * of the object.
+     */
+    void setInitialized(ShardId shardId, OID clusterId);
+    void setInitialized(Status failedStatus);
+
+    /**
+     * If 'setInitialized' has not been called, returns boost::none. Otherwise, returns the status
+     * with which 'setInitialized' was called. This is used by the initialization sequence to decide
+     * whether to set up the sharding services.
+     */
+    boost::optional<Status> initializationStatus();
+
+    /**
+     * Returns true if 'setInitialized' has been called with shardId and clusterId.
      *
      * Code that needs to perform extra actions if sharding is initialized, but does not need to
      * error if not, should use this. Alternatively, see ShardingState::canAcceptShardedCommands().
      */
     bool enabled() const;
-
-    /**
-     * Force-sets the initialization state to InitializationState::kInitialized, for testing
-     * purposes. Note that this function should ONLY be used for testing purposes.
-     */
-    void setEnabledForTest(const std::string& shardName);
 
     /**
      * Returns Status::OK if the ShardingState is enabled; if not, returns an error describing
@@ -101,62 +92,22 @@ public:
      */
     Status canAcceptShardedCommands() const;
 
-    std::string getShardName();
+    /**
+     * Returns the shard id to which this node belongs.
+     */
+    ShardId shardId();
 
     /**
-     * Initializes the sharding state of this server from the shard identity document argument
-     * and sets secondary or primary state information on the catalog cache loader.
-     *
-     * Note: caller must hold a global/database lock! Needed in order to stably check for
-     * replica set state (primary, secondary, standalone).
+     * Returns the cluster id of the cluster to which this node belongs.
      */
-    Status initializeFromShardIdentity(OperationContext* opCtx,
-                                       const ShardIdentityType& shardIdentity);
+    OID clusterId();
 
     /**
-     * Shuts down sharding machinery on the shard.
+     * For testing only. This is a workaround for the fact that it is not possible to get a clean
+     * ServiceContext in between test executions. Because of this, tests which require that they get
+     * started with a clean (uninitialized) ShardingState must invoke this in their tearDown method.
      */
-    void shutDown(OperationContext* opCtx);
-
-    /**
-     * Updates the ShardRegistry's stored notion of the config server optime based on the
-     * ConfigServerMetadata decoration attached to the OperationContext.
-     */
-    Status updateConfigServerOpTimeFromMetadata(OperationContext* opCtx);
-
-    void appendInfo(OperationContext* opCtx, BSONObjBuilder& b);
-
-    bool needCollectionMetadata(OperationContext* opCtx, const std::string& ns);
-
-    /**
-     * Updates the config server field of the shardIdentity document with the given connection
-     * string.
-     *
-     * Note: this can return NotMaster error.
-     */
-    Status updateShardIdentityConfigString(OperationContext* opCtx,
-                                           const std::string& newConnectionString);
-
-    /**
-     * For testing only. Mock the initialization method used by initializeFromConfigConnString and
-     * initializeFromShardIdentity after all checks are performed.
-     */
-    void setGlobalInitMethodForTest(GlobalInitFunc func);
-
-    /**
-     * If started with --shardsvr, initializes sharding awareness from the shardIdentity document
-     * on disk, if there is one.
-     * If started with --shardsvr in queryableBackupMode, initializes sharding awareness from the
-     * shardIdentity document passed through the --overrideShardIdentity startup parameter.
-     *
-     * If returns true, the ShardingState::_globalInit method was called, meaning all the core
-     * classes for sharding were initialized, but no networking calls were made yet (with the
-     * exception of the duplicate ShardRegistry reload in ShardRegistry::startup() (see
-     * SERVER-26123). Outgoing networking calls to cluster members can now be made.
-     *
-     * Note: this function briefly takes the global lock to determine primary/secondary state.
-     */
-    StatusWith<bool> initializeShardingAwarenessIfNeeded(OperationContext* opCtx);
+    void clearForTests();
 
 private:
     // Progress of the sharding state initialization
@@ -178,33 +129,33 @@ private:
     /**
      * Returns the initialization state.
      */
-    InitializationState _getInitializationState() const;
+    InitializationState _getInitializationState() const {
+        return static_cast<InitializationState>(_initializationState.load());
+    }
 
-    /**
-     * Updates the initialization state.
-     */
-    void _setInitializationState(InitializationState newState);
-
-    // Protects state below
-    stdx::mutex _mutex;
+    // Protects state for initializing '_shardId', '_clusterId', and '_initializationStatus'.
+    // Protects read access for '_initializationStatus'.
+    Mutex _mutex = MONGO_MAKE_LATCH("ShardingState::_mutex");
 
     // State of the initialization of the sharding state along with any potential errors
-    AtomicUInt32 _initializationState;
+    AtomicWord<unsigned> _initializationState{static_cast<uint32_t>(InitializationState::kNew)};
 
-    // Only valid if _initializationState is kError. Contains the reason for initialization failure.
-    Status _initializationStatus;
+    // For '_shardId' and '_clusterId':
+    //
+    // These variables will invariant if attempts are made to access them before 'enabled()' has
+    // been set to true. 'enabled()' being set to true guarantees that these variables have been
+    // set, and that they will remain unchanged for the duration of the ShardingState object's
+    // lifetime. Because these variables will not change, it's unnecessary to acquire the class's
+    // mutex in order to call these getters and access their underlying data.
 
-    // Signaled when ::initialize finishes.
-    stdx::condition_variable _initializationFinishedCondition;
-
-    // Sets the shard name for this host (comes through setShardVersion)
-    std::string _shardName;
+    // Sets the shard name for this host.
+    ShardId _shardId;
 
     // The id for the cluster this shard belongs to.
     OID _clusterId;
 
-    // Function for initializing the external sharding state components not owned here.
-    GlobalInitFunc _globalInit;
+    // Only valid if _initializationState is kError. Contains the reason for initialization failure.
+    Status _initializationStatus{ErrorCodes::InternalError, "Uninitialized value"};
 };
 
 }  // namespace mongo

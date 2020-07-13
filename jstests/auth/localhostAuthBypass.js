@@ -54,11 +54,8 @@ var assertCannotRunCommands = function(mongo) {
     assert.throws(function() {
         mongo.getDB("test").createUser({user: username, pwd: password, roles: ['readWrite']});
     });
-    // DB operations
-    var authorizeErrorCode = 13;
-    assert.commandFailedWithCode(
-        mongo.getDB("test").copyDatabase("admin", "admin2"), authorizeErrorCode, "copyDatabase");
     // Create collection
+    var authorizeErrorCode = 13;
     assert.commandFailedWithCode(
         mongo.getDB("test").createCollection("log", {capped: true, size: 5242880, max: 5000}),
         authorizeErrorCode,
@@ -99,9 +96,9 @@ var assertCanRunCommands = function(mongo) {
     // will throw on failure
     test.system.users.findOne();
 
-    assert.writeOK(test.foo.save({_id: 0}));
-    assert.writeOK(test.foo.update({_id: 0}, {$set: {x: 20}}));
-    assert.writeOK(test.foo.remove({_id: 0}));
+    assert.commandWorked(test.foo.save({_id: 0}));
+    assert.commandWorked(test.foo.update({_id: 0}, {$set: {x: 20}}));
+    assert.commandWorked(test.foo.remove({_id: 0}));
 
     test.foo.mapReduce(
         function() {

@@ -1,47 +1,48 @@
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/shutdown.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/log_process_details.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_util.h"
+#include "mongo/logv2/ramlog.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/log.h"
-#include "mongo/util/net/sock.h"
+#include "mongo/util/net/socket_utils.h"
 #include "mongo/util/ntservice.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/ramlog.h"
@@ -51,9 +52,6 @@
 
 namespace mongo {
 namespace {
-
-using std::string;
-using std::vector;
 
 class FeaturesCmd : public BasicCommand {
 public:
@@ -71,7 +69,7 @@ public:
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) const {}  // No auth required
     virtual bool run(OperationContext* opCtx,
-                     const string& ns,
+                     const std::string& ns,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         if (getGlobalScriptEngine()) {
@@ -80,10 +78,10 @@ public:
             bb.done();
         }
         if (cmdObj["oidReset"].trueValue()) {
-            result.append("oidMachineOld", OID::getMachineId());
+            result.append("oidMachineOld", static_cast<int>(OID::getMachineId()));
             OID::regenMachineId();
         }
-        result.append("oidMachine", OID::getMachineId());
+        result.append("oidMachine", static_cast<int>(OID::getMachineId()));
         return true;
     }
 
@@ -112,7 +110,7 @@ public:
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
     }
     bool run(OperationContext* opCtx,
-             const string& dbname,
+             const std::string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
         ProcessInfo p;
@@ -120,9 +118,10 @@ public:
 
         bSys.appendDate("currentTime", jsTime());
         bSys.append("hostname", prettyHostName());
-        bSys.append("cpuAddrSize", p.getAddrSize());
-        bSys.append("memSizeMB", static_cast<unsigned>(p.getMemSizeMB()));
-        bSys.append("numCores", p.getNumCores());
+        bSys.append("cpuAddrSize", static_cast<int>(p.getAddrSize()));
+        bSys.append("memSizeMB", static_cast<long long>(p.getSystemMemSizeMB()));
+        bSys.append("memLimitMB", static_cast<long long>(p.getMemSizeMB()));
+        bSys.append("numCores", static_cast<int>(p.getNumAvailableCores()));
         bSys.append("cpuArch", p.getArch());
         bSys.append("numaEnabled", p.hasNumaEnabled());
         bOs.append("type", p.getOsType());
@@ -137,9 +136,6 @@ public:
     }
 
 } hostInfoCmd;
-
-MONGO_FP_DECLARE(crashOnShutdown);
-int* volatile illegalAddress;  // NOLINT - used for fail point only
 
 class CmdGetCmdLineOpts : public BasicCommand {
 public:
@@ -164,7 +160,7 @@ public:
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
     }
     virtual bool run(OperationContext* opCtx,
-                     const string&,
+                     const std::string&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         result.append("argv", serverGlobalParams.argvArray);
@@ -194,13 +190,14 @@ public:
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
     }
     virtual bool run(OperationContext* opCtx,
-                     const string& ns,
+                     const std::string& ns,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
-        bool didRotate = rotateLogs(serverGlobalParams.logRenameOnRotate);
+        bool didRotate = logv2::rotateLogs(serverGlobalParams.logRenameOnRotate);
         if (didRotate)
             logProcessDetailsForLogRotate(opCtx->getServiceContext());
         return didRotate;
+        return true;
     }
 
 } logRotateCmd;
@@ -229,26 +226,31 @@ public:
         return "{ getLog : '*' }  OR { getLog : 'global' }";
     }
 
-    virtual bool errmsgRun(OperationContext* opCtx,
-                           const string& dbname,
-                           const BSONObj& cmdObj,
-                           string& errmsg,
-                           BSONObjBuilder& result) {
+    bool errmsgRun(OperationContext* opCtx,
+                   const std::string& dbname,
+                   const BSONObj& cmdObj,
+                   std::string& errmsg,
+                   BSONObjBuilder& result) override {
+        return errmsgRunImpl<logv2::RamLog>(opCtx, dbname, cmdObj, errmsg, result);
+    }
+
+    template <typename RamLogType>
+    bool errmsgRunImpl(OperationContext* opCtx,
+                       const std::string& dbname,
+                       const BSONObj& cmdObj,
+                       std::string& errmsg,
+                       BSONObjBuilder& result) {
         BSONElement val = cmdObj.firstElement();
         if (val.type() != String) {
-            return CommandHelpers::appendCommandStatus(
-                result,
-                Status(ErrorCodes::TypeMismatch,
-                       str::stream() << "Argument to getLog must be of type String; found "
-                                     << val.toString(false)
-                                     << " of type "
-                                     << typeName(val.type())));
+            uasserted(ErrorCodes::TypeMismatch,
+                      str::stream() << "Argument to getLog must be of type String; found "
+                                    << val.toString(false) << " of type " << typeName(val.type()));
         }
 
-        string p = val.String();
+        std::string p = val.String();
         if (p == "*") {
-            vector<string> names;
-            RamLog::getNames(names);
+            std::vector<std::string> names;
+            RamLogType::getNames(names);
 
             BSONArrayBuilder arr;
             for (unsigned i = 0; i < names.size(); i++) {
@@ -257,12 +259,12 @@ public:
 
             result.appendArray("names", arr.arr());
         } else {
-            RamLog* ramlog = RamLog::getIfExists(p);
+            RamLogType* ramlog = RamLogType::getIfExists(p);
             if (!ramlog) {
                 errmsg = str::stream() << "no RamLog named: " << p;
                 return false;
             }
-            RamLog::LineIterator rl(ramlog);
+            typename RamLogType::LineIterator rl(ramlog);
 
             result.appendNumber("totalLinesWritten", rl.getTotalLinesWritten());
 
@@ -301,70 +303,28 @@ public:
     }
 
     virtual bool run(OperationContext* opCtx,
-                     const string& dbname,
+                     const std::string& dbname,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         std::string logName;
         Status status = bsonExtractStringField(cmdObj, "clearLog", &logName);
-        if (!status.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, status);
-        }
+        uassertStatusOK(status);
 
         if (logName != "global") {
-            return CommandHelpers::appendCommandStatus(
-                result, Status(ErrorCodes::InvalidOptions, "Only the 'global' log can be cleared"));
+            uasserted(ErrorCodes::InvalidOptions, "Only the 'global' log can be cleared");
         }
-        RamLog* ramlog = RamLog::getIfExists(logName);
-        invariant(ramlog);
-        ramlog->clear();
+        auto clearRamlog = [&](auto* ramlog) {
+            invariant(ramlog);
+            ramlog->clear();
+        };
+        clearRamlog(logv2::RamLog::getIfExists(logName));
+
         return true;
     }
 };
 
-MONGO_INITIALIZER(RegisterClearLogCmd)(InitializerContext* context) {
-    if (getTestCommandsEnabled()) {
-        // Leaked intentionally: a Command registers itself when constructed.
-        new ClearLogCmd();
-    }
-    return Status::OK();
-}
+MONGO_REGISTER_TEST_COMMAND(ClearLogCmd);
 
 }  // namespace
-
-void CmdShutdown::addRequiredPrivileges(const std::string& dbname,
-                                        const BSONObj& cmdObj,
-                                        std::vector<Privilege>* out) const {
-    ActionSet actions;
-    actions.addAction(ActionType::shutdown);
-    out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-}
-
-void CmdShutdown::shutdownHelper(const BSONObj& cmdObj) {
-    MONGO_FAIL_POINT_BLOCK(crashOnShutdown, crashBlock) {
-        const std::string crashHow = crashBlock.getData()["how"].str();
-        if (crashHow == "fault") {
-            ++*illegalAddress;
-        }
-        ::abort();
-    }
-
-    log() << "terminating, shutdown command received " << cmdObj;
-
-#if defined(_WIN32)
-    // Signal the ServiceMain thread to shutdown.
-    if (ntservice::shouldStartService()) {
-        shutdownNoTerminate();
-
-        // Client expects us to abruptly close the socket as part of exiting
-        // so this function is not allowed to return.
-        // The ServiceMain thread will quit for us so just sleep until it does.
-        while (true)
-            sleepsecs(60);  // Loop forever
-    } else
-#endif
-    {
-        exitCleanly(EXIT_CLEAN);  // this never returns
-    }
-}
 
 }  // namespace mongo

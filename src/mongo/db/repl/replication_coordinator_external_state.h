@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,15 +31,12 @@
 
 #include <boost/optional.hpp>
 #include <cstddef>
+#include <functional>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/repl/member_state.h"
-#include "mongo/db/repl/multiapplier.h"
-#include "mongo/db/repl/oplog_applier.h"
-#include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/stdx/functional.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/time_support.h"
 
@@ -66,7 +64,9 @@ class ReplicationCoordinator;
  * ReplicationCoordinatorImpl should be moved here.
  */
 class ReplicationCoordinatorExternalState {
-    MONGO_DISALLOW_COPYING(ReplicationCoordinatorExternalState);
+    ReplicationCoordinatorExternalState(const ReplicationCoordinatorExternalState&) = delete;
+    ReplicationCoordinatorExternalState& operator=(const ReplicationCoordinatorExternalState&) =
+        delete;
 
 public:
     ReplicationCoordinatorExternalState() {}
@@ -77,7 +77,7 @@ public:
      *
      * NOTE: Only starts threads if they are not already started,
      */
-    virtual void startThreads(const ReplSettings& settings) = 0;
+    virtual void startThreads() = 0;
 
     /**
      * Returns true if an incomplete initial sync is detected.
@@ -102,6 +102,15 @@ public:
     virtual void shutdown(OperationContext* opCtx) = 0;
 
     /**
+     * Clears appliedThrough to indicate that the dataset is consistent with top of the
+     * oplog on shutdown.
+     * This should be called after calling shutdown() and should be called holding RSTL
+     * in mode X to make sure that that are no active readers while executing this method
+     * as this does perform timestamped minvalid writes at lastAppliedTimestamp.
+     */
+    virtual void clearAppliedThroughIfCleanShutdown(OperationContext* opCtx) = 0;
+
+    /**
      * Returns task executor for scheduling tasks to be run asynchronously.
      */
     virtual executor::TaskExecutor* getTaskExecutor() const = 0;
@@ -112,22 +121,9 @@ public:
     virtual ThreadPool* getDbWorkThreadPool() const = 0;
 
     /**
-     * Runs the repair database command on the "local" db, if the storage engine is MMapV1.
-     * Note: Used after initial sync to compact the database files.
-     */
-    virtual Status runRepairOnLocalDB(OperationContext* opCtx) = 0;
-
-    /**
      * Creates the oplog, writes the first entry and stores the replica set config document.
      */
     virtual Status initializeReplSetStorage(OperationContext* opCtx, const BSONObj& config) = 0;
-
-    /**
-     * Waits for all committed writes to be visible in the oplog.  Committed writes will be hidden
-     * if there are uncommitted writes ahead of them, and some operations require that all committed
-     * writes are visible before proceeding.
-     */
-    virtual void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) = 0;
 
     /**
      * Called when a node on way to becoming a primary is ready to leave drain mode. It is called
@@ -143,13 +139,12 @@ public:
      * state. See the call site in ReplicationCoordinatorImpl for details about when and how it is
      * called.
      *
-     * Among other things, this writes a message about our transition to primary to the oplog if
-     * isV1 and and returns the optime of that message. If !isV1, returns the optime of the last op
-     * in the oplog.
+     * Among other things, this writes a message about our transition to primary to the oplog and
+     * returns the optime of that message.
      *
      * Throws on errors.
      */
-    virtual OpTime onTransitionToPrimary(OperationContext* opCtx, bool isV1ElectionProtocol) = 0;
+    virtual OpTime onTransitionToPrimary(OperationContext* opCtx) = 0;
 
     /**
      * Simple wrapper around SyncSourceFeedback::forwardSlaveProgress.  Signals to the
@@ -169,9 +164,17 @@ public:
     virtual StatusWith<BSONObj> loadLocalConfigDocument(OperationContext* opCtx) = 0;
 
     /**
-     * Stores the replica set config document in local storage, or returns an error.
+     * Stores the replica set config document in local storage and writes a no-op in the oplog, or
+     * returns an error.
      */
-    virtual Status storeLocalConfigDocument(OperationContext* opCtx, const BSONObj& config) = 0;
+    virtual Status storeLocalConfigDocument(OperationContext* opCtx,
+                                            const BSONObj& config,
+                                            bool writeOplog) = 0;
+
+    /**
+     * Creates the collection for "lastVote" documents and initializes it, or returns an error.
+     */
+    virtual Status createLocalLastVoteCollection(OperationContext* opCtx) = 0;
 
     /**
      * Gets the replica set lastVote document from local storage, or returns an error.
@@ -190,10 +193,20 @@ public:
     virtual void setGlobalTimestamp(ServiceContext* service, const Timestamp& newTime) = 0;
 
     /**
-     * Gets the last optime of an operation performed on this host, from stable
-     * storage.
+     * Gets the global opTime timestamp, i.e. the latest cluster time.
      */
-    virtual StatusWith<OpTime> loadLastOpTime(OperationContext* opCtx) = 0;
+    virtual Timestamp getGlobalTimestamp(ServiceContext* service) = 0;
+
+    /**
+     * Checks if the oplog exists.
+     */
+    virtual bool oplogExists(OperationContext* opCtx) = 0;
+
+    /**
+     * Gets the last optime, and corresponding wall clock time, of an operation performed on this
+     * host, from stable storage.
+     */
+    virtual StatusWith<OpTimeAndWallTime> loadLastOpTimeAndWallTime(OperationContext* opCtx) = 0;
 
     /**
      * Returns the HostAndPort of the remote client connected to us that initiated the operation
@@ -209,17 +222,10 @@ public:
     virtual void closeConnections() = 0;
 
     /**
-     * Kills all operations that have a Client that is associated with an incoming user
-     * connection.  Used during stepdown.
+     * Called after this node has stepped down. This includes stepDowns caused by rollback or node
+     * removal, so this function must also be able to handle those situations.
      */
-    virtual void killAllUserOperations(OperationContext* opCtx) = 0;
-
-    /**
-     * Resets any active sharding metadata on this server and stops any sharding-related threads
-     * (such as the balancer). It is called after stepDown to ensure that if the node becomes
-     * primary again in the future it will recover its state from a clean slate.
-     */
-    virtual void shardingOnStepDownHook() = 0;
+    virtual void onStepDownHook() = 0;
 
     /**
      * Notifies the bgsync and syncSourceFeedback threads to choose a new sync source.
@@ -237,6 +243,11 @@ public:
     virtual void startProducerIfStopped() = 0;
 
     /**
+     * True if we have discovered that no sync source's oplog overlaps with ours.
+     */
+    virtual bool tooStale() = 0;
+
+    /**
      * Drops all snapshots and clears the "committed" snapshot.
      */
     virtual void dropAllSnapshots() = 0;
@@ -249,6 +260,13 @@ public:
     virtual void updateCommittedSnapshot(const OpTime& newCommitPoint) = 0;
 
     /**
+     * Updates the lastApplied snapshot to a consistent point for secondary reads.
+     *
+     * It is illegal to call with a non-existent optime.
+     */
+    virtual void updateLastAppliedSnapshot(const OpTime& optime) = 0;
+
+    /**
      * Returns whether or not the SnapshotThread is active.
      */
     virtual bool snapshotsEnabled() const = 0;
@@ -257,6 +275,12 @@ public:
      * Notifies listeners of a change in the commit level.
      */
     virtual void notifyOplogMetadataWaiters(const OpTime& committedOpTime) = 0;
+
+    /**
+     * Returns earliest drop optime of drop pending collections.
+     * Returns boost::none if there are no drop pending collections.
+     */
+    virtual boost::optional<OpTime> getEarliestDropPendingOpTime() const = 0;
 
     /**
      * Returns multiplier to apply to election timeout to obtain upper bound
@@ -276,9 +300,15 @@ public:
 
     /**
      * Returns maximum number of times that the oplog fetcher will consecutively restart the oplog
-     * tailing query on non-cancellation errors.
+     * tailing query on non-cancellation errors during steady state replication.
      */
-    virtual std::size_t getOplogFetcherMaxFetcherRestarts() const = 0;
+    virtual std::size_t getOplogFetcherSteadyStateMaxFetcherRestarts() const = 0;
+
+    /**
+     * Returns maximum number of times that the oplog fetcher will consecutively restart the oplog
+     * tailing query on non-cancellation errors during initial sync.
+     */
+    virtual std::size_t getOplogFetcherInitialSyncMaxFetcherRestarts() const = 0;
 
     /*
      * Creates noop writer instance. Setting the _noopWriter member is not protected by a guard,

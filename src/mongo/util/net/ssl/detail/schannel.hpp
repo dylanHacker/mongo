@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -306,10 +308,25 @@ public:
     }
 
     /**
+     * Returns the SNI captured in doServerHandshake.
+     */
+    boost::optional<std::string> getSNI() const {
+        if (!_sni) {
+            return boost::none;
+        }
+        auto sni_data = reinterpret_cast<const char*>(_sni->data());
+        return std::string(sni_data);
+    }
+
+    /**
      * Get data to sent over the network.
      */
     void readOutputBuffer(void* data, size_t inLength, size_t& outLength) {
         _pOutBuffer->readInto(data, inLength, outLength);
+    }
+
+    static void setSslGetServerIdentityFn(SslGetServerIdentityFn sslGetServerIdentityFn) {
+        _sslGetServerIdentityFn = sslGetServerIdentityFn;
     }
 
 private:
@@ -359,9 +376,12 @@ private:
      * +----------------+     +-----------------------+     +-------------------+     +------+
      * | HandshakeStart | --> | NeedMoreHandshakeData | --> | HaveEncryptedData | --> | Done |
      * +----------------+     +-----------------------+     +-------------------+     +------+
+     *                          ^                   |
+     *                          +-------------------+
      *
-     * "[ HandshakeStart ] --> [ NeedMoreHandshakeData ] --> [HaveEncryptedData] -> [
-     * NeedMoreHandshakeData], [Done] " | graph-easy
+     * echo "[ HandshakeStart ] --> [ NeedMoreHandshakeData ] --> [ NeedMoreHandshakeData ] -->
+     * [HaveEncryptedData] -> [NeedMoreHandshakeData], [Done]" | graph-easy "[ HandshakeStart ] -->
+     * [ NeedMoreHandshakeData ] --> [HaveEncryptedData] -> [
      */
     enum class State {
         // Initial state
@@ -383,7 +403,7 @@ private:
     void setState(State s) {
         ASSERT_STATE_TRANSITION(_state == State::HandshakeStart, s == State::NeedMoreHandshakeData);
         ASSERT_STATE_TRANSITION(_state == State::NeedMoreHandshakeData,
-                                s == State::HaveEncryptedData);
+                                s == State::HaveEncryptedData || s == State::NeedMoreHandshakeData);
         ASSERT_STATE_TRANSITION(_state == State::HaveEncryptedData,
                                 s == State::NeedMoreHandshakeData || s == State::Done);
         _state = s;
@@ -398,6 +418,15 @@ private:
 
     // Server name for TLS SNI purposes
     std::wstring& _serverName;
+
+    // For reading in the SNI from client hello
+    boost::optional<std::vector<BYTE>> _sni;
+
+    // Checks whether the sni has been set.
+    bool _sni_set = false;
+
+    // SChannel function to get the SNI from the client hello
+    static SslGetServerIdentityFn _sslGetServerIdentityFn;
 
     // Buffer of data received from remote side
     ReusableBuffer* _pInBuffer;

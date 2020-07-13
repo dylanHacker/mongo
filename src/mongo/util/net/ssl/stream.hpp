@@ -64,11 +64,11 @@ template <typename Stream>
 class stream : public stream_base, private noncopyable {
 public:
 /// The native handle type of the SSL stream.
-#if MONGO_CONFIG_SSL_PROVIDER == SSL_PROVIDER_WINDOWS
+#if MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_WINDOWS
     typedef PCtxtHandle native_handle_type;
-#elif MONGO_CONFIG_SSL_PROVIDER == SSL_PROVIDER_OPENSSL
+#elif MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
     typedef SSL* native_handle_type;
-#elif MONGO_CONFIG_SSL_PROVIDER == SSL_PROVIDER_APPLE
+#elif MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_APPLE
     typedef ::SSLContextRef native_handle_type;
 #else
 #error "Unknown SSL Provider"
@@ -164,6 +164,11 @@ public:
      */
     native_handle_type native_handle() {
         return core_.engine_.native_handle();
+    }
+
+    /// Gets the sni from the client hello.
+    boost::optional<std::string> get_sni() {
+        return core_.engine_.get_sni();
     }
 
     /// Get a reference to the next layer.
@@ -575,6 +580,10 @@ public:
                          init.completion_handler);
 
         return init.result.get();
+    }
+
+    asio::mutable_buffer& getCoreOutputBuffer() {
+        return core_.output_;
     }
 
 private:

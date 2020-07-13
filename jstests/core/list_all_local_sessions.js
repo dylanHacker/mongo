@@ -11,9 +11,14 @@
 // ]
 
 (function() {
-    'use strict';
+'use strict';
 
-    const admin = db.getSisterDB('admin');
+const admin = db.getSisterDB('admin');
+
+// Get current log level.
+let originalLogLevel = assert.commandWorked(admin.setLogLevel(1)).was.verbosity;
+
+try {
     const listAllLocalSessions = function() {
         return admin.aggregate([{'$listLocalSessions': {allUsers: true}}]);
     };
@@ -33,4 +38,7 @@
                                     return 0 == bsonWoCompare({x: id}, {x: myid});
                                 });
     assert.eq(resultArrayMine.length, 1);
+} finally {
+    admin.setLogLevel(originalLogLevel);
+}
 })();

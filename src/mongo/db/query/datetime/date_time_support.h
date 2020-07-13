@@ -1,37 +1,39 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
 #include <memory>
 #include <string>
+#include <utility>
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/base/status.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/string_map.h"
 #include "mongo/util/time_support.h"
@@ -42,6 +44,8 @@ struct _timelib_tzdb;
 struct _timelib_tzinfo;
 
 namespace mongo {
+
+using namespace std::string_literals;
 
 /**
  * A TimeZone object represents one way of formatting/reading dates to compute things like the day
@@ -192,15 +196,15 @@ public:
      * Converts a date object to a string according to 'format'. 'format' can be any string literal,
      * containing 0 or more format specifiers like %Y (year) or %d (day of month). Callers must pass
      * a valid format string for 'format', i.e. one that has already been passed to
-     * validateFormat().
+     * validateFormat(). May return a Status indicating that the date value is an unprintable range.
      */
-    std::string formatDate(StringData format, Date_t) const;
+    StatusWith<std::string> formatDate(StringData format, Date_t) const;
 
     /**
      * Like formatDate, except outputs to an output stream like a std::ostream or a StringBuilder.
      */
     template <typename OutputStream>
-    void outputDateWithFormat(OutputStream& os, StringData format, Date_t date) const {
+    auto outputDateWithFormat(OutputStream& os, StringData format, Date_t date) const {
         auto parts = dateParts(date);
         for (auto&& it = format.begin(); it != format.end(); ++it) {
             if (*it != '%') {
@@ -217,51 +221,71 @@ public:
                     break;
                 case 'Y':  // Year
                 {
-                    insertPadded(os, parts.year, 4);
+                    if (auto status = insertPadded(os, parts.year, 4); status != Status::OK())
+                        return status;
                     break;
                 }
                 case 'm':  // Month
-                    insertPadded(os, parts.month, 2);
+                    if (auto status = insertPadded(os, parts.month, 2); status != Status::OK())
+                        return status;
                     break;
                 case 'd':  // Day of month
-                    insertPadded(os, parts.dayOfMonth, 2);
+                    if (auto status = insertPadded(os, parts.dayOfMonth, 2); status != Status::OK())
+                        return status;
                     break;
                 case 'H':  // Hour
-                    insertPadded(os, parts.hour, 2);
+                    if (auto status = insertPadded(os, parts.hour, 2); status != Status::OK())
+                        return status;
                     break;
                 case 'M':  // Minute
-                    insertPadded(os, parts.minute, 2);
+                    if (auto status = insertPadded(os, parts.minute, 2); status != Status::OK())
+                        return status;
                     break;
                 case 'S':  // Second
-                    insertPadded(os, parts.second, 2);
+                    if (auto status = insertPadded(os, parts.second, 2); status != Status::OK())
+                        return status;
                     break;
                 case 'L':  // Millisecond
-                    insertPadded(os, parts.millisecond, 3);
+                    if (auto status = insertPadded(os, parts.millisecond, 3);
+                        status != Status::OK())
+                        return status;
                     break;
                 case 'j':  // Day of year
-                    insertPadded(os, dayOfYear(date), 3);
+                    if (auto status = insertPadded(os, dayOfYear(date), 3); status != Status::OK())
+                        return status;
                     break;
                 case 'w':  // Day of week
-                    insertPadded(os, dayOfWeek(date), 1);
+                    if (auto status = insertPadded(os, dayOfWeek(date), 1); status != Status::OK())
+                        return status;
                     break;
                 case 'U':  // Week
-                    insertPadded(os, week(date), 2);
+                    if (auto status = insertPadded(os, week(date), 2); status != Status::OK())
+                        return status;
                     break;
                 case 'G':  // Iso year of week
-                    insertPadded(os, isoYear(date), 4);
+                    if (auto status = insertPadded(os, isoYear(date), 4); status != Status::OK())
+                        return status;
                     break;
                 case 'V':  // Iso week
-                    insertPadded(os, isoWeek(date), 2);
+                    if (auto status = insertPadded(os, isoWeek(date), 2); status != Status::OK())
+                        return status;
                     break;
                 case 'u':  // Iso day of week
-                    insertPadded(os, isoDayOfWeek(date), 1);
+                    if (auto status = insertPadded(os, isoDayOfWeek(date), 1);
+                        status != Status::OK())
+                        return status;
                     break;
                 case 'z':  // UTC offset as ±hhmm.
                 {
                     auto offset = utcOffset(date);
-                    os << ((offset.count() < 0) ? "-" : "+");                            // sign
-                    insertPadded(os, std::abs(durationCount<Hours>(offset)), 2);         // hh
-                    insertPadded(os, std::abs(durationCount<Minutes>(offset)) % 60, 2);  // mm
+                    os << ((offset.count() < 0) ? "-" : "+");  // sign
+                    if (auto status = insertPadded(os, std::abs(durationCount<Hours>(offset)), 2);
+                        status != Status::OK())  // hh
+                        return status;
+                    if (auto status =
+                            insertPadded(os, std::abs(durationCount<Minutes>(offset)) % 60, 2);
+                        status != Status::OK())  // mm
+                        return status;
                     break;
                 }
                 case 'Z':  // UTC offset in minutes.
@@ -272,6 +296,7 @@ public:
                     MONGO_UNREACHABLE;
             }
         }
+        return Status::OK();
     }
 
     /**
@@ -289,15 +314,15 @@ private:
      * count of number we simply insert the number without padding.
      */
     template <typename OutputStream>
-    void insertPadded(OutputStream& os, int number, int width) const {
+    static auto insertPadded(OutputStream& os, int number, int width) {
         invariant(width >= 1);
         invariant(width <= 4);
 
-        uassert(18537,
-                str::stream() << "Could not convert date to string: date component was outside "
-                              << "the supported range of 0-9999: "
-                              << number,
-                (number >= 0) && (number <= 9999));
+        if ((number < 0) || (number > 9999))
+            return Status{ErrorCodes::Error{18537},
+                          "Could not convert date to string: date component was outside "
+                          "the supported range of 0-9999: "s +
+                              std::to_string(number)};
 
         int digits = 1;
 
@@ -313,6 +338,7 @@ private:
             os.write("0000", width - digits);
         }
         os << number;
+        return Status::OK();
     }
 
     struct TimelibTZInfoDeleter {
@@ -331,7 +357,8 @@ private:
  * accessed via the global service context.
  */
 class TimeZoneDatabase {
-    MONGO_DISALLOW_COPYING(TimeZoneDatabase);
+    TimeZoneDatabase(const TimeZoneDatabase&) = delete;
+    TimeZoneDatabase& operator=(const TimeZoneDatabase&) = delete;
 
 public:
     /**
@@ -408,6 +435,8 @@ public:
      * Creates a TimeZoneDatabase object using time zone rules given by 'timeZoneDatabase'.
      */
     TimeZoneDatabase(std::unique_ptr<_timelib_tzdb, TimeZoneDBDeleter> timeZoneDatabase);
+
+    std::vector<std::string> getTimeZoneStrings() const;
 
 private:
     /**

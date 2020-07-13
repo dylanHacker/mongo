@@ -1,28 +1,53 @@
 """Mongo lock module."""
 
-from __future__ import print_function
-
 import re
 import sys
 
 import gdb
 import gdb.printing
-import mongo
 
-if sys.version_info[0] >= 3:
-    # GDB only permits converting a gdb.Value instance to its numerical address when using the
-    # long() constructor in Python 2 and not when using the int() constructor. We define the
-    # 'long' class as an alias for the 'int' class in Python 3 for compatibility.
-    long = int  # pylint: disable=redefined-builtin,invalid-name
+if sys.version_info[0] < 3:
+    raise gdb.GdbError(
+        "MongoDB gdb extensions only support Python 3. Your GDB was compiled against Python 2")
+
+
+class NonExecutingThread(object):
+    """NonExecutingThread class.
+
+    Idle multi-statement transactions can hold locks that are not associated with an active
+    thread. In order to generate meaningful digraphs that include these locks, we create an
+    object that implements the "Thread" class interface but populates with LockerId rather than
+    thread::id. This allows us to uniquely identify each idle transaction.
+    """
+
+    def __init__(self, locker_id):
+        """Initialize Thread."""
+        self.locker_id = locker_id
+
+    def __eq__(self, other):
+        if isinstance(other, NonExecutingThread):
+            return self.locker_id == other.locker_id
+        return NotImplemented
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __str__(self):
+        return "Idle Transaction (LockerId {})".format(self.locker_id)
+
+    def key(self):
+        """Return NonExecutingThread key."""
+        return "LockerId {}".format(self.locker_id)
 
 
 class Thread(object):
     """Thread class."""
 
-    def __init__(self, thread_id, lwpid):
+    def __init__(self, thread_id, lwpid, thread_name):
         """Initialize Thread."""
         self.thread_id = thread_id
         self.lwpid = lwpid
+        self.name = thread_name
 
     def __eq__(self, other):
         if isinstance(other, Thread):
@@ -33,7 +58,7 @@ class Thread(object):
         return not self == other
 
     def __str__(self):
-        return "Thread 0x{:012x} (LWP {})".format(self.thread_id, self.lwpid)
+        return "{} (Thread 0x{:012x} (LWP {}))".format(self.name, self.thread_id, self.lwpid)
 
     def key(self):
         """Return thread key."""
@@ -138,26 +163,40 @@ class Graph(object):
         for node_key in self.nodes:
             print("Node", self.nodes[node_key]['node'])
             for to_node in self.nodes[node_key]['next_nodes']:
-                print(" ->", to_node)
+                print(" ->", self.nodes[to_node]['node'])
+
+    def _get_node_escaped(self, node_key):
+        """Return the name of the node with any double quotes escaped.
+
+        The DOT language requires that literal double quotes be escaped using a backslash character.
+        """
+        return str(self.nodes[node_key]['node']).replace('"', '\\"')
 
     def to_graph(self, nodes=None, message=None):
         """Return the 'to_graph'."""
         sb = []
         sb.append('# Legend:')
-        sb.append('#    Thread 1 -> Lock 1 indicates Thread 1 is waiting on Lock 1')
-        sb.append('#    Lock 2 -> Thread 2 indicates Lock 2 is held by Thread 2')
+        sb.append('#    Thread 1 -> Lock C (MODE_IX) indicates Thread 1 is waiting on Lock C and'
+                  ' Lock C is currently held in MODE_IX')
+        sb.append('#    Lock C (MODE_IX) -> Thread 2 indicates Lock C is held by Thread 2 in'
+                  ' MODE_IX')
         if message is not None:
             sb.append(message)
         sb.append('digraph "mongod+lock-status" {')
+        # Draw the graph from left to right. There can be hundreds of threads blocked by the same
+        # resource, but only a few resources involved in a deadlock, so we prefer a long graph
+        # than a super wide one. Long resource / thread names would make a wide graph even wider.
+        sb.append('    rankdir=LR;')
         for node_key in self.nodes:
             for next_node_key in self.nodes[node_key]['next_nodes']:
-                sb.append('    "{}" -> "{}";'.format(node_key, next_node_key))
+                sb.append('    "{}" -> "{}";'.format(
+                    self._get_node_escaped(node_key), self._get_node_escaped(next_node_key)))
         for node_key in self.nodes:
             color = ""
             if nodes and node_key in nodes:
                 color = "color = red"
-            sb.append('    "{}" [label="{}" {}]'.format(node_key, self.nodes[node_key]['node'],
-                                                        color))
+
+            sb.append('    "{0}" [label="{0}" {1}]'.format(self._get_node_escaped(node_key), color))
         sb.append("}")
         return "\n".join(sb)
 
@@ -191,15 +230,15 @@ class Graph(object):
             if node not in nodes_visited:
                 cycle_path = self.depth_first_search(node, nodes_visited)
                 if cycle_path:
-                    return cycle_path
+                    return [str(self.nodes[node_key]['node']) for node_key in cycle_path]
         return None
 
 
-def find_lwpid(thread_dict, search_thread_id):
-    """Find lwpid."""
-    for (lwpid, thread_id) in thread_dict.items():
-        if thread_id == search_thread_id:
-            return lwpid
+def find_thread(thread_dict, search_thread_id):
+    """Find thread."""
+    for (_, thread) in list(thread_dict.items()):
+        if thread.thread_id == search_thread_id:
+            return thread
     return None
 
 
@@ -246,40 +285,52 @@ def find_mutex_holder(graph, thread_dict, show):
     mutex_this, _ = gdb.lookup_symbol("this", frame.block())
     mutex_value = mutex_this.value(frame)
     # The mutex holder is a LWPID
-    mutex_holder = int(mutex_value["_M_mutex"]["__data"]["__owner"])
+    mutex_holder_lwpid = int(mutex_value["_M_mutex"]["__data"]["__owner"])
+
     # At time thread_dict was initialized, the mutex holder may not have been found.
     # Use the thread LWP as a substitute for showing output or generating the graph.
-    if mutex_holder not in thread_dict:
+    if mutex_holder_lwpid not in thread_dict:
         print("Warning: Mutex at {} held by thread with LWP {}"
               " not found in thread_dict. Using LWP to track thread.".format(
-                  mutex_value, mutex_holder))
-        mutex_holder_id = mutex_holder
+                  mutex_value, mutex_holder_lwpid))
+        mutex_holder = Thread(mutex_holder_lwpid, mutex_holder_lwpid, '"[unknown]"')
     else:
-        mutex_holder_id = thread_dict[mutex_holder]
+        mutex_holder = thread_dict[mutex_holder_lwpid]
 
     (_, mutex_waiter_lwpid, _) = gdb.selected_thread().ptid
-    mutex_waiter_id = thread_dict[mutex_waiter_lwpid]
+    mutex_waiter = thread_dict[mutex_waiter_lwpid]
     if show:
-        print("Mutex at {} held by thread 0x{:x} (LWP {})"
-              " waited on by thread 0x{:x} (LWP {})".format(
-                  mutex_value, mutex_holder_id, mutex_holder, mutex_waiter_id, mutex_waiter_lwpid))
+        print("Mutex at {} held by {} waited on by {}".format(mutex_value, mutex_holder,
+                                                              mutex_waiter))
     if graph:
-        graph.add_edge(
-            Thread(mutex_waiter_id, mutex_waiter_lwpid), Lock(long(mutex_value), "Mutex"))
-        graph.add_edge(Lock(long(mutex_value), "Mutex"), Thread(mutex_holder_id, mutex_holder))
+        graph.add_edge(mutex_waiter, Lock(int(mutex_value), "Mutex"))
+        graph.add_edge(Lock(int(mutex_value), "Mutex"), mutex_holder)
 
 
-def find_lock_manager_holders(graph, thread_dict, show):
+def find_lock_manager_holders(graph, thread_dict, show):  # pylint: disable=too-many-locals
     """Find lock manager holders."""
-    frame = find_frame(r'mongo::LockerImpl\<.*\>::')
+    # In versions of MongoDB 4.0 and older, the LockerImpl class is templatized with a boolean
+    # parameter. With the removal of the MMAPv1 storage engine in MongoDB 4.2, the LockerImpl class
+    # is no longer templatized.
+    frame = find_frame(r'mongo::LockerImpl(?:\<.*\>)?::')
     if not frame:
         return
 
     frame.select()
 
-    (_, lwpid, _) = gdb.selected_thread().ptid
+    (_, lock_waiter_lwpid, _) = gdb.selected_thread().ptid
+    lock_waiter = thread_dict[lock_waiter_lwpid]
 
-    locker_ptr_type = gdb.lookup_type("mongo::LockerImpl<false>").pointer()
+    try:
+        locker_ptr_type = gdb.lookup_type("mongo::LockerImpl<false>").pointer()
+    except gdb.error as err:
+        # If we don't find the templatized version of the LockerImpl class, then we try to find the
+        # non-templatized version.
+        if not err.args[0].startswith("No type named"):
+            raise
+
+        locker_ptr_type = gdb.lookup_type("mongo::LockerImpl").pointer()
+
     lock_head = gdb.parse_and_eval(
         "mongo::getGlobalLockManager()->_getBucket(resId)->findOrInsert(resId)")
 
@@ -290,16 +341,18 @@ def find_lock_manager_holders(graph, thread_dict, show):
         locker_ptr = lock_request["locker"]
         locker_ptr = locker_ptr.cast(locker_ptr_type)
         locker = locker_ptr.dereference()
-        lock_thread_id = int(locker["_threadId"]["_M_thread"])
-        lock_thread_lwpid = find_lwpid(thread_dict, lock_thread_id)
+        lock_holder_id = int(locker["_threadId"]["_M_thread"])
+        if lock_holder_id == 0:
+            locker_id = int(locker["_id"])
+            lock_holder = NonExecutingThread(locker_id)
+        else:
+            lock_holder = find_thread(thread_dict, lock_holder_id)
         if show:
-            print("MongoDB Lock at {} ({}) held by thread id 0x{:x} (LWP {})".format(
-                lock_head, lock_request["mode"], lock_thread_id, lock_thread_lwpid) +
-                  " waited on by thread 0x{:x} (LWP {})".format(thread_dict[lwpid], lwpid))
+            print("MongoDB Lock at {} held by {} ({}) waited on by {}".format(
+                lock_head, lock_holder, lock_request["mode"], lock_waiter))
         if graph:
-            graph.add_edge(Thread(thread_dict[lwpid], lwpid), Lock(long(lock_head), "MongoDB lock"))
-            graph.add_edge(
-                Lock(long(lock_head), "MongoDB lock"), Thread(lock_thread_id, lock_thread_lwpid))
+            graph.add_edge(lock_waiter, Lock(int(lock_head), lock_request["mode"]))
+            graph.add_edge(Lock(int(lock_head), lock_request["mode"]), lock_holder)
         lock_request_ptr = lock_request["next"]
 
 
@@ -327,11 +380,12 @@ def get_threads_info():
             # PTID is a tuple: Process ID (PID), Lightweight Process ID (LWPID), Thread ID (TID)
             (_, lwpid, _) = thread.ptid
             thread_num = thread.num
-            thread_id = mongo.get_thread_id()
+            thread_name = get_current_thread_name()  # pylint: disable=undefined-variable
+            thread_id = get_thread_id()  # pylint: disable=undefined-variable
             if not thread_id:
                 print("Unable to retrieve thread_info for thread %d" % thread_num)
                 continue
-            thread_dict[lwpid] = thread_id
+            thread_dict[lwpid] = Thread(thread_id, lwpid, thread_name)
         except gdb.error as err:
             print("Ignoring GDB error '%s' in get_threads_info" % str(err))
 
@@ -343,7 +397,8 @@ class MongoDBShowLocks(gdb.Command):
 
     def __init__(self):
         """Initialize MongoDBShowLocks."""
-        mongo.register_mongo_command(self, "mongodb-show-locks", gdb.COMMAND_DATA)
+        RegisterMongoCommand.register(  # pylint: disable=undefined-variable
+            self, "mongodb-show-locks", gdb.COMMAND_DATA)
 
     def invoke(self, *_):
         """Invoke mongodb_show_locks."""
@@ -359,7 +414,7 @@ class MongoDBShowLocks(gdb.Command):
             print("Ignoring GDB error '%s' in mongodb_show_locks" % str(err))
 
 
-mongo.MongoDBShowLocks()  # type: ignore
+MongoDBShowLocks()
 
 
 class MongoDBWaitsForGraph(gdb.Command):
@@ -367,7 +422,8 @@ class MongoDBWaitsForGraph(gdb.Command):
 
     def __init__(self):
         """Initialize MongoDBWaitsForGraph."""
-        mongo.register_mongo_command(self, "mongodb-waitsfor-graph", gdb.COMMAND_DATA)
+        RegisterMongoCommand.register(  # pylint: disable=undefined-variable
+            self, "mongodb-waitsfor-graph", gdb.COMMAND_DATA)
 
     def invoke(self, arg, *_):
         """Invoke mongodb_waitsfor_graph."""

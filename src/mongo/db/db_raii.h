@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,33 +38,50 @@
 namespace mongo {
 
 /**
- * RAII-style class which automatically tracks the operation namespace in CurrentOp and records the
- * operation via Top upon destruction.
+ * RAII-style class which can update the diagnostic state on the operation's CurOp object and record
+ * the operation via Top upon destruction. Can be configured to only update the Top counters if
+ * desired.
  */
 class AutoStatsTracker {
-    MONGO_DISALLOW_COPYING(AutoStatsTracker);
+    AutoStatsTracker(const AutoStatsTracker&) = delete;
+    AutoStatsTracker& operator=(const AutoStatsTracker&) = delete;
 
 public:
     /**
-     * Sets the namespace of the CurOp object associated with 'opCtx' to be 'nss' and starts the
-     * CurOp timer. 'lockType' describes which type of lock is held by this operation, and will be
-     * used for reporting via Top. If 'dbProfilingLevel' is not given, this constructor will acquire
-     * and then drop a database lock in order to determine the database's profiling level.
+     * Describes which diagnostics to update during the lifetime of this object.
+     */
+    enum class LogMode {
+        kUpdateTop,    // Increments the Top counter for this operation type and this namespace
+                       // upon destruction.
+        kUpdateCurOp,  // Adjusts the state on the CurOp object associated with the
+                       // OperationContext. Updates the namespace to be 'nss', starts a timer
+                       // for the operation (if it hasn't already started), and figures out and
+                       // records the profiling level of the operation.
+        kUpdateTopAndCurOp,  // Performs the operations of both the LogModes specified above.
+    };
+
+    /**
+     * If 'logMode' is 'kUpdateCurOp' or 'kUpdateTopAndCurOp', sets up and records state on the
+     * CurOp object attached to 'opCtx', as described above.
      */
     AutoStatsTracker(OperationContext* opCtx,
                      const NamespaceString& nss,
                      Top::LockType lockType,
-                     boost::optional<int> dbProfilingLevel,
+                     LogMode logMode,
+                     int dbProfilingLevel,
                      Date_t deadline = Date_t::max());
 
     /**
-     * Records stats about the current operation via Top.
+     * Records stats about the current operation via Top, if 'logMode' is 'kUpdateTop' or
+     * 'kUpdateTopAndCurOp'.
      */
     ~AutoStatsTracker();
 
 private:
     OperationContext* _opCtx;
     Top::LockType _lockType;
+    const NamespaceString _nss;
+    const LogMode _logMode;
 };
 
 /**
@@ -79,7 +97,8 @@ private:
  * snapshot to become available.
  */
 class AutoGetCollectionForRead {
-    MONGO_DISALLOW_COPYING(AutoGetCollectionForRead);
+    AutoGetCollectionForRead(const AutoGetCollectionForRead&) = delete;
+    AutoGetCollectionForRead& operator=(const AutoGetCollectionForRead&) = delete;
 
 public:
     AutoGetCollectionForRead(
@@ -105,6 +124,12 @@ public:
     }
 
 private:
+    // If this field is set, the reader will not take the ParallelBatchWriterMode lock and conflict
+    // with secondary batch application. This stays in scope with the _autoColl so that locks are
+    // taken and released in the right order.
+    boost::optional<ShouldNotConflictWithSecondaryBatchApplicationBlock>
+        _shouldNotConflictWithSecondaryBatchApplicationBlock;
+
     // This field is optional, because the code to wait for majority committed snapshot needs to
     // release locks in order to block waiting
     boost::optional<AutoGetCollection> _autoColl;
@@ -115,14 +140,16 @@ private:
  * ensure the CurrentOp object has the right namespace and has started its timer.
  */
 class AutoGetCollectionForReadCommand {
-    MONGO_DISALLOW_COPYING(AutoGetCollectionForReadCommand);
+    AutoGetCollectionForReadCommand(const AutoGetCollectionForReadCommand&) = delete;
+    AutoGetCollectionForReadCommand& operator=(const AutoGetCollectionForReadCommand&) = delete;
 
 public:
     AutoGetCollectionForReadCommand(
         OperationContext* opCtx,
         const NamespaceStringOrUUID& nsOrUUID,
         AutoGetCollection::ViewMode viewMode = AutoGetCollection::ViewMode::kViewsForbidden,
-        Date_t deadline = Date_t::max());
+        Date_t deadline = Date_t::max(),
+        AutoStatsTracker::LogMode logMode = AutoStatsTracker::LogMode::kUpdateTopAndCurOp);
 
     Database* getDb() const {
         return _autoCollForRead.getDb();
@@ -150,7 +177,8 @@ private:
  * current operation.
  */
 class OldClientContext {
-    MONGO_DISALLOW_COPYING(OldClientContext);
+    OldClientContext(const OldClientContext&) = delete;
+    OldClientContext& operator=(const OldClientContext&) = delete;
 
 public:
     OldClientContext(OperationContext* opCtx, const std::string& ns, bool doVersion = true);
@@ -165,16 +193,6 @@ public:
         return _justCreated;
     }
 
-    /**
-     * Only used by the OldClientWriteContext class below and internally, do not use in any new
-     * code.
-     */
-    OldClientContext(OperationContext* opCtx,
-                     const std::string& ns,
-                     bool doVersion,
-                     Database* db,
-                     bool justCreated);
-
 private:
     friend class CurOp;
 
@@ -183,46 +201,66 @@ private:
     OperationContext* const _opCtx;
 
     Database* _db;
-    bool _justCreated;
-};
-
-/**
- * Combines AutoGetOrCreateDb and OldClientContext. If the requested 'ns' exists, the constructed
- * object will have both the database and the collection locked in MODE_IX. Otherwise, the database
- * will be locked in MODE_X and will be created (note, only the database will be created, but not
- * the collection).
- *
- * TODO: Based on its usages, this class should become AutoGetOrCreateCollection whereby the
- * requested collection should be automatically created instead of relying on the callers to perform
- * a check and create it afterwards.
- */
-class OldClientWriteContext {
-    MONGO_DISALLOW_COPYING(OldClientWriteContext);
-
-public:
-    OldClientWriteContext(OperationContext* opCtx, StringData ns);
-
-    Database* db() const {
-        return _clientContext->db();
-    }
-
-    Collection* getCollection() const {
-        return db()->getCollection(_opCtx, _nss);
-    }
-
-private:
-    OperationContext* const _opCtx;
-    const NamespaceString _nss;
-
-    boost::optional<AutoGetOrCreateDb> _autoCreateDb;
-    boost::optional<Lock::CollectionLock> _collLock;
-    boost::optional<OldClientContext> _clientContext;
+    bool _justCreated{false};
 };
 
 /**
  * Returns a MODE_IX LockMode if a read is performed under readConcern level snapshot, or a MODE_IS
  * lock otherwise. MODE_IX acquisition will allow a read to participate in two-phase locking.
+ * Throws an exception if 'system.views' is being queried within a transaction.
  */
-LockMode getLockModeForQuery(OperationContext* opCtx);
+LockMode getLockModeForQuery(OperationContext* opCtx, const boost::optional<NamespaceString>& nss);
+
+/**
+ * When in scope, enforces prepare conflicts in the storage engine. Reads and writes in this scope
+ * will block on accessing an already updated document which is in prepared state. And they will
+ * unblock after the prepared transaction that performed the update commits/aborts.
+ */
+class EnforcePrepareConflictsBlock {
+public:
+    explicit EnforcePrepareConflictsBlock(OperationContext* opCtx)
+        : _opCtx(opCtx), _originalValue(opCtx->recoveryUnit()->getPrepareConflictBehavior()) {
+        // It is illegal to call setPrepareConflictBehavior() while any storage transaction is
+        // active. setPrepareConflictBehavior() invariants that there is no active storage
+        // transaction.
+        _opCtx->recoveryUnit()->setPrepareConflictBehavior(PrepareConflictBehavior::kEnforce);
+    }
+
+    ~EnforcePrepareConflictsBlock() {
+        // If we are still holding locks, we might still have open storage transactions. However, we
+        // did not start with any active transactions when we first entered the scope. And
+        // transactions started within this scope cannot be reused outside of the scope. So we need
+        // to call abandonSnapshot() to close any open transactions on destruction. Any reads or
+        // writes should have already completed as we are exiting the scope. Therefore, this call is
+        // safe.
+        if (_opCtx->lockState()->isLocked()) {
+            _opCtx->recoveryUnit()->abandonSnapshot();
+        }
+        // It is illegal to call setPrepareConflictBehavior() while any storage transaction is
+        // active. There should not be any active transaction if we are not holding locks. If locks
+        // are still being held, the above abandonSnapshot() call should have already closed all
+        // storage transactions.
+        _opCtx->recoveryUnit()->setPrepareConflictBehavior(_originalValue);
+    }
+
+private:
+    OperationContext* _opCtx;
+    PrepareConflictBehavior _originalValue;
+};
+
+/**
+ * TODO: SERVER-44105 remove
+ * RAII type for letting secondary reads to block behind the PBW lock.
+ * Note: Do not add additional usage. This is only temporary for ease of backport.
+ */
+struct BlockSecondaryReadsDuringBatchApplication_DONT_USE {
+public:
+    BlockSecondaryReadsDuringBatchApplication_DONT_USE(OperationContext* opCtx);
+    ~BlockSecondaryReadsDuringBatchApplication_DONT_USE();
+
+private:
+    OperationContext* _opCtx{nullptr};
+    boost::optional<bool> _originalSettings;
+};
 
 }  // namespace mongo

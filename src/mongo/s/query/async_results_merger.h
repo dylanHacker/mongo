@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,14 +33,13 @@
 #include <queue>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/cursor_id.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/query/async_results_merger_params_gen.h"
 #include "mongo/s/query/cluster_query_result.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
@@ -72,7 +72,8 @@ class CursorResponse;
  * Does not throw exceptions.
  */
 class AsyncResultsMerger {
-    MONGO_DISALLOW_COPYING(AsyncResultsMerger);
+    AsyncResultsMerger(const AsyncResultsMerger&) = delete;
+    AsyncResultsMerger& operator=(const AsyncResultsMerger&) = delete;
 
 public:
     // When mongos has to do a merge in order to return results to the client in the correct sort
@@ -97,7 +98,7 @@ public:
      * with a new, valid OperationContext before the next use.
      */
     AsyncResultsMerger(OperationContext* opCtx,
-                       executor::TaskExecutor* executor,
+                       std::shared_ptr<executor::TaskExecutor> executor,
                        AsyncResultsMergerParams params);
 
     /**
@@ -109,7 +110,7 @@ public:
     /**
      * Returns true if all of the remote cursors are exhausted.
      */
-    bool remotesExhausted();
+    bool remotesExhausted() const;
 
     /**
      * Sets the maxTimeMS value that the ARM should forward with any internally issued getMore
@@ -167,12 +168,6 @@ public:
     StatusWith<ClusterQueryResult> nextReady();
 
     /**
-     * Blocks until the next result is ready, all remote cursors are exhausted, or there is an
-     * error.
-     */
-    StatusWith<ClusterQueryResult> blockingNext();
-
-    /**
      * Schedules remote work as required in order to make further results available. If there is an
      * error in scheduling this work, returns a non-ok status. On success, returns an event handle.
      * The caller can pass this event handle to 'executor' in order to be blocked until further
@@ -192,14 +187,47 @@ public:
     StatusWith<executor::TaskExecutor::EventHandle> nextEvent();
 
     /**
+     * Schedules a getMore on any remote hosts which:
+     *  - Do not have an error status set already.
+     *  - Don't already have a request outstanding.
+     *  - We don't currently have any results buffered.
+     *  - Are not exhausted (have a non-zero cursor id).
+     * Returns an error if any of the remotes responded with an error, or if we encounter an error
+     * while scheduling the getMore requests..
+     *
+     * In most cases users should call nextEvent() instead of this method, but this can be necessary
+     * if the caller of nextEvent() calls detachFromOperationContext() before the event is signaled.
+     * In such cases, the ARM cannot schedule getMores itself, and will need to be manually prompted
+     * after calling reattachToOperationContext().
+     *
+     * It is illegal to call this method if the ARM is not attached to an OperationContext.
+     */
+    Status scheduleGetMores();
+
+    /**
      * Adds the specified shard cursors to the set of cursors to be merged.  The results from the
      * new cursors will be returned as normal through nextReady().
      */
     void addNewShardCursors(std::vector<RemoteCursor>&& newCursors);
 
-    std::size_t getNumRemotes() const {
-        return _remotes.size();
-    }
+    /**
+     * Returns true if the cursor was opened with 'allowPartialResults:true' and results are not
+     * available from one or more shards.
+     */
+    bool partialResultsReturned() const;
+
+    /**
+     * Returns the number of remotes involved in this operation.
+     */
+    std::size_t getNumRemotes() const;
+
+    /**
+     * For sorted tailable cursors, returns the most recent available sort key. This guarantees that
+     * we will never return any future results which precede this key. If no results are ready to be
+     * returned, this method may cause the high water mark to advance to the lowest promised sortkey
+     * received from the shards. Returns an empty BSONObj if no such sort key is available.
+     */
+    BSONObj getHighWaterMark();
 
     /**
      * Starts shutting down this ARM by canceling all pending requests and scheduling killCursors
@@ -220,11 +248,6 @@ public:
      */
     executor::TaskExecutor::EventHandle kill(OperationContext* opCtx);
 
-    /**
-     * A blocking version of kill() that will not return until this is safe to destroy.
-     */
-    void blockingKill(OperationContext*);
-
 private:
     /**
      * We instantiate one of these per remote host. It contains the buffer of results we've
@@ -234,7 +257,8 @@ private:
     struct RemoteCursorData {
         RemoteCursorData(HostAndPort hostAndPort,
                          NamespaceString cursorNss,
-                         CursorId establishedCursorId);
+                         CursorId establishedCursorId,
+                         bool partialResultsReturned);
 
         /**
          * Returns the resolved host and port on which the remote cursor resides.
@@ -258,6 +282,9 @@ private:
         // result with a sort key lower than this.
         boost::optional<BSONObj> promisedMinSortKey;
 
+        // True if this remote is eligible to provide a high water mark sort key; false otherwise.
+        bool eligibleForHighWaterMark = false;
+
         // The cursor id for the remote cursor. If a remote cursor is not yet exhausted, this member
         // will be set to a valid non-zero cursor id. If a remote cursor is now exhausted, this
         // member will be set to zero.
@@ -267,8 +294,16 @@ private:
         // the operation if there is a view.
         NamespaceString cursorNss;
 
-        // The exact host in the shard on which the cursor resides.
+        // The exact host in the shard on which the cursor resides. Can be empty if this merger has
+        // 'allowPartialResults' set to true and initial cursor establishment failed on this shard.
         HostAndPort shardHostAndPort;
+
+        // The identity of the shard which the cursor belongs to.
+        ShardId shardId;
+
+        // This flag is set if the connection to the remote shard was lost, or never established in
+        // the first place. Only applicable if the 'allowPartialResults' option is enabled.
+        bool partialResultsReturned = false;
 
         // The buffer of results that have been retrieved but not yet returned to the caller.
         std::queue<ClusterQueryResult> docBuffer;
@@ -305,6 +340,18 @@ private:
         const bool _compareWholeSortKey;
     };
 
+    using MinSortKeyRemoteIdPair = std::pair<BSONObj, size_t>;
+
+    class PromisedMinSortKeyComparator {
+    public:
+        PromisedMinSortKeyComparator(BSONObj sort) : _sort(std::move(sort)) {}
+
+        bool operator()(const MinSortKeyRemoteIdPair& lhs, const MinSortKeyRemoteIdPair& rhs) const;
+
+    private:
+        BSONObj _sort;
+    };
+
     enum LifecycleState { kAlive, kKillStarted, kKillComplete };
 
     /**
@@ -328,7 +375,7 @@ private:
     /**
      * Checks whether or not the remote cursors are all exhausted.
      */
-    bool _remotesExhausted(WithLock);
+    bool _remotesExhausted(WithLock) const;
 
     //
     // Helpers for ready().
@@ -394,22 +441,47 @@ private:
     bool _haveOutstandingBatchRequests(WithLock);
 
     /**
+     * If a promisedMinSortKey has been received from all remotes, returns the lowest such key.
+     * Otherwise, returns boost::none.
+     */
+    boost::optional<MinSortKeyRemoteIdPair> _getMinPromisedSortKey(WithLock);
+
+    /**
+     * Schedules a getMore on any remote hosts which we need another batch from.
+     */
+    Status _scheduleGetMores(WithLock);
+
+    /**
      * Schedules a killCursors command to be run on all remote hosts that have open cursors.
      */
     void _scheduleKillCursors(WithLock, OperationContext* opCtx);
 
     /**
-     * Updates 'remote's metadata (e.g. the cursor id) based on information in 'response'.
+     * Updates the given remote's metadata (e.g. the cursor id) based on information in 'response'.
      */
-    void updateRemoteMetadata(RemoteCursorData* remote, const CursorResponse& response);
+    void _updateRemoteMetadata(WithLock, size_t remoteIndex, const CursorResponse& response);
+
+    /**
+     * Returns true if the given batch is eligible to provide a high water mark resume token for the
+     * stream, false otherwise.
+     */
+    bool _checkHighWaterMarkEligibility(WithLock,
+                                        BSONObj newMinSortKey,
+                                        const RemoteCursorData& remote,
+                                        const CursorResponse& response);
+
+    /**
+     * Sets the initial value of the high water mark sort key, if applicable.
+     */
+    void _setInitialHighWaterMark();
 
     OperationContext* _opCtx;
-    executor::TaskExecutor* _executor;
+    std::shared_ptr<executor::TaskExecutor> _executor;
     TailableModeEnum _tailableMode;
     AsyncResultsMergerParams _params;
 
     // Must be acquired before accessing any data members (other than _params, which is read-only).
-    stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("AsyncResultsMerger::_mutex");
 
     // Data tracking the state of our communication with each of the remote nodes.
     std::vector<RemoteCursorData> _remotes;
@@ -431,6 +503,13 @@ private:
     bool _eofNext = false;
 
     boost::optional<Milliseconds> _awaitDataTimeout;
+
+    // An ordered set of (promisedMinSortKey, remoteIndex) pairs received from the shards. The first
+    // element in the set will be the lowest sort key across all shards.
+    std::set<MinSortKeyRemoteIdPair, PromisedMinSortKeyComparator> _promisedMinSortKeys;
+
+    // For sorted tailable cursors, records the current high-water-mark sort key. Empty otherwise.
+    BSONObj _highWaterMark;
 
     //
     // Killing

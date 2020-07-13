@@ -1,23 +1,24 @@
 /**
- *    Copyright 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,11 +29,12 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/db/repl/reporter.h"
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/task_executor_proxy.h"
 #include "mongo/unittest/unittest.h"
 
@@ -71,8 +73,12 @@ public:
             BSONObjBuilder entry(arrayBuilder.subobjStart());
             itr.second.lastDurableOpTime.append(&entry,
                                                 UpdatePositionArgs::kDurableOpTimeFieldName);
+            entry.appendDate(UpdatePositionArgs::kDurableWallTimeFieldName,
+                             Date_t() + Seconds(itr.second.lastDurableOpTime.getSecs()));
             itr.second.lastAppliedOpTime.append(&entry,
                                                 UpdatePositionArgs::kAppliedOpTimeFieldName);
+            entry.appendDate(UpdatePositionArgs::kAppliedWallTimeFieldName,
+                             Date_t() + Seconds(itr.second.lastAppliedOpTime.getSecs()));
             entry.append(UpdatePositionArgs::kMemberIdFieldName, itr.first);
             if (_configVersion != -1) {
                 entry.append(UpdatePositionArgs::kConfigVersionFieldName, _configVersion);
@@ -141,9 +147,9 @@ ReporterTest::ReporterTest() {}
 void ReporterTest::setUp() {
     executor::ThreadPoolExecutorTest::setUp();
 
-    _executorProxy = stdx::make_unique<unittest::TaskExecutorProxy>(&getExecutor());
+    _executorProxy = std::make_unique<unittest::TaskExecutorProxy>(&getExecutor());
 
-    posUpdater = stdx::make_unique<MockProgressManager>();
+    posUpdater = std::make_unique<MockProgressManager>();
     posUpdater->updateMap(0, OpTime({3, 0}, 1), OpTime({3, 0}, 1));
 
     prepareReplSetUpdatePositionCommandFn = [updater = posUpdater.get()] {
@@ -151,11 +157,11 @@ void ReporterTest::setUp() {
     };
 
     reporter =
-        stdx::make_unique<Reporter>(_executorProxy.get(),
-                                    [this]() { return prepareReplSetUpdatePositionCommandFn(); },
-                                    HostAndPort("h1"),
-                                    Milliseconds(1000),
-                                    Milliseconds(5000));
+        std::make_unique<Reporter>(_executorProxy.get(),
+                                   [this]() { return prepareReplSetUpdatePositionCommandFn(); },
+                                   HostAndPort("h1"),
+                                   Milliseconds(1000),
+                                   Milliseconds(5000));
     launchExecutorThread();
 
     if (triggerAtSetUp()) {
@@ -226,6 +232,44 @@ void ReporterTest::assertReporterDone() {
     ASSERT_FALSE(reporter->isWaitingToSendReport());
     ASSERT_EQUALS(Date_t(), reporter->getKeepAliveTimeoutWhen_forTest());
     ASSERT_EQUALS(reporter->join(), reporter->trigger());
+}
+
+TEST(UpdatePositionArgs, AcceptsUnknownField) {
+    UpdatePositionArgs updatePositionArgs;
+    BSONObjBuilder bob;
+    bob.append(UpdatePositionArgs::kCommandFieldName, 1);
+    bob.append(UpdatePositionArgs::kUpdateArrayFieldName, BSONArray());
+    bob.append("unknownField", 1);  // append an unknown field.
+    BSONObj cmdObj = bob.obj();
+    ASSERT_OK(updatePositionArgs.initialize(cmdObj));
+}
+TEST(UpdatePositionArgs, AcceptsUnknownFieldInUpdateInfo) {
+    UpdatePositionArgs updatePositionArgs;
+    BSONObjBuilder bob;
+    bob.append(UpdatePositionArgs::kCommandFieldName, 1);
+    auto now = Date_t();
+    auto updateInfo =
+        BSON(UpdatePositionArgs::kConfigVersionFieldName
+             << 1 << UpdatePositionArgs::kMemberIdFieldName << 1
+             << UpdatePositionArgs::kDurableOpTimeFieldName << OpTime()
+             << UpdatePositionArgs::kAppliedOpTimeFieldName << OpTime()
+             << UpdatePositionArgs::kAppliedWallTimeFieldName << now
+             << UpdatePositionArgs::kDurableWallTimeFieldName << now << "unknownField" << 1);
+    bob.append(UpdatePositionArgs::kUpdateArrayFieldName, BSON_ARRAY(updateInfo));
+    BSONObj cmdObj = bob.obj();
+    ASSERT_OK(updatePositionArgs.initialize(cmdObj));
+
+    // The serialized object should be the same as the original except for the unknown field.
+    BSONObjBuilder bob2;
+    auto updateArgsObj = updatePositionArgs.toBSON();
+    auto updatesArr =
+        BSONArray(updateArgsObj.getObjectField(UpdatePositionArgs::kUpdateArrayFieldName));
+    ASSERT_EQ(updatesArr.nFields(), 1);
+    bob2.appendElements(updatesArr[0].Obj());
+    bob2.append(UpdatePositionArgs::kAppliedWallTimeFieldName, now);
+    bob2.append(UpdatePositionArgs::kDurableWallTimeFieldName, now);
+    bob2.append("unknownField", 1);
+    ASSERT_EQ(bob2.obj().woCompare(updateInfo), 0);
 }
 
 TEST_F(ReporterTestNoTriggerAtSetUp, InvalidConstruction) {
@@ -331,7 +375,7 @@ TEST_F(ReporterTestNoTriggerAtSetUp, IsNotActiveAfterUpdatePositionTimeoutExpire
     // Schedule a response to the updatePosition command at a time that exceeds the timeout. Then
     // make sure the reporter shut down due to a remote command timeout.
     auto updatePosRequest = net->getNextReadyRequest();
-    RemoteCommandResponse response(BSON("ok" << 1), BSONObj(), Milliseconds(0));
+    RemoteCommandResponse response(BSON("ok" << 1), Milliseconds(0));
     executor::TaskExecutor::ResponseStatus responseStatus(response);
     net->scheduleResponse(
         updatePosRequest, net->now() + updatePositionTimeout + Milliseconds(1), responseStatus);
@@ -342,7 +386,7 @@ TEST_F(ReporterTestNoTriggerAtSetUp, IsNotActiveAfterUpdatePositionTimeoutExpire
     // Reporter should have shut down.
     ASSERT_FALSE(testReporter.isWaitingToSendReport());
     ASSERT_FALSE(testReporter.isActive());
-    ASSERT_EQUALS(testReporter.getStatus_forTest().code(), ErrorCodes::NetworkTimeout);
+    ASSERT_TRUE(ErrorCodes::isExceededTimeLimitError(testReporter.getStatus_forTest().code()));
 }
 
 // If an error is returned, it should be recorded in the Reporter and not run again.
@@ -374,8 +418,7 @@ TEST_F(ReporterTestNoTriggerAtSetUp,
     processNetworkResponse(BSON("ok" << 0 << "code" << int(ErrorCodes::InvalidReplicaSetConfig)
                                      << "errmsg"
                                      << "newer config"
-                                     << "configVersion"
-                                     << 100));
+                                     << "configVersion" << 100));
 
     ASSERT_EQUALS(Status(ErrorCodes::InvalidReplicaSetConfig, "invalid config"), reporter->join());
     assertReporterDone();
@@ -394,8 +437,7 @@ TEST_F(ReporterTest, InvalidReplicaSetResponseWithSameConfigVersionOnSyncTargetS
     processNetworkResponse(BSON("ok" << 0 << "code" << int(ErrorCodes::InvalidReplicaSetConfig)
                                      << "errmsg"
                                      << "invalid config"
-                                     << "configVersion"
-                                     << posUpdater->getConfigVersion()));
+                                     << "configVersion" << posUpdater->getConfigVersion()));
 
     ASSERT_EQUALS(Status(ErrorCodes::InvalidReplicaSetConfig, "invalid config"), reporter->join());
     assertReporterDone();
@@ -411,8 +453,7 @@ TEST_F(ReporterTest,
     processNetworkResponse(BSON("ok" << 0 << "code" << int(ErrorCodes::InvalidReplicaSetConfig)
                                      << "errmsg"
                                      << "newer config"
-                                     << "configVersion"
-                                     << posUpdater->getConfigVersion() + 1));
+                                     << "configVersion" << posUpdater->getConfigVersion() + 1));
 
     ASSERT_TRUE(reporter->isActive());
 }
@@ -577,7 +618,7 @@ TEST_F(ReporterTestNoTriggerAtSetUp,
         TaskExecutorWithFailureInScheduleWork(executor::TaskExecutor* executor)
             : unittest::TaskExecutorProxy(executor) {}
         virtual StatusWith<executor::TaskExecutor::CallbackHandle> scheduleWork(
-            const CallbackFn& work) override {
+            CallbackFn&& override) {
             return Status(ErrorCodes::OperationFailed, "failed to schedule work");
         }
     };
@@ -599,9 +640,10 @@ TEST_F(ReporterTestNoTriggerAtSetUp, FailingToScheduleRemoteCommandTaskShouldMak
     public:
         TaskExecutorWithFailureInScheduleRemoteCommand(executor::TaskExecutor* executor)
             : unittest::TaskExecutorProxy(executor) {}
-        virtual StatusWith<executor::TaskExecutor::CallbackHandle> scheduleRemoteCommand(
-            const executor::RemoteCommandRequest& request,
-            const RemoteCommandCallbackFn& cb) override {
+        virtual StatusWith<executor::TaskExecutor::CallbackHandle> scheduleRemoteCommandOnAny(
+            const executor::RemoteCommandRequestOnAny& request,
+            const RemoteCommandOnAnyCallbackFn& cb,
+            const BatonHandle& baton = nullptr) override {
             // Any error status other than ShutdownInProgress will cause the reporter to fassert.
             return Status(ErrorCodes::ShutdownInProgress,
                           "failed to send remote command - shutdown in progress");
@@ -628,7 +670,7 @@ TEST_F(ReporterTest, FailingToScheduleTimeoutShouldMakeReporterInactive) {
         TaskExecutorWithFailureInScheduleWorkAt(executor::TaskExecutor* executor)
             : unittest::TaskExecutorProxy(executor) {}
         virtual StatusWith<executor::TaskExecutor::CallbackHandle> scheduleWorkAt(
-            Date_t when, const CallbackFn& work) override {
+            Date_t when, CallbackFn&&) override {
             return Status(ErrorCodes::OperationFailed, "failed to schedule work");
         }
     };

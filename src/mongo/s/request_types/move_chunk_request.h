@@ -1,29 +1,30 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -47,6 +48,21 @@ class StatusWith;
  */
 class MoveChunkRequest {
 public:
+    // This enum represents whether or not a migraiton should attempt to move a large chunk
+    enum class ForceJumbo : int {
+        kDoNotForce = 0,  // do not attempt to migrate a large chunk
+        kForceManual,     // manual moveChunk command specified 'forceJumbo : true'
+        kForceBalancer,   // balancer specified 'forceJumbo : true'
+    };
+
+    static constexpr StringData kDoNotForce = "doNotForceJumbo"_sd;
+    static constexpr StringData kForceManual = "forceJumboManualMoveChunk"_sd;
+    static constexpr StringData kForceBalancer = "forceJumboBalancerMigration"_sd;
+
+    static std::string forceJumboToString(ForceJumbo forceJumboVal);
+
+    static ForceJumbo parseForceJumbo(std::string forceJumbo);
+
     /**
      * Parses the input command and produces a request corresponding to its arguments. The parsing
      * ignores arguments, which are processed at the command level, in particular shardVersion and
@@ -72,7 +88,8 @@ public:
                                 const ChunkRange& range,
                                 int64_t maxChunkSizeBytes,
                                 const MigrationSecondaryThrottleOptions& secondaryThrottle,
-                                bool waitForDelete);
+                                bool waitForDelete,
+                                ForceJumbo forceJumbo);
 
     const NamespaceString& getNss() const {
         return _nss;
@@ -84,6 +101,10 @@ public:
 
     const ShardId& getToShardId() const {
         return _toShardId;
+    }
+
+    const ChunkRange& getRange() const {
+        return _range;
     }
 
     const BSONObj& getMinKey() const {
@@ -108,6 +129,10 @@ public:
 
     bool getWaitForDelete() const {
         return _waitForDelete;
+    }
+
+    ForceJumbo getForceJumbo() const {
+        return parseForceJumbo(_forceJumbo);
     }
 
     /**
@@ -139,7 +164,8 @@ private:
     // Range of the chunk being moved
     ChunkRange _range;
 
-    // Assures the collection has not been dropped and recreated since the moveChunk was sent.
+    // Used to ensure the collection has not been dropped and recreated or had its shard key refined
+    // since the moveChunk was sent.
     OID _versionEpoch;
 
     // This value is used by the migration source to determine the data size threshold above which a
@@ -152,6 +178,8 @@ private:
     // Whether to block and wait for the range deleter to cleanup the orphaned documents at the end
     // of move.
     bool _waitForDelete;
+
+    std::string _forceJumbo;
 };
 
 }  // namespace mongo

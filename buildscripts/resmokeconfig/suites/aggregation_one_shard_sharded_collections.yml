@@ -6,18 +6,19 @@ selector:
   exclude_files:
   - jstests/aggregation/extras/*.js
   - jstests/aggregation/data/*.js
-  # The following tests start their own mongod.
-  - jstests/aggregation/bugs/cursor_timeout.js
-  - jstests/aggregation/bugs/lookup_unwind_getmore.js
-  - jstests/aggregation/bugs/lookup_unwind_killcursor.js
   # TODO: Remove when SERVER-23229 is fixed.
   - jstests/aggregation/bugs/groupMissing.js
+  # TODO SERVER-32309: Enable once $lookup with pipeline supports sharded foreign collections.
+  - jstests/aggregation/sources/lookup/lookup_subpipeline.js
+  - jstests/aggregation/sources/graphLookup/variables.js
   exclude_with_any_tags:
   # Tests tagged with the following will fail because they assume collections are not sharded.
+  - assumes_against_mongod_not_mongos
   - assumes_no_implicit_collection_creation_after_drop
   - assumes_no_implicit_index_creation
   - assumes_unsharded_collection
   - cannot_create_unique_index_when_using_hashed_shard_key
+  - requires_profiling
   # The following tests start their own ShardingTest or ReplSetTest, respectively.
   - requires_sharding
   - requires_replication
@@ -46,7 +47,5 @@ executor:
       set_parameters:
         enableTestCommands: 1
     mongod_options:
-      nopreallocj: ''
       set_parameters:
         enableTestCommands: 1
-        numInitialSyncAttempts: 1

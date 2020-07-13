@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -25,9 +26,11 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#include "mongo/util/dns_query.h"
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/dns_query.h"
 
 using namespace std::literals::string_literals;
 
@@ -81,11 +84,15 @@ TEST(MongoDnsQuery, basic) {
     for (const auto& test : tests) {
         try {
             const auto witness = getFirstARecord(test.dns);
-            std::cout << "Resolved " << test.dns << " to: " << witness << std::endl;
+            using namespace mongo::literals;
+            LOGV2(23512,
+                  "Resolved {dns} to: {witness}",
+                  "dns"_attr = test.dns,
+                  "witness"_attr = witness);
 
             const bool resolution = (witness == test.ip);
             if (!resolution)
-                std::cerr << "Warning: Did not correctly resolve " << test.dns << std::endl;
+                LOGV2(23513, "Warning: Did not correctly resolve {dns}", "dns"_attr = test.dns);
             resolution_count += resolution;
         }
         // Failure to resolve is okay, but not great -- print a warning
@@ -109,11 +116,13 @@ TEST(MongoDnsQuery, srvRecords) {
     } tests[] = {
         {"test1.test.build.10gen.cc.",
          {
-             {"localhost.test.build.10gen.cc.", 27017}, {"localhost.test.build.10gen.cc.", 27018},
+             {"localhost.test.build.10gen.cc.", 27017},
+             {"localhost.test.build.10gen.cc.", 27018},
          }},
         {"test2.test.build.10gen.cc.",
          {
-             {"localhost.test.build.10gen.cc.", 27018}, {"localhost.test.build.10gen.cc.", 27019},
+             {"localhost.test.build.10gen.cc.", 27018},
+             {"localhost.test.build.10gen.cc.", 27019},
          }},
         {"test3.test.build.10gen.cc.",
          {
@@ -145,12 +154,16 @@ TEST(MongoDnsQuery, srvRecords) {
         std::sort(begin(witness), end(witness));
 
         for (const auto& entry : witness) {
-            std::cout << "Entry: " << entry << std::endl;
+            using namespace mongo::literals;
+            LOGV2(23514, "Entry: {entry}", "entry"_attr = entry);
         }
 
         for (std::size_t i = 0; i < witness.size() && i < expected.size(); ++i) {
-            std::cout << "Expected: " << expected.at(i) << std::endl;
-            std::cout << "Witness:  " << witness.at(i) << std::endl;
+            using namespace mongo::literals;
+            LOGV2(23510,
+                  "Expected: {expected} Witness: {witness}",
+                  "expected"_attr = expected.at(i),
+                  "witness"_attr = witness.at(i));
             ASSERT_EQ(witness.at(i), expected.at(i));
         }
 
@@ -173,7 +186,8 @@ TEST(MongoDnsQuery, txtRecords) {
          }},
         {"test6.test.build.10gen.cc",
          {
-             "authSource=otherDB", "replicaSet=repl0",
+             "authSource=otherDB",
+             "replicaSet=repl0",
          }},
     };
 

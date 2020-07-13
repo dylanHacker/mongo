@@ -1,29 +1,30 @@
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -39,10 +40,10 @@ namespace mongo {
  */
 class FeatureCompatibilityVersionParser {
 public:
-    static constexpr StringData kVersion36 = "3.6"_sd;
-    static constexpr StringData kVersion40 = "4.0"_sd;
-    static constexpr StringData kVersionDowngradingTo36 = "downgrading to 3.6"_sd;
-    static constexpr StringData kVersionUpgradingTo40 = "upgrading to 4.0"_sd;
+    static constexpr StringData kVersion44 = "4.4"_sd;
+    static constexpr StringData kVersion451 = "4.5.1"_sd;
+    static constexpr StringData kVersionDowngradingFrom451To44 = "downgrading from 4.5.1 to 4.4"_sd;
+    static constexpr StringData kVersionUpgradingFrom44To451 = "upgrading from 4.4 to 4.5.1"_sd;
     static constexpr StringData kVersionUnset = "Unset"_sd;
 
     static constexpr StringData kParameterName = "featureCompatibilityVersion"_sd;
@@ -62,16 +63,16 @@ public:
      */
     static StringData toString(ServerGlobalParams::FeatureCompatibility::Version version) {
         switch (version) {
-            case ServerGlobalParams::FeatureCompatibility::Version::kUnsetDefault36Behavior:
+            case ServerGlobalParams::FeatureCompatibility::Version::kUnsetDefault44Behavior:
                 return kVersionUnset;
-            case ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo36:
-                return kVersion36;
-            case ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo40:
-                return kVersionUpgradingTo40;
-            case ServerGlobalParams::FeatureCompatibility::Version::kDowngradingTo36:
-                return kVersionDowngradingTo36;
-            case ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40:
-                return kVersion40;
+            case ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo44:
+                return kVersion44;
+            case ServerGlobalParams::FeatureCompatibility::Version::kUpgradingFrom44To451:
+                return kVersionUpgradingFrom44To451;
+            case ServerGlobalParams::FeatureCompatibility::Version::kDowngradingFrom451To44:
+                return kVersionDowngradingFrom451To44;
+            case ServerGlobalParams::FeatureCompatibility::Version::kVersion451:
+                return kVersion451;
             default:
                 MONGO_UNREACHABLE;
         }

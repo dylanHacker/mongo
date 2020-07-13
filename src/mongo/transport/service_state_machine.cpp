@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,20 +27,24 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/transport/service_state_machine.h"
 
+#include <memory>
+
 #include "mongo/config.h"
 #include "mongo/db/client.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/stats/counters.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/traffic_recorder.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/message.h"
+#include "mongo/rpc/op_msg.h"
 #include "mongo/transport/message_compressor_manager.h"
 #include "mongo/transport/service_entry_point.h"
-#include "mongo/transport/service_executor_task_names.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/assert_util.h"
@@ -47,44 +52,112 @@
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/exit.h"
-#include "mongo/util/log.h"
-#include "mongo/util/net/message.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/net/socket_exception.h"
+#include "mongo/util/net/ssl_peer_info.h"
 #include "mongo/util/quick_exit.h"
 
 namespace mongo {
 namespace {
-// Set up proper headers for formatting an exhaust request, if we need to
-bool setExhaustMessage(Message* m, const DbResponse& dbresponse) {
+MONGO_FAIL_POINT_DEFINE(doNotSetMoreToCome);
+/**
+ * Creates and returns a legacy exhaust message, if exhaust is allowed. The returned message is to
+ * be used as the subsequent 'synthetic' exhaust request. Returns an empty message if exhaust is not
+ * allowed. Any messages that do not have an opcode of OP_MSG are considered legacy.
+ */
+Message makeLegacyExhaustMessage(Message* m, const DbResponse& dbresponse) {
+    // OP_QUERY responses are always of type OP_REPLY.
+    invariant(dbresponse.response.operation() == opReply);
+
+    if (!dbresponse.shouldRunAgainForExhaust) {
+        return Message();
+    }
+
+    // Legacy find operations via the OP_QUERY/OP_GET_MORE network protocol never provide the next
+    // invocation for exhaust.
+    invariant(!dbresponse.nextInvocation);
+
+    DbMessage dbmsg(*m);
+    invariant(dbmsg.messageShouldHaveNs());
+    const char* ns = dbmsg.getns();
+
     MsgData::View header = dbresponse.response.header();
     QueryResult::View qr = header.view2ptr();
     long long cursorid = qr.getCursorId();
 
-    if (!cursorid) {
-        return false;
+    if (cursorid == 0) {
+        return Message();
     }
 
-    invariant(dbresponse.exhaustNS.size() && dbresponse.exhaustNS[0]);
-
-    auto ns = dbresponse.exhaustNS;  // m->reset() will free this so we must cache a copy
-
-    m->reset();
-
-    // Rebuild out the response.
+    // Generate a message that will act as the subsequent 'synthetic' exhaust request.
     BufBuilder b(512);
-    b.appendNum(static_cast<int>(0) /* size set later in setLen() */);
+    b.appendNum(static_cast<int>(0));          // size set later in setLen()
     b.appendNum(header.getId());               // message id
     b.appendNum(header.getResponseToMsgId());  // in response to
     b.appendNum(static_cast<int>(dbGetMore));  // opCode is OP_GET_MORE
     b.appendNum(static_cast<int>(0));          // Must be ZERO (reserved)
-    b.appendStr(ns);                           // Namespace
+    b.appendStr(StringData(ns));               // Namespace
     b.appendNum(static_cast<int>(0));          // ntoreturn
     b.appendNum(cursorid);                     // cursor id from the OP_REPLY
 
     MsgData::View(b.buf()).setLen(b.len());
-    m->setData(b.release());
 
-    return true;
+    return Message(b.release());
+}
+
+/**
+ * Given a request and its already generated response, checks for exhaust flags. If exhaust is
+ * allowed, produces the subsequent request message, and modifies the response message to indicate
+ * it is part of an exhaust stream. Returns the subsequent request message, which is known as a
+ * 'synthetic' exhaust request. Returns an empty message if exhaust is not allowed.
+ */
+Message makeExhaustMessage(Message requestMsg, DbResponse* dbresponse) {
+    if (requestMsg.operation() == dbQuery) {
+        return makeLegacyExhaustMessage(&requestMsg, *dbresponse);
+    }
+
+    if (!OpMsgRequest::isFlagSet(requestMsg, OpMsg::kExhaustSupported)) {
+        return Message();
+    }
+
+    if (!dbresponse->shouldRunAgainForExhaust) {
+        return Message();
+    }
+
+    const bool checksumPresent = OpMsg::isFlagSet(requestMsg, OpMsg::kChecksumPresent);
+    Message exhaustMessage;
+
+    if (auto nextInvocation = dbresponse->nextInvocation) {
+        // The command provided a new BSONObj for the next invocation.
+        OpMsgBuilder builder;
+        builder.setBody(*nextInvocation);
+        exhaustMessage = builder.finish();
+    } else {
+        // Reuse the previous invocation for the next invocation.
+        OpMsg::removeChecksum(&requestMsg);
+        exhaustMessage = requestMsg;
+    }
+
+    // The id of the response is used as the request id of this 'synthetic' request. Re-checksum
+    // if needed.
+    exhaustMessage.header().setId(dbresponse->response.header().getId());
+    exhaustMessage.header().setResponseToMsgId(dbresponse->response.header().getResponseToMsgId());
+    OpMsg::setFlag(&exhaustMessage, OpMsg::kExhaustSupported);
+    if (checksumPresent) {
+        OpMsg::appendChecksum(&exhaustMessage);
+    }
+
+    OpMsg::removeChecksum(&dbresponse->response);
+    // Indicate that the response is part of an exhaust stream (unless the 'doNotSetMoreToCome'
+    // failpoint is set). Re-checksum if needed.
+    if (!MONGO_unlikely(doNotSetMoreToCome.shouldFail())) {
+        OpMsg::setFlag(&dbresponse->response, OpMsg::kMoreToCome);
+    }
+    if (checksumPresent) {
+        OpMsg::appendChecksum(&dbresponse->response);
+    }
+
+    return exhaustMessage;
 }
 
 }  // namespace
@@ -103,7 +176,8 @@ class ServiceStateMachine::ThreadGuard {
 
 public:
     explicit ThreadGuard(ServiceStateMachine* ssm) : _ssm{ssm} {
-        auto owned = _ssm->_owned.compareAndSwap(Ownership::kUnowned, Ownership::kOwned);
+        auto owned = Ownership::kUnowned;
+        _ssm->_owned.compareAndSwap(&owned, Ownership::kOwned);
         if (owned == Ownership::kStatic) {
             dassert(haveClient());
             dassert(Client::getCurrent() == _ssm->_dbClientPtr);
@@ -226,6 +300,7 @@ ServiceStateMachine::ServiceStateMachine(ServiceContext* svcContext,
       _sep{svcContext->getServiceEntryPoint()},
       _transportMode(transportMode),
       _serviceContext(svcContext),
+      _serviceExecutor(_serviceContext->getServiceExecutor()),
       _sessionHandle(session),
       _threadName{str::stream() << "conn" << _session()->id()},
       _dbClient{svcContext->makeClient(_threadName, std::move(session))},
@@ -300,20 +375,30 @@ void ServiceStateMachine::_sourceCallback(Status status) {
         // If this callback doesn't own the ThreadGuard, then we're being called recursively,
         // and the executor shouldn't start a new thread to process the message - it can use this
         // one just after this returns.
-        return _scheduleNextWithGuard(std::move(guard),
-                                      ServiceExecutor::kMayRecurse,
-                                      transport::ServiceExecutorTaskName::kSSMProcessMessage);
+        return _scheduleNextWithGuard(std::move(guard), ServiceExecutor::kMayRecurse);
     } else if (ErrorCodes::isInterruption(status.code()) ||
                ErrorCodes::isNetworkError(status.code())) {
-        LOG(2) << "Session from " << remote << " encountered a network error during SourceMessage";
+        LOGV2_DEBUG(
+            22986,
+            2,
+            "Session from {remote} encountered a network error during SourceMessage: {error}",
+            "Session from remote encountered a network error during SourceMessage",
+            "remote"_attr = remote,
+            "error"_attr = status);
         _state.store(State::EndSession);
     } else if (status == TransportLayer::TicketSessionClosedStatus) {
         // Our session may have been closed internally.
-        LOG(2) << "Session from " << remote << " was closed internally during SourceMessage";
+        LOGV2_DEBUG(22987,
+                    2,
+                    "Session from {remote} was closed internally during SourceMessage",
+                    "remote"_attr = remote);
         _state.store(State::EndSession);
     } else {
-        log() << "Error receiving request from client: " << status << ". Ending connection from "
-              << remote << " (connection id: " << _session()->id() << ")";
+        LOGV2(22988,
+              "Error receiving request from client. Ending connection from remote",
+              "error"_attr = status,
+              "remote"_attr = remote,
+              "connectionId"_attr = _session()->id());
         _state.store(State::EndSession);
     }
 
@@ -335,27 +420,31 @@ void ServiceStateMachine::_sinkCallback(Status status) {
     // Otherwise, update the current state depending on whether we're in exhaust or not, and call
     // scheduleNext() to unwind the stack and do the next step.
     if (!status.isOK()) {
-        log() << "Error sending response to client: " << status << ". Ending connection from "
-              << _session()->remote() << " (connection id: " << _session()->id() << ")";
+        LOGV2(22989,
+              "Error sending response to client. Ending connection from remote",
+              "error"_attr = status,
+              "remote"_attr = _session()->remote(),
+              "connectionId"_attr = _session()->id());
         _state.store(State::EndSession);
         return _runNextInGuard(std::move(guard));
     } else if (_inExhaust) {
         _state.store(State::Process);
         return _scheduleNextWithGuard(std::move(guard),
                                       ServiceExecutor::kDeferredTask |
-                                          ServiceExecutor::kMayYieldBeforeSchedule,
-                                      transport::ServiceExecutorTaskName::kSSMExhaustMessage);
+                                          ServiceExecutor::kMayYieldBeforeSchedule);
     } else {
         _state.store(State::Source);
         return _scheduleNextWithGuard(std::move(guard),
                                       ServiceExecutor::kDeferredTask |
-                                          ServiceExecutor::kMayYieldBeforeSchedule,
-                                      transport::ServiceExecutorTaskName::kSSMSourceMessage);
+                                          ServiceExecutor::kMayYieldBeforeSchedule);
     }
 }
 
 void ServiceStateMachine::_processMessage(ThreadGuard guard) {
     invariant(!_inMessage.empty());
+
+    TrafficRecorder::get(_serviceContext)
+        .observe(_sessionHandle, _serviceContext->getPreciseClockSource()->now(), _inMessage);
 
     auto& compressorMgr = MessageCompressorManager::forSession(_session());
 
@@ -372,29 +461,47 @@ void ServiceStateMachine::_processMessage(ThreadGuard guard) {
 
     // Pass sourced Message to handler to generate response.
     auto opCtx = Client::getCurrent()->makeOperationContext();
+    if (_inExhaust) {
+        opCtx->markKillOnClientDisconnect();
+    }
 
     // The handleRequest is implemented in a subclass for mongod/mongos and actually all the
     // database work for this request.
     DbResponse dbresponse = _sep->handleRequest(opCtx.get(), _inMessage);
 
-    // opCtx must be destroyed here so that the operation cannot show
-    // up in currentOp results after the response reaches the client
-    opCtx.reset();
+    // opCtx must be killed and delisted here so that the operation cannot show up in currentOp
+    // results after the response reaches the client. The destruction is postponed for later to
+    // mitigate its performance impact on the critical path of execution.
+    _serviceContext->killAndDelistOperation(opCtx.get(), ErrorCodes::OperationIsKilledAndDelisted);
+    invariant(!_killedOpCtx);
+    _killedOpCtx = std::move(opCtx);
 
     // Format our response, if we have one
     Message& toSink = dbresponse.response;
     if (!toSink.empty()) {
         invariant(!OpMsg::isFlagSet(_inMessage, OpMsg::kMoreToCome));
+        invariant(!OpMsg::isFlagSet(toSink, OpMsg::kChecksumPresent));
+
+        // Update the header for the response message.
         toSink.header().setId(nextMessageId());
         toSink.header().setResponseToMsgId(_inMessage.header().getId());
-
-        // If this is an exhaust cursor, don't source more Messages
-        if (dbresponse.exhaustNS.size() > 0 && setExhaustMessage(&_inMessage, dbresponse)) {
-            _inExhaust = true;
-        } else {
-            _inExhaust = false;
-            _inMessage.reset();
+        if (OpMsg::isFlagSet(_inMessage, OpMsg::kChecksumPresent)) {
+#ifdef MONGO_CONFIG_SSL
+            if (!SSLPeerInfo::forSession(_session()).isTLS) {
+                OpMsg::appendChecksum(&toSink);
+            }
+#else
+            OpMsg::appendChecksum(&toSink);
+#endif
         }
+
+        // If the incoming message has the exhaust flag set, then we bypass the normal RPC behavior.
+        // We will sink the response to the network, but we also synthesize a new request, as if we
+        // sourced a new message from the network. This new request is sent to the database once
+        // again to be processed. This cycle repeats as long as the command indicates the exhaust
+        // stream should continue.
+        _inMessage = makeExhaustMessage(_inMessage, &dbresponse);
+        _inExhaust = !_inMessage.empty();
 
         networkCounter.hitLogicalOut(toSink.size());
 
@@ -403,14 +510,17 @@ void ServiceStateMachine::_processMessage(ThreadGuard guard) {
             uassertStatusOK(swm.getStatus());
             toSink = swm.getValue();
         }
+
+        TrafficRecorder::get(_serviceContext)
+            .observe(_sessionHandle, _serviceContext->getPreciseClockSource()->now(), toSink);
+
         _sinkMessage(std::move(guard), std::move(toSink));
 
     } else {
         _state.store(State::Source);
         _inMessage.reset();
-        return _scheduleNextWithGuard(std::move(guard),
-                                      ServiceExecutor::kDeferredTask,
-                                      transport::ServiceExecutorTaskName::kSSMSourceMessage);
+        _inExhaust = false;
+        return _scheduleNextWithGuard(std::move(guard), ServiceExecutor::kDeferredTask);
     }
 }
 
@@ -426,6 +536,12 @@ void ServiceStateMachine::_runNextInGuard(ThreadGuard guard) {
     if (curState == State::Created) {
         curState = State::Source;
         _state.store(curState);
+    }
+
+    // Destroy the opCtx (already killed) here, to potentially use the delay between clients'
+    // requests to hide the destruction cost.
+    if (MONGO_likely(_killedOpCtx)) {
+        _killedOpCtx.reset();
     }
 
     // Make sure the current Client got set correctly
@@ -447,12 +563,13 @@ void ServiceStateMachine::_runNextInGuard(ThreadGuard guard) {
 
         return;
     } catch (const DBException& e) {
-        // must be right above std::exception to avoid catching subclasses
-        log() << "DBException handling request, closing client connection: " << redact(e);
-    } catch (const std::exception& e) {
-        error() << "Uncaught std::exception: " << e.what() << ", terminating";
-        quickExit(EXIT_UNCAUGHT);
+        LOGV2(22990,
+              "DBException handling request, closing client connection: {error}",
+              "DBException handling request, closing client connection",
+              "error"_attr = redact(e));
     }
+    // No need to catch std::exception, as std::terminate will be called when the exception bubbles
+    // to the top of the stack
 
     if (!guard) {
         guard = ThreadGuard(this);
@@ -462,25 +579,25 @@ void ServiceStateMachine::_runNextInGuard(ThreadGuard guard) {
 }
 
 void ServiceStateMachine::start(Ownership ownershipModel) {
-    _scheduleNextWithGuard(ThreadGuard(this),
-                           transport::ServiceExecutor::kEmptyFlags,
-                           transport::ServiceExecutorTaskName::kSSMStartSession,
-                           ownershipModel);
+    _scheduleNextWithGuard(
+        ThreadGuard(this), transport::ServiceExecutor::kEmptyFlags, ownershipModel);
+}
+
+void ServiceStateMachine::setServiceExecutor(ServiceExecutor* executor) {
+    _serviceExecutor = executor;
 }
 
 void ServiceStateMachine::_scheduleNextWithGuard(ThreadGuard guard,
                                                  transport::ServiceExecutor::ScheduleFlags flags,
-                                                 transport::ServiceExecutorTaskName taskName,
                                                  Ownership ownershipModel) {
-    auto func = [ ssm = shared_from_this(), ownershipModel ] {
+    auto func = [ssm = shared_from_this(), ownershipModel] {
         ThreadGuard guard(ssm.get());
         if (ownershipModel == Ownership::kStatic)
             guard.markStaticOwnership();
         ssm->_runNextInGuard(std::move(guard));
     };
     guard.release();
-    Status status =
-        _serviceContext->getServiceExecutor()->schedule(std::move(func), flags, taskName);
+    Status status = _serviceExecutor->schedule(std::move(func), flags);
     if (status.isOK()) {
         return;
     }
@@ -510,14 +627,16 @@ void ServiceStateMachine::terminateIfTagsDontMatch(transport::Session::TagMask t
     // If terminateIfTagsDontMatch gets called when we still are 'pending' where no tags have been
     // set, then skip the termination check.
     if ((sessionTags & tags) || (sessionTags & transport::Session::kPending)) {
-        log() << "Skip closing connection for connection # " << _session()->id();
+        LOGV2(22991,
+              "Skip closing connection for connection",
+              "connectionId"_attr = _session()->id());
         return;
     }
 
     terminate();
 }
 
-void ServiceStateMachine::setCleanupHook(stdx::function<void()> hook) {
+void ServiceStateMachine::setCleanupHook(std::function<void()> hook) {
     invariant(state() == State::Created);
     _cleanupHook = std::move(hook);
 }
@@ -528,12 +647,45 @@ ServiceStateMachine::State ServiceStateMachine::state() {
 
 void ServiceStateMachine::_terminateAndLogIfError(Status status) {
     if (!status.isOK()) {
-        warning(logger::LogComponent::kExecutor) << "Terminating session due to error: " << status;
+        LOGV2_WARNING_OPTIONS(22993,
+                              {logv2::LogComponent::kExecutor},
+                              "Terminating session due to error: {error}",
+                              "Terminating session due to error",
+                              "error"_attr = status);
         terminate();
     }
 }
 
+void ServiceStateMachine::_cleanupExhaustResources() noexcept try {
+    if (!_inExhaust) {
+        return;
+    }
+    auto request = OpMsgRequest::parse(_inMessage);
+    // Clean up cursor for exhaust getMore request.
+    if (request.getCommandName() == "getMore"_sd) {
+        auto cursorId = request.body["getMore"].Long();
+        auto opCtx = Client::getCurrent()->makeOperationContext();
+        // Fire and forget. This is a best effort attempt to immediately clean up the exhaust
+        // cursor. If the killCursors request fails here for any reasons, it will still be
+        // cleaned up once the cursor times out.
+        _sep->handleRequest(opCtx.get(), makeKillCursorsMessage(cursorId));
+    }
+} catch (const DBException& e) {
+    LOGV2(22992,
+          "Error cleaning up resources for exhaust requests: {error}",
+          "Error cleaning up resources for exhaust requests",
+          "error"_attr = e.toStatus());
+}
+
 void ServiceStateMachine::_cleanupSession(ThreadGuard guard) {
+    // Ensure the delayed destruction of opCtx always happens before doing the cleanup.
+    if (MONGO_likely(_killedOpCtx)) {
+        _killedOpCtx.reset();
+    }
+    invariant(!_killedOpCtx);
+
+    _cleanupExhaustResources();
+
     _state.store(State::Ended);
 
     _inMessage.reset();

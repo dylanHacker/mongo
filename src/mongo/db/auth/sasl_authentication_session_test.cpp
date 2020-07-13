@@ -1,8 +1,31 @@
-/*
- * Copyright (C) 2013 10gen, Inc.  All Rights Reserved.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
-
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
 
 #include <string>
 #include <vector>
@@ -13,25 +36,25 @@
 #include "mongo/client/sasl_client_session.h"
 #include "mongo/crypto/mechanism_scram.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_manager_impl.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/authz_manager_external_state_mock.h"
 #include "mongo/db/auth/authz_session_external_state_mock.h"
+#include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/db/auth/sasl_options.h"
 #include "mongo/db/auth/sasl_plain_server_conversation.h"
 #include "mongo/db/auth/sasl_scram_server_conversation.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/operation_context_noop.h"
-#include "mongo/db/service_context_noop.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context_test_fixture.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 #include "mongo/util/password_digest.h"
 
 namespace mongo {
-
 namespace {
 
-class SaslConversation : public unittest::Test {
+class SaslConversation : public ServiceContextTest {
 public:
     explicit SaslConversation(std::string mech);
 
@@ -40,9 +63,8 @@ public:
     void testBadPassword();
     void testWrongClientMechanism();
     void testWrongServerMechanism();
+    void testSCRAMSkipEmptyExchange();
 
-    ServiceContextNoop serviceContext;
-    ServiceContext::UniqueClient opClient;
     ServiceContext::UniqueOperationContext opCtx;
     AuthzManagerExternalStateMock* authManagerExternalState;
     AuthorizationManager* authManager;
@@ -65,15 +87,17 @@ const std::string mockServiceName = "mocksvc";
 const std::string mockHostName = "host.mockery.com";
 
 SaslConversation::SaslConversation(std::string mech)
-    : opClient(serviceContext.makeClient("saslTest")),
-      opCtx(serviceContext.makeOperationContext(opClient.get())),
+    : opCtx(makeOperationContext()),
       authManagerExternalState(new AuthzManagerExternalStateMock),
-      authManager(new AuthorizationManager(
+      authManager(new AuthorizationManagerImpl(
+          getServiceContext(),
           std::unique_ptr<AuthzManagerExternalState>(authManagerExternalState))),
       authSession(authManager->makeAuthorizationSession()),
+      registry(getServiceContext(), {"SCRAM-SHA-1", "SCRAM-SHA-256", "PLAIN"}),
       mechanism(mech) {
 
-    AuthorizationManager::set(&serviceContext, std::unique_ptr<AuthorizationManager>(authManager));
+    AuthorizationManager::set(getServiceContext(),
+                              std::unique_ptr<AuthorizationManager>(authManager));
 
     client.reset(SaslClientSession::create(mechanism));
 
@@ -105,19 +129,17 @@ SaslConversation::SaslConversation(std::string mech)
                            << scram::Secrets<SHA256Block>::generateCredentials(
                                   "frim", saslGlobalParams.scramSHA256IterationCount.load()));
 
-    ASSERT_OK(authManagerExternalState->insert(opCtx.get(),
-                                               NamespaceString("admin.system.users"),
-                                               BSON("_id"
-                                                    << "test.andy"
-                                                    << "user"
-                                                    << "andy"
-                                                    << "db"
-                                                    << "test"
-                                                    << "credentials"
-                                                    << creds
-                                                    << "roles"
-                                                    << BSONArray()),
-                                               BSONObj()));
+    ASSERT_OK(
+        authManagerExternalState->insert(opCtx.get(),
+                                         NamespaceString("admin.system.users"),
+                                         BSON("_id"
+                                              << "test.andy"
+                                              << "user"
+                                              << "andy"
+                                              << "db"
+                                              << "test"
+                                              << "credentials" << creds << "roles" << BSONArray()),
+                                         BSONObj()));
 }
 
 void SaslConversation::assertConversationFailure() {
@@ -132,9 +154,9 @@ void SaslConversation::assertConversationFailure() {
         serverResponse = server->step(opCtx.get(), clientMessage);
         if (!serverResponse.isOK())
             break;
-    } while (!client->isDone());
-    ASSERT_FALSE(serverResponse.isOK() && clientStatus.isOK() && client->isDone() &&
-                 server->isDone());
+    } while (!client->isSuccess());
+    ASSERT_FALSE(serverResponse.isOK() && clientStatus.isOK() && client->isSuccess() &&
+                 server->isSuccess());
 }
 
 void SaslConversation::testSuccessfulAuthentication() {
@@ -151,8 +173,8 @@ void SaslConversation::testSuccessfulAuthentication() {
         ASSERT_OK(client->step(serverResponse.getValue(), &clientMessage));
         serverResponse = server->step(opCtx.get(), clientMessage);
         ASSERT_OK(serverResponse.getStatus());
-    } while (!client->isDone());
-    ASSERT_TRUE(server->isDone());
+    } while (!client->isSuccess());
+    ASSERT_TRUE(server->isSuccess());
 }
 
 void SaslConversation::testNoSuchUser() {
@@ -206,6 +228,54 @@ void SaslConversation::testWrongServerMechanism() {
     assertConversationFailure();
 }
 
+void SaslConversation::testSCRAMSkipEmptyExchange() {
+    if ((mechanism != "SCRAM-SHA-1") && (mechanism != "SCRAM-SHA-256")) {
+        return;
+    }
+
+    for (bool enabled : {true, false}) {
+        client.reset(SaslClientSession::create(mechanism));
+        client->setParameter(SaslClientSession::parameterServiceName, mockServiceName);
+        client->setParameter(SaslClientSession::parameterServiceHostname, mockHostName);
+        client->setParameter(SaslClientSession::parameterMechanism, mechanism);
+        client->setParameter(SaslClientSession::parameterUser, "andy");
+        client->setParameter(SaslClientSession::parameterPassword, "frim");
+        ASSERT_OK(client->initialize());
+
+        auto swServer = registry.getServerMechanism(mechanism, "test");
+        ASSERT_OK(swServer.getStatus());
+        server = std::move(swServer.getValue());
+        ASSERT_OK(server->setOptions(BSON(saslCommandOptionSkipEmptyExchange << enabled)));
+
+        const std::size_t expected = enabled ? 2 : 3;
+        std::size_t step = 0;
+
+        std::string clientMsg = "";
+        StatusWith<std::string> serverMsg = "";
+        for (;;) {
+            ASSERT_OK(client->step(serverMsg.getValue(), &clientMsg));
+            if (client->isSuccess() && server->isSuccess()) {
+                break;
+            }
+
+            if (step > expected) {
+                break;
+            }
+            ++step;
+
+            serverMsg = server->step(opCtx.get(), clientMsg);
+            ASSERT_OK(serverMsg.getStatus());
+            if (client->isSuccess() && server->isSuccess()) {
+                break;
+            }
+        }
+
+        ASSERT_TRUE(client->isSuccess());
+        ASSERT_TRUE(server->isSuccess());
+        ASSERT_EQ(step, expected);
+    }
+}
+
 #define DEFINE_MECHANISM_FIXTURE(CLASS_SUFFIX, MECH_NAME)                   \
     class SaslConversation##CLASS_SUFFIX : public SaslConversation {        \
     public:                                                                 \
@@ -226,7 +296,8 @@ void SaslConversation::testWrongServerMechanism() {
     DEFINE_MECHANISM_TEST(FIXTURE_NAME, NoSuchUser)               \
     DEFINE_MECHANISM_TEST(FIXTURE_NAME, BadPassword)              \
     DEFINE_MECHANISM_TEST(FIXTURE_NAME, WrongClientMechanism)     \
-    DEFINE_MECHANISM_TEST(FIXTURE_NAME, WrongServerMechanism)
+    DEFINE_MECHANISM_TEST(FIXTURE_NAME, WrongServerMechanism)     \
+    DEFINE_MECHANISM_TEST(FIXTURE_NAME, SCRAMSkipEmptyExchange)
 
 #define TEST_MECHANISM(CLASS_SUFFIX, MECH_NAME)        \
     DEFINE_MECHANISM_FIXTURE(CLASS_SUFFIX, MECH_NAME); \
@@ -246,12 +317,6 @@ TEST_F(SaslIllegalConversation, IllegalClientMechanism) {
     std::string clientMessage;
     std::string serverMessage;
     ASSERT(!client->initialize().isOK() || !client->step(serverMessage, &clientMessage).isOK());
-}
-
-TEST_F(SaslIllegalConversation, IllegalServerMechanism) {
-    SASLServerMechanismRegistry registry;
-    auto swServer = registry.getServerMechanism("FAKE", "test");
-    ASSERT_NOT_OK(swServer.getStatus());
 }
 
 }  // namespace

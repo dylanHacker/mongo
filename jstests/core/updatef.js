@@ -1,4 +1,9 @@
-// @tags: [requires_non_retryable_commands, requires_non_retryable_writes]
+// @tags: [
+//   requires_non_retryable_commands,
+//   requires_non_retryable_writes,
+//   uses_multiple_connections,
+//   uses_parallel_shell,
+// ]
 
 // Test unsafe management of nsdt on update command yield SERVER-3208
 

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,17 +30,19 @@
 #pragma once
 
 #include <functional>
+#include <memory>
 #include <string>
 
 #include "mongo/base/status_with.h"
 #include "mongo/config.h"
 #include "mongo/db/server_options.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/transport/transport_mode.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/net/ssl_types.h"
@@ -66,13 +69,23 @@ class ServiceEntryPoint;
 
 namespace transport {
 
+// This fail point simulates reads and writes that always return 1 byte and fail with EAGAIN
+extern FailPoint transportLayerASIOshortOpportunisticReadWrite;
+
+// This fail point will cause an asyncConnect to timeout after it's successfully connected
+// to the remote peer
+extern FailPoint transportLayerASIOasyncConnectTimesOut;
+
 /**
  * A TransportLayer implementation based on ASIO networking primitives.
  */
 class TransportLayerASIO final : public TransportLayer {
-    MONGO_DISALLOW_COPYING(TransportLayerASIO);
+    TransportLayerASIO(const TransportLayerASIO&) = delete;
+    TransportLayerASIO& operator=(const TransportLayerASIO&) = delete;
 
 public:
+    constexpr static auto kSlowOperationThreshold = Seconds(1);
+
     struct Options {
         constexpr static auto kIngress = 0x1;
         constexpr static auto kEgress = 0x10;
@@ -91,7 +104,7 @@ public:
         }
 
         int port = ServerGlobalParams::DefaultDBPort;  // port to bind to
-        std::string ipList;                            // addresses to bind to
+        std::vector<std::string> ipList;               // addresses to bind to
 #ifndef _WIN32
         bool useUnixSockets = true;  // whether to allow UNIX sockets in ipList
 #endif
@@ -111,7 +124,8 @@ public:
 
     Future<SessionHandle> asyncConnect(HostAndPort peer,
                                        ConnectSSLMode sslMode,
-                                       const ReactorHandle& reactor) final;
+                                       const ReactorHandle& reactor,
+                                       Milliseconds timeout) final;
 
     Status setup() final;
 
@@ -125,7 +139,12 @@ public:
         return _listenerPort;
     }
 
+#ifdef __linux__
+    BatonHandle makeBaton(OperationContext* opCtx) const override;
+#endif
+
 private:
+    class BatonASIO;
     class ASIOSession;
     class ASIOReactor;
 
@@ -140,11 +159,13 @@ private:
                                                  const HostAndPort& peer,
                                                  const Milliseconds& timeout);
 
+    void _runListener() noexcept;
+
 #ifdef MONGO_CONFIG_SSL
     SSLParams::SSLModes _sslMode() const;
 #endif
 
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "TransportLayerASIO::_mutex");
 
     // There are three reactors that are used by TransportLayerASIO. The _ingressReactor contains
     // all the accepted sockets and all ingress networking activity. The _acceptorReactor contains
@@ -180,13 +201,20 @@ private:
     std::vector<std::pair<SockAddr, GenericAcceptor>> _acceptors;
 
     // Only used if _listenerOptions.async is false.
-    stdx::thread _listenerThread;
+    struct Listener {
+        stdx::thread thread;
+        stdx::condition_variable cv;
+        bool active = false;
+    };
+    Listener _listener;
 
     ServiceEntryPoint* const _sep = nullptr;
-    AtomicWord<bool> _running{false};
+
     Options _listenerOptions;
     // The real incoming port in case of _listenerOptions.port==0 (ephemeral).
     int _listenerPort = 0;
+
+    bool _isShutdown = false;
 };
 
 }  // namespace transport

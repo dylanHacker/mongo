@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -37,45 +38,75 @@
 
 namespace mongo {
 
-boost::optional<OperationSessionInfoFromClient> initializeOperationSessionInfo(
-    OperationContext* opCtx,
-    const BSONObj& requestBody,
-    bool requiresAuth,
-    bool isReplSetMemberOrMongos,
-    bool supportsDocLocking) {
+OperationSessionInfoFromClient initializeOperationSessionInfo(OperationContext* opCtx,
+                                                              const BSONObj& requestBody,
+                                                              bool requiresAuth,
+                                                              bool attachToOpCtx,
+                                                              bool isReplSetMemberOrMongos,
+                                                              bool supportsDocLocking) {
+    auto osi = OperationSessionInfoFromClient::parse("OperationSessionInfo"_sd, requestBody);
 
-    if (!requiresAuth) {
-        return boost::none;
+    if (opCtx->getClient()->isInDirectClient()) {
+        uassert(50891,
+                "Invalid to set operation session info in a direct client",
+                !osi.getSessionId() && !osi.getTxnNumber() && !osi.getAutocommit() &&
+                    !osi.getStartTransaction());
     }
 
-    {
+    if (!requiresAuth) {
+        uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                "This command is not supported in transactions",
+                !osi.getAutocommit());
+        uassert(
+            50889, "It is illegal to provide a txnNumber for this command", !osi.getTxnNumber());
+    }
+
+    if (auto authSession = AuthorizationSession::get(opCtx->getClient())) {
         // If we're using the localhost bypass, and the client hasn't authenticated,
         // logical sessions are disabled. A client may authenticate as the __sytem user,
         // or as an externally authorized user.
-        AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
-        if (authSession && authSession->isUsingLocalhostBypass() &&
-            !authSession->getAuthenticatedUserNames().more()) {
-            return boost::none;
+        if (authSession->isUsingLocalhostBypass() && !authSession->isAuthenticated()) {
+            return {};
+        }
+
+        // Do not initialize lsid when auth is enabled and no user is logged in since
+        // there is no sensible uid that can be assigned to it.
+        if (AuthorizationManager::get(opCtx->getServiceContext())->isAuthEnabled() &&
+            !authSession->isAuthenticated() && !requiresAuth) {
+            return {};
         }
     }
-
-    auto osi = OperationSessionInfoFromClient::parse("OperationSessionInfo"_sd, requestBody);
 
     if (osi.getSessionId()) {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
 
-        opCtx->setLogicalSessionId(makeLogicalSessionId(osi.getSessionId().get(), opCtx));
+        auto lsc = LogicalSessionCache::get(opCtx->getServiceContext());
+        if (!lsc) {
+            // Ignore session information if the logical session cache has not been set up, e.g. on
+            // the embedded version of mongod.
+            return {};
+        }
 
-        LogicalSessionCache* lsc = LogicalSessionCache::get(opCtx->getServiceContext());
-        lsc->vivify(opCtx, opCtx->getLogicalSessionId().get());
+        // If osi lsid includes the uid, makeLogicalSessionId will also verify that the hash
+        // matches with the current user logged in.
+        auto lsid = makeLogicalSessionId(osi.getSessionId().get(), opCtx);
+
+        if (!attachToOpCtx) {
+            return {};
+        }
+
+        opCtx->setLogicalSessionId(std::move(lsid));
+        uassertStatusOK(lsc->vivify(opCtx, opCtx->getLogicalSessionId().get()));
+    } else {
+        uassert(ErrorCodes::InvalidOptions,
+                "Transaction number requires a session ID to also be specified",
+                !osi.getTxnNumber());
     }
 
     if (osi.getTxnNumber()) {
+        invariant(osi.getSessionId());
         stdx::lock_guard<Client> lk(*opCtx->getClient());
 
-        uassert(ErrorCodes::IllegalOperation,
-                "Transaction number requires a sessionId to be specified",
-                opCtx->getLogicalSessionId());
         uassert(ErrorCodes::IllegalOperation,
                 "Transaction numbers are only allowed on a replica set member or mongos",
                 isReplSetMemberOrMongos);
@@ -83,17 +114,34 @@ boost::optional<OperationSessionInfoFromClient> initializeOperationSessionInfo(
                 "Transaction numbers are only allowed on storage engines that support "
                 "document-level locking",
                 supportsDocLocking);
-        uassert(ErrorCodes::BadValue,
+        uassert(ErrorCodes::InvalidOptions,
                 "Transaction number cannot be negative",
                 *osi.getTxnNumber() >= 0);
 
         opCtx->setTxnNumber(*osi.getTxnNumber());
+    } else {
+        uassert(ErrorCodes::InvalidOptions,
+                "'autocommit' field requires a transaction number to also be specified",
+                !osi.getAutocommit());
     }
 
     if (osi.getAutocommit()) {
-        uassert(ErrorCodes::IllegalOperation,
-                "Autocommit requires a transaction number to be specified",
-                opCtx->getTxnNumber());
+        invariant(osi.getTxnNumber());
+        uassert(ErrorCodes::InvalidOptions,
+                "Specifying autocommit=true is not allowed.",
+                !osi.getAutocommit().value());
+        opCtx->setInMultiDocumentTransaction();
+    } else {
+        uassert(ErrorCodes::InvalidOptions,
+                "'startTransaction' field requires 'autocommit' field to also be specified",
+                !osi.getStartTransaction());
+    }
+
+    if (osi.getStartTransaction()) {
+        invariant(osi.getAutocommit());
+        uassert(ErrorCodes::InvalidOptions,
+                "Specifying startTransaction=false is not allowed.",
+                osi.getStartTransaction().value());
     }
 
     return osi;

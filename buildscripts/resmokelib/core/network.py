@@ -1,13 +1,11 @@
 """Class used to allocate ports for mongod and mongos processes involved in running the tests."""
 
-from __future__ import absolute_import
-
 import collections
 import functools
 import threading
 
-from .. import config
-from .. import errors
+from buildscripts.resmokelib import config
+from buildscripts.resmokelib import errors
 
 
 def _check_port(func):
@@ -51,7 +49,7 @@ class PortAllocator(object):
 
     # The first _PORTS_PER_FIXTURE ports of each range are reserved for the fixtures, the remainder
     # of the port range is used by tests.
-    _PORTS_PER_FIXTURE = 10
+    _PORTS_PER_FIXTURE = 20
 
     _NUM_USED_PORTS_LOCK = threading.Lock()
 

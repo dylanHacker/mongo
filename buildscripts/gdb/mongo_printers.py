@@ -1,8 +1,9 @@
 """GDB Pretty-printers for MongoDB."""
-from __future__ import print_function
 
+import re
 import struct
 import sys
+import uuid
 
 import gdb.printing
 
@@ -16,10 +17,14 @@ except ImportError as err:
     print("Check with the pip command if pymongo 3.x is installed.")
     bson = None
 
+if sys.version_info[0] < 3:
+    raise gdb.GdbError(
+        "MongoDB gdb extensions only support Python 3. Your GDB was compiled against Python 2")
+
 
 def get_unique_ptr(obj):
     """Read the value of a libstdc++ std::unique_ptr."""
-    return obj["_M_t"]['_M_head_impl']
+    return obj['_M_t']['_M_t']['_M_head_impl']
 
 
 ###################################################################################################
@@ -120,11 +125,11 @@ class BSONObjPrinter(object):
             return
 
         inferior = gdb.selected_inferior()
-        buf = bytes(inferior.read_memory(self.ptr, self.size))
+        buf = bson.BSON(bytes(inferior.read_memory(self.ptr, self.size)))
         options = CodecOptions(document_class=collections.OrderedDict)
-        bsondoc = bson.BSON.decode(buf, codec_options=options)
+        bsondoc = buf.decode(codec_options=options)
 
-        for key, val in bsondoc.items():
+        for key, val in list(bsondoc.items()):
             yield 'key', key
             yield 'value', bson.json_util.dumps(val)
 
@@ -146,47 +151,23 @@ class BSONObjPrinter(object):
         return "%s BSONObj %s bytes @ %s" % (ownership, size, self.ptr)
 
 
-class UnorderedFastKeyTablePrinter(object):
-    """Pretty-printer for mongo::UnorderedFastKeyTable<>."""
+class UUIDPrinter(object):
+    """Pretty-printer for mongo::UUID."""
 
     def __init__(self, val):
-        """Initialize UnorderedFastKeyTablePrinter."""
+        """Initialize UUIDPrinter."""
         self.val = val
-
-        # Get the value_type by doing a type lookup
-        value_type_name = val.type.strip_typedefs().name + "::value_type"
-        value_type = gdb.lookup_type(value_type_name).target()
-        self.value_type_ptr = value_type.pointer()
 
     @staticmethod
     def display_hint():
         """Display hint."""
-        return 'map'
+        return 'string'
 
     def to_string(self):
-        """Return UnorderedFastKeyTablePrinter for printing."""
-        return "UnorderedFastKeyTablePrinter<%s> with %s elems " % (
-            self.val.type.template_argument(0), self.val["_size"])
-
-    def children(self):
-        """Children."""
-        cap = self.val["_area"]["_hashMask"] + 1
-        it = get_unique_ptr(self.val["_area"]["_entries"])
-        end = it + cap
-
-        if it == 0:
-            return
-
-        while it != end:
-            elt = it.dereference()
-            it += 1
-            if not elt['_used']:
-                continue
-
-            value = elt['_data']["__data"].cast(self.value_type_ptr).dereference()
-
-            yield ('key', value['first'])
-            yield ('value', value['second'])
+        """Return UUID for printing."""
+        raw_bytes = [self.val['_uuid']['_M_elems'][i] for i in range(16)]
+        uuid_hex_bytes = [hex(int(b))[2:].zfill(2) for b in raw_bytes]
+        return str(uuid.UUID("".join(uuid_hex_bytes)))
 
 
 class DecorablePrinter(object):
@@ -200,7 +181,9 @@ class DecorablePrinter(object):
         # TODO: abstract out navigating a std::vector
         self.start = decl_vector["_M_impl"]["_M_start"]
         finish = decl_vector["_M_impl"]["_M_finish"]
-        decinfo_t = gdb.lookup_type('mongo::DecorationRegistry::DecorationInfo')
+        decorable_t = val.type.template_argument(0)
+        decinfo_t = gdb.lookup_type('mongo::DecorationRegistry<{}>::DecorationInfo'.format(
+            str(decorable_t).replace("class", "").strip()))
         self.count = int((int(finish) - int(self.start)) / decinfo_t.sizeof)
 
     @staticmethod
@@ -223,7 +206,7 @@ class DecorablePrinter(object):
             # In order to get the type stored in the decorable, we examine the type of its
             # constructor, and do some string manipulations.
             # TODO: abstract out navigating a std::function
-            type_name = str(descriptor["constructor"]["_M_functor"]["_M_unused"]["_M_object"])
+            type_name = str(descriptor["constructor"])
             type_name = type_name[0:len(type_name) - 1]
             type_name = type_name[0:type_name.rindex(">")]
             type_name = type_name[type_name.index("constructAt<"):].replace("constructAt<", "")
@@ -239,6 +222,249 @@ class DecorablePrinter(object):
 
             yield ('key', "%d:%s:%s" % (index, obj.address, type_name))
             yield ('value', obj)
+
+
+def _get_flags(flag_val, flags):
+    """
+    Return a list of flag name strings.
+
+    `flags` is a list of `(flag_name, flag_value)` pairs. The list must be in sorted in order of the
+    highest `flag_value` first and the lowest last.
+    """
+    if not flags:
+        return "Flags not parsed from source."
+
+    ret = []
+    for name, hex_val in flags:
+        dec_val = int(hex_val, 16)
+        if flag_val < dec_val:
+            continue
+
+        ret.append(name)
+        flag_val -= dec_val
+
+    return ret
+
+
+class WtCursorPrinter(object):
+    """
+    Pretty-printer for WT_CURSOR objects.
+
+    Complement the `flags: int` field with the macro names used in the source code.
+    """
+
+    try:
+        with open("./src/third_party/wiredtiger/src/include/wiredtiger.in") as wiredtiger_header:
+            file_contents = wiredtiger_header.read()
+            cursor_flags_re = re.compile(r"#define\s+WT_CURSTD_(\w+)\s+0x(\d+)u")
+            cursor_flags = cursor_flags_re.findall(file_contents)[::-1]
+    except IOError:
+        cursor_flags = []
+
+    def __init__(self, val):
+        """Initializer."""
+        self.val = val
+
+    # pylint: disable=R0201
+    def to_string(self):
+        """to_string."""
+        return None
+
+    def children(self):
+        """children."""
+        for field in self.val.type.fields():
+            field_val = self.val[field.name]
+            if field.name == "flags":
+                yield ("flags", "{} ({})".format(field_val,
+                                                 str(_get_flags(field_val, self.cursor_flags))))
+            else:
+                yield (field.name, field_val)
+
+
+class WtSessionImplPrinter(object):
+    """
+    Pretty-printer for WT_SESSION_IMPL objects.
+
+    Complement the `flags: int` field with the macro names used in the source code.
+    """
+
+    try:
+        with open("./src/third_party/wiredtiger/src/include/session.h") as session_header:
+            file_contents = session_header.read()
+            session_flags_re = re.compile(r"#define\s+WT_SESSION_(\w+)\s+0x(\d+)u")
+            session_flags = session_flags_re.findall(file_contents)[::-1]
+    except IOError:
+        session_flags = []
+
+    def __init__(self, val):
+        """Initializer."""
+        self.val = val
+
+    # pylint: disable=R0201
+    def to_string(self):
+        """to_string."""
+        return None
+
+    def children(self):
+        """children."""
+        for field in self.val.type.fields():
+            field_val = self.val[field.name]
+            if field.name == "flags":
+                yield ("flags", "{} ({})".format(field_val,
+                                                 str(_get_flags(field_val, self.session_flags))))
+            else:
+                yield (field.name, field_val)
+
+
+class WtTxnPrinter(object):
+    """
+    Pretty-printer for WT_TXN objects.
+
+    Complement the `flags: int` field with the macro names used in the source code.
+    """
+
+    try:
+        with open("./src/third_party/wiredtiger/src/include/txn.h") as txn_header:
+            file_contents = txn_header.read()
+            txn_flags_re = re.compile(r"#define\s+WT_TXN_(\w+)\s+0x(\d+)u")
+            txn_flags = txn_flags_re.findall(file_contents)[::-1]
+    except IOError:
+        txn_flags = []
+
+    def __init__(self, val):
+        """Initializer."""
+        self.val = val
+
+    # pylint: disable=R0201
+    def to_string(self):
+        """to_string."""
+        return None
+
+    def children(self):
+        """children."""
+        for field in self.val.type.fields():
+            field_val = self.val[field.name]
+            if field.name == "flags":
+                yield ("flags", "{} ({})".format(field_val,
+                                                 str(_get_flags(field_val, self.txn_flags))))
+            else:
+                yield (field.name, field_val)
+
+
+def absl_get_nodes(val):
+    """Return a generator of every node in absl::container_internal::raw_hash_set and derived classes."""
+    size = val["size_"]
+
+    if size == 0:
+        return
+
+    table = val
+    capacity = int(table["capacity_"])
+    ctrl = table["ctrl_"]
+
+    # Using the array of ctrl bytes, search for in-use slots and return them
+    # https://github.com/abseil/abseil-cpp/blob/7ffbe09f3d85504bd018783bbe1e2c12992fe47c/absl/container/internal/raw_hash_set.h#L787-L788
+    for item in range(capacity):
+        ctrl_t = int(ctrl[item])
+        if ctrl_t >= 0:
+            yield table["slots_"][item]
+
+
+class AbslHashSetPrinterBase(object):
+    """Pretty-printer base class for absl::[node/flat]_hash_set<>."""
+
+    def __init__(self, val, to_str):
+        """Initialize absl::[node/flat]_hash_set."""
+        self.val = val
+        self.to_str = to_str
+
+    @staticmethod
+    def display_hint():
+        """Display hint."""
+        return 'array'
+
+    def to_string(self):
+        """Return absl::[node/flat]_hash_set for printing."""
+        return "absl::%s_hash_set<%s> with %s elems " % (
+            self.to_str, self.val.type.template_argument(0), self.val["size_"])
+
+
+class AbslNodeHashSetPrinter(AbslHashSetPrinterBase):
+    """Pretty-printer for absl::node_hash_set<>."""
+
+    def __init__(self, val):
+        """Initialize absl::node_hash_set."""
+        AbslHashSetPrinterBase.__init__(self, val, "node")
+
+    def children(self):
+        """Children."""
+        count = 0
+        for val in absl_get_nodes(self.val):
+            yield (str(count), val.dereference())
+            count += 1
+
+
+class AbslFlatHashSetPrinter(AbslHashSetPrinterBase):
+    """Pretty-printer for absl::flat_hash_set<>."""
+
+    def __init__(self, val):
+        """Initialize absl::flat_hash_set."""
+        AbslHashSetPrinterBase.__init__(self, val, "flat")
+
+    def children(self):
+        """Children."""
+        count = 0
+        for val in absl_get_nodes(self.val):
+            yield (str(count), val.reference_value())
+            count += 1
+
+
+class AbslHashMapPrinterBase(object):
+    """Pretty-printer base class for absl::[node/flat]_hash_map<>."""
+
+    def __init__(self, val, to_str):
+        """Initialize absl::[node/flat]_hash_map."""
+        self.val = val
+        self.to_str = to_str
+
+    @staticmethod
+    def display_hint():
+        """Display hint."""
+        return 'map'
+
+    def to_string(self):
+        """Return absl::[node/flat]_hash_map for printing."""
+        return "absl::%s_hash_map<%s, %s> with %s elems " % (
+            self.to_str, self.val.type.template_argument(0), self.val.type.template_argument(1),
+            self.val["size_"])
+
+
+class AbslNodeHashMapPrinter(AbslHashMapPrinterBase):
+    """Pretty-printer for absl::node_hash_map<>."""
+
+    def __init__(self, val):
+        """Initialize absl::node_hash_map."""
+        AbslHashMapPrinterBase.__init__(self, val, "node")
+
+    def children(self):
+        """Children."""
+        for kvp in absl_get_nodes(self.val):
+            yield ('key', kvp['first'])
+            yield ('value', kvp['second'])
+
+
+class AbslFlatHashMapPrinter(AbslHashMapPrinterBase):
+    """Pretty-printer for absl::flat_hash_map<>."""
+
+    def __init__(self, val):
+        """Initialize absl::flat_hash_map."""
+        AbslHashMapPrinterBase.__init__(self, val, "flat")
+
+    def children(self):
+        """Children."""
+        for kvp in absl_get_nodes(self.val):
+            yield ('key', kvp['key'])
+            yield ('value', kvp['value'])
 
 
 def find_match_brackets(search, opening='<', closing='>'):
@@ -330,8 +556,14 @@ def build_pretty_printer():
     pp.add('Status', 'mongo::Status', False, StatusPrinter)
     pp.add('StatusWith', 'mongo::StatusWith', True, StatusWithPrinter)
     pp.add('StringData', 'mongo::StringData', False, StringDataPrinter)
-    pp.add('UnorderedFastKeyTable', 'mongo::UnorderedFastKeyTable', True,
-           UnorderedFastKeyTablePrinter)
+    pp.add('node_hash_map', 'absl::node_hash_map', True, AbslNodeHashMapPrinter)
+    pp.add('node_hash_set', 'absl::node_hash_set', True, AbslNodeHashSetPrinter)
+    pp.add('flat_hash_map', 'absl::flat_hash_map', True, AbslFlatHashMapPrinter)
+    pp.add('flat_hash_set', 'absl::flat_hash_set', True, AbslFlatHashSetPrinter)
+    pp.add('UUID', 'mongo::UUID', False, UUIDPrinter)
+    pp.add('__wt_cursor', '__wt_cursor', False, WtCursorPrinter)
+    pp.add('__wt_session_impl', '__wt_session_impl', False, WtSessionImplPrinter)
+    pp.add('__wt_txn', '__wt_txn', False, WtTxnPrinter)
     return pp
 
 

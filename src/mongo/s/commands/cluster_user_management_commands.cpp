@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,24 +27,25 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 #include "mongo/platform/basic.h"
 
+#include <fmt/format.h>
+
 #include "mongo/base/status.h"
 #include "mongo/bson/mutable/document.h"
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/config.h"
 #include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/user_management_commands_parser.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/user_management_commands.h"
+#include "mongo/db/commands/user_management_commands_common.h"
+#include "mongo/db/commands/user_management_commands_gen.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/rpc/write_concern_error_detail.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/commands/cluster_commands_helpers.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 
 namespace mongo {
@@ -51,6 +53,7 @@ namespace mongo {
 using std::string;
 using std::stringstream;
 using std::vector;
+using namespace fmt::literals;
 
 namespace {
 
@@ -59,288 +62,140 @@ const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
                                                 // kMajority implies JOURNAL if journaling is
                                                 // supported by this mongod.
                                                 WriteConcernOptions::SyncMode::UNSET,
-                                                Seconds(30));
+                                                WriteConcernOptions::kWriteConcernTimeoutSharding);
 
-class CmdCreateUser : public BasicCommand {
+template <typename Request>
+void uassertEmptyReply(BSONObj obj) {
+    uassert(ErrorCodes::BadValue,
+            "Received unexpected response from {} command: {}"_format(Request::kCommandName,
+                                                                      tojson(obj)),
+            (obj.nFields() == 1) && obj["ok"]);
+}
+
+template <typename Request, typename Reply>
+Reply parseUMCReply(BSONObj obj) try {
+    return Reply::parse(IDLParserErrorContext(Request::kCommandName), obj);
+} catch (const AssertionException& ex) {
+    uasserted(ex.code(),
+              "Received invalid response from {} command: {}, error: {}"_format(
+                  Request::kCommandName, tojson(obj), ex.reason()));
+}
+
+struct UserCacheInvalidatorNOOP {
+    static constexpr bool kRequireUserName = false;
+    static void invalidate(OperationContext*, StringData) {}
+};
+struct UserCacheInvalidatorUser {
+    static constexpr bool kRequireUserName = true;
+    static void invalidate(OperationContext* opCtx, const UserName& userName) {
+        AuthorizationManager::get(opCtx->getServiceContext())
+            ->invalidateUserByName(opCtx, userName);
+    }
+};
+struct UserCacheInvalidatorDB {
+    static constexpr bool kRequireUserName = false;
+    static void invalidate(OperationContext* opCtx, StringData dbname) {
+        AuthorizationManager::get(opCtx->getServiceContext())->invalidateUsersFromDB(opCtx, dbname);
+    }
+};
+struct UserCacheInvalidatorAll {
+    static constexpr bool kRequireUserName = false;
+    static void invalidate(OperationContext* opCtx, StringData) {
+        AuthorizationManager::get(opCtx->getServiceContext())->invalidateUserCache(opCtx);
+    }
+};
+
+/**
+ * Most user management commands follow a very predictable pattern:
+ * 1. Proxy command to config servers.
+ * 2. Invalidate whatever we were just working on.
+ * 3. Panic if anything went wrong.
+ */
+template <typename RequestT, typename ReplyT, typename InvalidatorT>
+class CmdUMCPassthrough : public TypedCommand<CmdUMCPassthrough<RequestT, ReplyT, InvalidatorT>> {
 public:
-    CmdCreateUser() : BasicCommand("createUser") {}
+    using Request = RequestT;
+    using Reply = ReplyT;
+    using TC = TypedCommand<CmdUMCPassthrough<RequestT, ReplyT, InvalidatorT>>;
 
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kNever;
+    class Invocation final : public TC::InvocationBase {
+    public:
+        using TC::InvocationBase::InvocationBase;
+        using TC::InvocationBase::request;
+
+        Reply typedRun(OperationContext* opCtx) {
+            const auto& cmd = request();
+
+            BSONObjBuilder builder;
+            auto status = Grid::get(opCtx)->catalogClient()->runUserManagementWriteCommand(
+                opCtx,
+                Request::kCommandName,
+                cmd.getDbName(),
+                applyReadWriteConcern(
+                    opCtx,
+                    this,
+                    CommandHelpers::filterCommandRequestForPassthrough(cmd.toBSON({}))),
+                &builder);
+
+            if constexpr (InvalidatorT::kRequireUserName) {
+                InvalidatorT::invalidate(opCtx,
+                                         UserName(cmd.getCommandParameter(), cmd.getDbName()));
+            } else {
+                InvalidatorT::invalidate(opCtx, cmd.getDbName());
+            }
+
+            uassertStatusOK(status);
+
+            if constexpr (std::is_void_v<Reply>) {
+                uassertEmptyReply<Request>(builder.obj());
+            } else {
+                return parseUMCReply<Request, Reply>(builder.obj());
+            }
+        }
+
+    private:
+        bool supportsWriteConcern() const final {
+            return true;
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const final {
+            auth::checkAuthForTypedCommand(opCtx->getClient(), request());
+        }
+
+        NamespaceString ns() const override {
+            return NamespaceString(request().getDbName(), "");
+        }
+    };
+
+    typename TC::AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
+        return TC::AllowedOnSecondary::kNever;
     }
+};
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
+class CmdCreateUser : public CmdUMCPassthrough<CreateUserCommand, void, UserCacheInvalidatorNOOP> {
+public:
+    static constexpr StringData kPwdField = "pwd"_sd;
+    StringData sensitiveFieldName() const final {
+        return kPwdField;
     }
-
-    std::string help() const override {
-        return "Adds a user to the system";
-    }
-
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
-        return auth::checkAuthForCreateUserCommand(client, dbname, cmdObj);
-    }
-
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
-        return Grid::get(opCtx)->catalogClient()->runUserManagementWriteCommand(
-            opCtx,
-            getName(),
-            dbname,
-            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
-            &result);
-    }
-
-    void redactForLogging(mutablebson::Document* cmdObj) const override {
-        auth::redactPasswordData(cmdObj->root());
-    }
-
 } cmdCreateUser;
 
-class CmdUpdateUser : public BasicCommand {
+class CmdUpdateUser : public CmdUMCPassthrough<UpdateUserCommand, void, UserCacheInvalidatorUser> {
 public:
-    CmdUpdateUser() : BasicCommand("updateUser") {}
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kNever;
+    static constexpr StringData kPwdField = "pwd"_sd;
+    StringData sensitiveFieldName() const final {
+        return kPwdField;
     }
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
-    }
-
-    std::string help() const override {
-        return "Used to update a user, for example to change its password";
-    }
-
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
-        return auth::checkAuthForUpdateUserCommand(client, dbname, cmdObj);
-    }
-
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
-        auth::CreateOrUpdateUserArgs args;
-        Status status = auth::parseCreateOrUpdateUserCommands(cmdObj, getName(), dbname, &args);
-        if (!status.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, status);
-        }
-        const bool ok = Grid::get(opCtx)->catalogClient()->runUserManagementWriteCommand(
-            opCtx,
-            getName(),
-            dbname,
-            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
-            &result);
-
-        AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-        invariant(authzManager);
-        authzManager->invalidateUserByName(args.userName);
-
-        return ok;
-    }
-
-    void redactForLogging(mutablebson::Document* cmdObj) const override {
-        auth::redactPasswordData(cmdObj->root());
-    }
-
 } cmdUpdateUser;
 
-class CmdDropUser : public BasicCommand {
-public:
-    CmdDropUser() : BasicCommand("dropUser") {}
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kNever;
-    }
-
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
-    }
-
-    std::string help() const override {
-        return "Drops a single user.";
-    }
-
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
-        return auth::checkAuthForDropUserCommand(client, dbname, cmdObj);
-    }
-
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
-        UserName userName;
-        Status status = auth::parseAndValidateDropUserCommand(cmdObj, dbname, &userName);
-        if (!status.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, status);
-        }
-        const bool ok = Grid::get(opCtx)->catalogClient()->runUserManagementWriteCommand(
-            opCtx,
-            getName(),
-            dbname,
-            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
-            &result);
-
-        AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-        invariant(authzManager);
-        authzManager->invalidateUserByName(userName);
-
-        return ok;
-    }
-
-} cmdDropUser;
-
-class CmdDropAllUsersFromDatabase : public BasicCommand {
-public:
-    CmdDropAllUsersFromDatabase() : BasicCommand("dropAllUsersFromDatabase") {}
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kNever;
-    }
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
-    }
-
-    std::string help() const override {
-        return "Drops all users for a single database.";
-    }
-
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
-        return auth::checkAuthForDropAllUsersFromDatabaseCommand(client, dbname);
-    }
-
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
-        const bool ok = Grid::get(opCtx)->catalogClient()->runUserManagementWriteCommand(
-            opCtx,
-            getName(),
-            dbname,
-            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
-            &result);
-
-        AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-        invariant(authzManager);
-        authzManager->invalidateUsersFromDB(dbname);
-
-        return ok;
-    }
-
-} cmdDropAllUsersFromDatabase;
-
-class CmdGrantRolesToUser : public BasicCommand {
-public:
-    CmdGrantRolesToUser() : BasicCommand("grantRolesToUser") {}
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kNever;
-    }
-
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
-    }
-
-    std::string help() const override {
-        return "Grants roles to a user.";
-    }
-
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
-        return auth::checkAuthForGrantRolesToUserCommand(client, dbname, cmdObj);
-    }
-
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
-        string userNameString;
-        vector<RoleName> roles;
-        Status status = auth::parseRolePossessionManipulationCommands(
-            cmdObj, getName(), dbname, &userNameString, &roles);
-        if (!status.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, status);
-        }
-        const bool ok = Grid::get(opCtx)->catalogClient()->runUserManagementWriteCommand(
-            opCtx,
-            getName(),
-            dbname,
-            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
-            &result);
-
-        AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-        invariant(authzManager);
-        authzManager->invalidateUserByName(UserName(userNameString, dbname));
-
-        return ok;
-    }
-
-} cmdGrantRolesToUser;
-
-class CmdRevokeRolesFromUser : public BasicCommand {
-public:
-    CmdRevokeRolesFromUser() : BasicCommand("revokeRolesFromUser") {}
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kNever;
-    }
-
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
-    }
-
-    std::string help() const override {
-        return "Revokes roles from a user.";
-    }
-
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
-        return auth::checkAuthForRevokeRolesFromUserCommand(client, dbname, cmdObj);
-    }
-
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
-        string userNameString;
-        vector<RoleName> unusedRoles;
-        Status status = auth::parseRolePossessionManipulationCommands(
-            cmdObj, getName(), dbname, &userNameString, &unusedRoles);
-        if (!status.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, status);
-        }
-        const bool ok = Grid::get(opCtx)->catalogClient()->runUserManagementWriteCommand(
-            opCtx,
-            getName(),
-            dbname,
-            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
-            &result);
-
-        AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-        invariant(authzManager);
-        authzManager->invalidateUserByName(UserName(userNameString, dbname));
-
-        return ok;
-    }
-
-} cmdRevokeRolesFromUser;
+CmdUMCPassthrough<DropUserCommand, void, UserCacheInvalidatorUser> cmdDropUser;
+CmdUMCPassthrough<DropAllUsersFromDatabaseCommand,
+                  DropAllUsersFromDatabaseReply,
+                  UserCacheInvalidatorDB>
+    cmdDropAllUsersFromDatabase;
+CmdUMCPassthrough<GrantRolesToUserCommand, void, UserCacheInvalidatorUser> cmdGrantRolesToUser;
+CmdUMCPassthrough<RevokeRolesFromUserCommand, void, UserCacheInvalidatorUser>
+    cmdRevokeRolesFromUser;
 
 class CmdUsersInfo : public BasicCommand {
 public:
@@ -369,349 +224,28 @@ public:
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
         return Grid::get(opCtx)->catalogClient()->runUserManagementReadCommand(
-            opCtx, dbname, CommandHelpers::filterCommandRequestForPassthrough(cmdObj), &result);
+            opCtx,
+            dbname,
+            applyReadWriteConcern(
+                opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
+            &result);
     }
 
 } cmdUsersInfo;
 
-class CmdCreateRole : public BasicCommand {
-public:
-    CmdCreateRole() : BasicCommand("createRole") {}
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kNever;
-    }
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
-    }
-
-    std::string help() const override {
-        return "Adds a role to the system";
-    }
-
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
-        return auth::checkAuthForCreateRoleCommand(client, dbname, cmdObj);
-    }
-
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
-        return Grid::get(opCtx)->catalogClient()->runUserManagementWriteCommand(
-            opCtx,
-            getName(),
-            dbname,
-            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
-            &result);
-    }
-
-} cmdCreateRole;
-
-class CmdUpdateRole : public BasicCommand {
-public:
-    CmdUpdateRole() : BasicCommand("updateRole") {}
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kNever;
-    }
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
-    }
-
-    std::string help() const override {
-        return "Used to update a role";
-    }
-
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
-        return auth::checkAuthForUpdateRoleCommand(client, dbname, cmdObj);
-    }
-
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
-        const bool ok = Grid::get(opCtx)->catalogClient()->runUserManagementWriteCommand(
-            opCtx,
-            getName(),
-            dbname,
-            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
-            &result);
-
-        AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-        invariant(authzManager);
-        authzManager->invalidateUserCache();
-
-        return ok;
-    }
-
-} cmdUpdateRole;
-
-class CmdGrantPrivilegesToRole : public BasicCommand {
-public:
-    CmdGrantPrivilegesToRole() : BasicCommand("grantPrivilegesToRole") {}
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kNever;
-    }
-
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
-    }
-
-    std::string help() const override {
-        return "Grants privileges to a role";
-    }
-
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
-        return auth::checkAuthForGrantPrivilegesToRoleCommand(client, dbname, cmdObj);
-    }
-
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
-        const bool ok = Grid::get(opCtx)->catalogClient()->runUserManagementWriteCommand(
-            opCtx,
-            getName(),
-            dbname,
-            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
-            &result);
-
-        AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-        invariant(authzManager);
-        authzManager->invalidateUserCache();
-
-        return ok;
-    }
-
-} cmdGrantPrivilegesToRole;
-
-class CmdRevokePrivilegesFromRole : public BasicCommand {
-public:
-    CmdRevokePrivilegesFromRole() : BasicCommand("revokePrivilegesFromRole") {}
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kNever;
-    }
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
-    }
-
-    std::string help() const override {
-        return "Revokes privileges from a role";
-    }
-
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
-        return auth::checkAuthForRevokePrivilegesFromRoleCommand(client, dbname, cmdObj);
-    }
-
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
-        const bool ok = Grid::get(opCtx)->catalogClient()->runUserManagementWriteCommand(
-            opCtx,
-            getName(),
-            dbname,
-            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
-            &result);
-
-        AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-        invariant(authzManager);
-        authzManager->invalidateUserCache();
-
-        return ok;
-    }
-
-} cmdRevokePrivilegesFromRole;
-
-class CmdGrantRolesToRole : public BasicCommand {
-public:
-    CmdGrantRolesToRole() : BasicCommand("grantRolesToRole") {}
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kNever;
-    }
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
-    }
-
-    std::string help() const override {
-        return "Grants roles to another role.";
-    }
-
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
-        return auth::checkAuthForGrantRolesToRoleCommand(client, dbname, cmdObj);
-    }
-
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
-        const bool ok = Grid::get(opCtx)->catalogClient()->runUserManagementWriteCommand(
-            opCtx,
-            getName(),
-            dbname,
-            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
-            &result);
-
-        AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-        invariant(authzManager);
-        authzManager->invalidateUserCache();
-
-        return ok;
-    }
-
-} cmdGrantRolesToRole;
-
-class CmdRevokeRolesFromRole : public BasicCommand {
-public:
-    CmdRevokeRolesFromRole() : BasicCommand("revokeRolesFromRole") {}
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kNever;
-    }
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
-    }
-
-    std::string help() const override {
-        return "Revokes roles from another role.";
-    }
-
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
-        return auth::checkAuthForRevokeRolesFromRoleCommand(client, dbname, cmdObj);
-    }
-
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
-        const bool ok = Grid::get(opCtx)->catalogClient()->runUserManagementWriteCommand(
-            opCtx,
-            getName(),
-            dbname,
-            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
-            &result);
-
-        AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-        invariant(authzManager);
-        authzManager->invalidateUserCache();
-
-        return ok;
-    }
-
-} cmdRevokeRolesFromRole;
-
-class CmdDropRole : public BasicCommand {
-public:
-    CmdDropRole() : BasicCommand("dropRole") {}
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kNever;
-    }
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
-    }
-
-    std::string help() const override {
-        return "Drops a single role.  Before deleting the role completely it must remove it "
-               "from any users or roles that reference it.  If any errors occur in the middle "
-               "of that process it's possible to be left in a state where the role has been "
-               "removed from some user/roles but otherwise still exists.";
-    }
-
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
-        return auth::checkAuthForDropRoleCommand(client, dbname, cmdObj);
-    }
-
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
-        const bool ok = Grid::get(opCtx)->catalogClient()->runUserManagementWriteCommand(
-            opCtx,
-            getName(),
-            dbname,
-            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
-            &result);
-
-        AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-        invariant(authzManager);
-        authzManager->invalidateUserCache();
-
-        return ok;
-    }
-
-} cmdDropRole;
-
-class CmdDropAllRolesFromDatabase : public BasicCommand {
-public:
-    CmdDropAllRolesFromDatabase() : BasicCommand("dropAllRolesFromDatabase") {}
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kNever;
-    }
-
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
-    }
-
-    std::string help() const override {
-        return "Drops all roles from the given database.  Before deleting the roles completely "
-               "it must remove them from any users or other roles that reference them.  If any "
-               "errors occur in the middle of that process it's possible to be left in a state "
-               "where the roles have been removed from some user/roles but otherwise still "
-               "exist.";
-    }
-
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
-        return auth::checkAuthForDropAllRolesFromDatabaseCommand(client, dbname);
-    }
-
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
-        const bool ok = Grid::get(opCtx)->catalogClient()->runUserManagementWriteCommand(
-            opCtx,
-            getName(),
-            dbname,
-            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
-            &result);
-
-        AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-        invariant(authzManager);
-        authzManager->invalidateUserCache();
-
-        return ok;
-    }
-
-} cmdDropAllRolesFromDatabase;
+CmdUMCPassthrough<CreateRoleCommand, void, UserCacheInvalidatorNOOP> cmdCreateRole;
+CmdUMCPassthrough<UpdateRoleCommand, void, UserCacheInvalidatorAll> cmdUpdateRole;
+CmdUMCPassthrough<GrantPrivilegesToRoleCommand, void, UserCacheInvalidatorAll>
+    cmdGrantPrivilegesToRole;
+CmdUMCPassthrough<RevokePrivilegesFromRoleCommand, void, UserCacheInvalidatorAll>
+    cmdRevokePrivilegesFromRole;
+CmdUMCPassthrough<GrantRolesToRoleCommand, void, UserCacheInvalidatorAll> cmdGrantRolesToRole;
+CmdUMCPassthrough<RevokeRolesFromRoleCommand, void, UserCacheInvalidatorAll> cmdRevokeRolesFromRole;
+CmdUMCPassthrough<DropRoleCommand, void, UserCacheInvalidatorAll> cmdDropRole;
+CmdUMCPassthrough<DropAllRolesFromDatabaseCommand,
+                  DropAllRolesFromDatabaseReply,
+                  UserCacheInvalidatorAll>
+    cmdDropAllRolesFromDatabase;
 
 class CmdRolesInfo : public BasicCommand {
 public:
@@ -740,7 +274,11 @@ public:
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
         return Grid::get(opCtx)->catalogClient()->runUserManagementReadCommand(
-            opCtx, dbname, CommandHelpers::filterCommandRequestForPassthrough(cmdObj), &result);
+            opCtx,
+            dbname,
+            applyReadWriteConcern(
+                opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
+            &result);
     }
 
 } cmdRolesInfo;
@@ -776,9 +314,8 @@ public:
              const string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
-        AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-        invariant(authzManager);
-        authzManager->invalidateUserCache();
+        const auto authzManager = AuthorizationManager::get(opCtx->getServiceContext());
+        authzManager->invalidateUserCache(opCtx);
         return true;
     }
 
@@ -824,12 +361,14 @@ public:
              const string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
-        return Grid::get(opCtx)->catalogClient()->runUserManagementWriteCommand(
+        uassertStatusOK(Grid::get(opCtx)->catalogClient()->runUserManagementWriteCommand(
             opCtx,
             getName(),
             dbname,
-            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
-            &result);
+            applyReadWriteConcern(
+                opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
+            &result));
+        return true;
     }
 
 } cmdMergeAuthzCollections;

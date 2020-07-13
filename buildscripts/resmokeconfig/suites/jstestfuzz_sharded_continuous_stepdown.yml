@@ -21,6 +21,7 @@ executor:
   - class: ContinuousStepdown
     config_stepdown: true
     shard_stepdown: true
+  - class: FuzzerRestoreClusterSettings
   # The CheckReplDBHash hook waits until all operations have replicated to and have been applied
   # on the secondaries, so we run the ValidateCollections hook after it to ensure we're
   # validating the entire contents of the collection.
@@ -34,6 +35,7 @@ executor:
       global_vars:
         TestData:
           skipValidationOnInvalidViewDefinitions: true
+          forceValidationWithFeatureCompatibilityVersion: "4.4"
   fixture:
     class: ShardedClusterFixture
     mongos_options:
@@ -43,12 +45,19 @@ executor:
       set_parameters:
         disableLogicalSessionCacheRefresh: false
         enableTestCommands: 1
-        numInitialSyncAttempts: 1
+        transactionLifetimeLimitSeconds: 1
         writePeriodicNoops: 1
-    num_rs_nodes_per_shard: 2
+        enableElectionHandoff: 0
+    num_rs_nodes_per_shard: 3
     num_shards: 2
     configsvr_options:
       num_nodes: 3
       all_nodes_electable: true
+      replset_config_options:
+        settings:
+          catchUpTimeoutMillis: 0
     shard_options:
       all_nodes_electable: true
+      replset_config_options:
+        settings:
+          catchUpTimeoutMillis: 0

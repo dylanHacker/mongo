@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2012-2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -40,13 +41,12 @@
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/user_management_commands_parser.h"
 #include "mongo/db/auth/user_name.h"
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/coll_mod.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/drop_collection.h"
@@ -59,13 +59,13 @@
 #include "mongo/db/commands/profile_gen.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/index_builder.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
@@ -79,19 +79,17 @@
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/read_concern.h"
-#include "mongo/db/repair_database.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/db/stats/storage_stats.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/scripting/engine.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/log.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/md5.hpp"
 #include "mongo/util/scopeguard.h"
 
@@ -102,12 +100,50 @@ using std::string;
 using std::stringstream;
 using std::unique_ptr;
 
+// Failpoint for making filemd5 hang.
+MONGO_FAIL_POINT_DEFINE(waitInFilemd5DuringManualYield);
+
 namespace {
+
+Status _setProfilingLevel(OperationContext* opCtx, Database* db, StringData dbName, int newLevel) {
+    invariant(db);
+
+    auto currLevel = CollectionCatalog::get(opCtx).getDatabaseProfileLevel(dbName);
+
+    if (currLevel == newLevel) {
+        return Status::OK();
+    }
+
+    if (newLevel == 0) {
+        CollectionCatalog::get(opCtx).setDatabaseProfileLevel(dbName, newLevel);
+        return Status::OK();
+    }
+
+    if (newLevel < 0 || newLevel > 2) {
+        return Status(ErrorCodes::BadValue, "profiling level has to be >=0 and <= 2");
+    }
+
+    // Can't support profiling without supporting capped collections.
+    if (!opCtx->getServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "the storage engine doesn't support profiling.");
+    }
+
+    Status status = createProfileCollection(opCtx, db);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    CollectionCatalog::get(opCtx).setDatabaseProfileLevel(dbName, newLevel);
+
+    return Status::OK();
+}
+
 
 /**
  * Sets the profiling level, logging/profiling threshold, and logging/profiling sample rate for the
  * given database.
-*/
+ */
 class CmdProfile : public ProfileCmdBase {
 public:
     CmdProfile() = default;
@@ -116,21 +152,32 @@ protected:
     int _applyProfilingLevel(OperationContext* opCtx,
                              const std::string& dbName,
                              int profilingLevel) const final {
+
+        // The system.profile collection is non-replicated, so writes to it do not cause
+        // replication lag. As such, they should be excluded from Flow Control.
+        opCtx->setShouldParticipateInFlowControl(false);
+
         const bool readOnly = (profilingLevel < 0 || profilingLevel > 2);
         const LockMode dbMode = readOnly ? MODE_S : MODE_X;
 
+        // Accessing system.profile collection should not conflict with oplog application.
+        ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(
+            opCtx->lockState());
         AutoGetDb ctx(opCtx, dbName, dbMode);
         Database* db = ctx.getDb();
 
-        auto oldLevel = (db ? db->getProfilingLevel() : serverGlobalParams.defaultProfile);
+        // Fetches the database profiling level or the server default if the db does not exist.
+        auto oldLevel = CollectionCatalog::get(opCtx).getDatabaseProfileLevel(dbName);
 
         if (!readOnly) {
             if (!db) {
                 // When setting the profiling level, create the database if it didn't already exist.
                 // When just reading the profiling level, we do not create the database.
-                db = dbHolder().openDb(opCtx, dbName);
+                auto databaseHolder = DatabaseHolder::get(opCtx);
+                db = databaseHolder->openDb(opCtx, dbName);
             }
-            uassertStatusOK(db->setProfilingLevel(opCtx, profilingLevel));
+
+            uassertStatusOK(_setProfilingLevel(opCtx, db, dbName, profilingLevel));
         }
 
         return oldLevel;
@@ -195,6 +242,12 @@ public:
             // it just passes the buffer through to another mongod.
             BSONElement stateElem = jsobj["md5state"];
             if (!stateElem.eoo()) {
+                uassert(50847,
+                        str::stream() << "The element that calls binDataClean() must be type of "
+                                         "BinData, but type of "
+                                      << typeName(stateElem.type()) << " found.",
+                        (stateElem.type() == BSONType::BinData));
+
                 int len;
                 const char* data = stateElem.binDataClean(len);
                 massert(16247, "md5 state not correct size", len == sizeof(st));
@@ -207,7 +260,7 @@ public:
         BSONObj sort = BSON("files_id" << 1 << "n" << 1);
 
         return writeConflictRetry(opCtx, "filemd5", dbname, [&] {
-            auto qr = stdx::make_unique<QueryRequest>(nss);
+            auto qr = std::make_unique<QueryRequest>(nss);
             qr->setFilter(query);
             qr->setSort(sort);
 
@@ -228,57 +281,94 @@ public:
             auto exec = uassertStatusOK(getExecutor(opCtx,
                                                     coll,
                                                     std::move(cq),
-                                                    PlanExecutor::YIELD_MANUAL,
+                                                    PlanYieldPolicy::YieldPolicy::YIELD_MANUAL,
                                                     QueryPlannerParams::NO_TABLE_SCAN));
 
-            BSONObj obj;
-            PlanExecutor::ExecState state;
-            while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
-                BSONElement ne = obj["n"];
-                verify(ne.isNumber());
-                int myn = ne.numberInt();
-                if (n != myn) {
-                    if (partialOk) {
-                        break;  // skipped chunk is probably on another shard
+            // We need to hold a lock to clean up the PlanExecutor, so make sure we have one when we
+            // exit this block. Because we use an AutoGetCollectionForReadCommand and manual
+            // yielding, we may throw when trying to re-acquire the lock. For example, this can
+            // happen if our operation has been interrupted.
+            ON_BLOCK_EXIT([&]() {
+                if (ctx) {
+                    // We still have the lock. No special action required.
+                    return;
+                }
+
+                // We need to be careful to not use AutoGetCollection or AutoGetDb here, since we
+                // only need the lock to protect potential access to the Collection's CursorManager
+                // and those helpers may throw if something has changed since the last time we took
+                // a lock. For example, AutoGetCollection will throw if this namespace has since
+                // turned into a view and AutoGetDb will throw if the database version is stale.
+                UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+                Lock::DBLock dbLock(opCtx, nss.db(), MODE_IS);
+                invariant(dbLock.isLocked(),
+                          "Expected lock acquisition to succeed due to UninterruptibleLockGuard");
+                Lock::CollectionLock collLock(opCtx, nss, MODE_IS);
+                exec.reset();
+            });
+
+            try {
+                BSONObj obj;
+                while (PlanExecutor::ADVANCED == exec->getNext(&obj, nullptr)) {
+                    BSONElement ne = obj["n"];
+                    verify(ne.isNumber());
+                    int myn = ne.numberInt();
+                    if (n != myn) {
+                        if (partialOk) {
+                            break;  // skipped chunk is probably on another shard
+                        }
+                        LOGV2(20452,
+                              "Should have chunk: {expected} have: {observed}",
+                              "Unexpected chunk",
+                              "expected"_attr = n,
+                              "observed"_attr = myn);
+                        dumpChunks(opCtx, nss.ns(), query, sort);
+                        uassert(10040, "chunks out of order", n == myn);
                     }
-                    log() << "should have chunk: " << n << " have:" << myn;
-                    dumpChunks(opCtx, nss.ns(), query, sort);
-                    uassert(10040, "chunks out of order", n == myn);
-                }
 
-                // make a copy of obj since we access data in it while yielding locks
-                BSONObj owned = obj.getOwned();
-                exec->saveState();
-                // UNLOCKED
-                ctx.reset();
+                    // make a copy of obj since we access data in it while yielding locks
+                    BSONObj owned = obj.getOwned();
+                    uassert(50848,
+                            str::stream() << "The element that calls binDataClean() must be type "
+                                             "of BinData, but type of misisng found. Field name is "
+                                             "required",
+                            owned["data"]);
+                    uassert(50849,
+                            str::stream() << "The element that calls binDataClean() must be type "
+                                             "of BinData, but type of "
+                                          << owned["data"].type() << " found.",
+                            owned["data"].type() == BSONType::BinData);
 
-                int len;
-                const char* data = owned["data"].binDataClean(len);
-                // This is potentially an expensive operation, so do it out of the lock
-                md5_append(&st, (const md5_byte_t*)(data), len);
-                n++;
+                    exec->saveState();
+                    // UNLOCKED
+                    ctx.reset();
 
-                try {
-                    // RELOCKED
-                    ctx.reset(new AutoGetCollectionForReadCommand(opCtx, nss));
-                } catch (const StaleConfigException&) {
-                    LOG(1) << "chunk metadata changed during filemd5, will retarget and continue";
-                    break;
-                }
+                    int len;
+                    const char* data = owned["data"].binDataClean(len);
+                    // This is potentially an expensive operation, so do it out of the lock
+                    md5_append(&st, (const md5_byte_t*)(data), len);
+                    n++;
 
-                // Have the lock again. See if we were killed.
-                if (!exec->restoreState().isOK()) {
-                    if (!partialOk) {
-                        uasserted(13281, "File deleted during filemd5 command");
+                    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                        &waitInFilemd5DuringManualYield, opCtx, "waitInFilemd5DuringManualYield");
+
+                    try {
+                        // RELOCKED
+                        ctx.reset(new AutoGetCollectionForReadCommand(opCtx, nss));
+                    } catch (const StaleConfigException&) {
+                        LOGV2_DEBUG(
+                            20453,
+                            1,
+                            "Chunk metadata changed during filemd5, will retarget and continue");
+                        break;
                     }
-                }
-            }
 
-            if (PlanExecutor::DEAD == state || PlanExecutor::FAILURE == state) {
-                return CommandHelpers::appendCommandStatus(
-                    result,
-                    WorkingSetCommon::getMemberObjectStatus(obj).withContext(
-                        "Executor error during filemd5 command"));
+                    // Now that we have the lock again, we can restore the PlanExecutor.
+                    exec->restoreState();
+                }
+            } catch (DBException& exception) {
+                exception.addContext("Executor error during filemd5 command");
+                throw;
             }
 
             if (partialOk)
@@ -301,38 +391,13 @@ public:
         DBDirectClient client(opCtx);
         Query q(query);
         q.sort(sort);
-        unique_ptr<DBClientCursor> c = client.query(ns, q);
+        unique_ptr<DBClientCursor> c = client.query(NamespaceString(ns), q);
         while (c->more()) {
-            log() << c->nextSafe();
+            LOGV2(20454, "Chunk: {chunk}", "Dumping chunks", "chunk"_attr = c->nextSafe());
         }
     }
 
 } cmdFileMD5;
-
-/* Returns client's uri */
-class CmdWhatsMyUri : public BasicCommand {
-public:
-    CmdWhatsMyUri() : BasicCommand("whatsmyuri") {}
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kAlways;
-    }
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return false;
-    }
-    std::string help() const override {
-        return "{whatsmyuri:1}";
-    }
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {}  // No auth required
-    virtual bool run(OperationContext* opCtx,
-                     const string& dbname,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
-        result << "you" << opCtx->getClient()->clientAddress(true /*includePort*/);
-        return true;
-    }
-} cmdWhatsMyUri;
 
 class AvailableQueryOptions : public BasicCommand {
 public:

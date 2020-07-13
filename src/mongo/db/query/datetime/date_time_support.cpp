@@ -1,35 +1,37 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
+#include <limits>
 #include <memory>
 #include <timelib.h>
 
@@ -38,11 +40,9 @@
 #include "mongo/base/init.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/service_context.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/duration.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -58,16 +58,14 @@ std::unique_ptr<_timelib_time, TimeZone::TimelibTimeDeleter> createTimelibTime()
 // Converts a date to a number of seconds, being careful to round appropriately for negative numbers
 // of seconds.
 long long seconds(Date_t date) {
-    auto millis = date.toMillisSinceEpoch();
-    if (millis < 0) {
-        // We want the division below to truncate toward -inf rather than 0
-        // eg Dec 31, 1969 23:59:58.001 should be -2 seconds rather than -1
-        // This is needed to get the correct values from coerceToTM
-        if (-1999 / 1000 != -2) {  // this is implementation defined
-            millis -= 1000 - 1;
-        }
-    }
-    return durationCount<Seconds>(Milliseconds(millis));
+    // We want the division below to truncate toward -inf rather than 0
+    // eg Dec 31, 1969 23:59:58.001 should be -2 seconds rather than -1
+    // This is needed to get the correct values from coerceToTM
+    constexpr auto needsRounding = -1999 / 1000 != -2;  // This is implementaiton defined.
+    if (auto millis = date.toMillisSinceEpoch(); millis < 0 && millis % 1000 != 0 && needsRounding)
+        return durationCount<Seconds>(Milliseconds(millis)) - 1ll;
+    else
+        return durationCount<Seconds>(Milliseconds(millis));
 }
 
 //
@@ -179,9 +177,7 @@ void TimeZoneDatabase::loadTimeZoneInfo(
                 40475,
                 {ErrorCodes::FailedToParse,
                  str::stream() << "failed to parse time zone file for time zone identifier \""
-                               << entry.id
-                               << "\": "
-                               << timelib_get_error_message(errorCode)});
+                               << entry.id << "\": " << timelib_get_error_message(errorCode)});
         }
 
         invariant(errorCode == TIMELIB_ERROR_NO_ERROR);
@@ -275,8 +271,7 @@ Date_t TimeZoneDatabase::fromString(StringData dateString,
         uasserted(ErrorCodes::ConversionFailure,
                   str::stream()
                       << "an incomplete date/time string has been found, with elements missing: \""
-                      << dateString
-                      << "\"");
+                      << dateString << "\"");
     }
 
     if (!tz.isUtcZone()) {
@@ -294,8 +289,7 @@ Date_t TimeZoneDatabase::fromString(StringData dateString,
                     ErrorCodes::ConversionFailure,
                     str::stream()
                         << "you cannot pass in a date/time string with time zone information ('"
-                        << parsedTime.get()->tz_abbr
-                        << "') together with a timezone argument");
+                        << parsedTime.get()->tz_abbr << "') together with a timezone argument");
                 break;
             default:  // should technically not be possible to reach
                 uasserted(ErrorCodes::ConversionFailure,
@@ -320,7 +314,7 @@ boost::optional<Seconds> TimeZoneDatabase::parseUtcOffset(StringData offsetSpec)
         // ±HH
         if (offsetSpec.size() == 3 && isdigit(offsetSpec[1]) && isdigit(offsetSpec[2])) {
             int offset;
-            if (parseNumberFromStringWithBase(offsetSpec.substr(1, 2), 10, &offset).isOK()) {
+            if (NumberParser().base(10)(offsetSpec.substr(1, 2), &offset).isOK()) {
                 return duration_cast<Seconds>(Hours(bias * offset));
             }
             return boost::none;
@@ -330,7 +324,7 @@ boost::optional<Seconds> TimeZoneDatabase::parseUtcOffset(StringData offsetSpec)
         if (offsetSpec.size() == 5 && isdigit(offsetSpec[1]) && isdigit(offsetSpec[2]) &&
             isdigit(offsetSpec[3]) && isdigit(offsetSpec[4])) {
             int offset;
-            if (parseNumberFromStringWithBase(offsetSpec.substr(1, 4), 10, &offset).isOK()) {
+            if (NumberParser().base(10)(offsetSpec.substr(1, 4), &offset).isOK()) {
                 return duration_cast<Seconds>(Hours(bias * (offset / 100L)) +
                                               Minutes(bias * (offset % 100)));
             }
@@ -341,10 +335,10 @@ boost::optional<Seconds> TimeZoneDatabase::parseUtcOffset(StringData offsetSpec)
         if (offsetSpec.size() == 6 && isdigit(offsetSpec[1]) && isdigit(offsetSpec[2]) &&
             offsetSpec[3] == ':' && isdigit(offsetSpec[4]) && isdigit(offsetSpec[5])) {
             int hourOffset, minuteOffset;
-            if (!parseNumberFromStringWithBase(offsetSpec.substr(1, 2), 10, &hourOffset).isOK()) {
+            if (!NumberParser().base(10)(offsetSpec.substr(1, 2), &hourOffset).isOK()) {
                 return boost::none;
             }
-            if (!parseNumberFromStringWithBase(offsetSpec.substr(4, 2), 10, &minuteOffset).isOK()) {
+            if (!NumberParser().base(10)(offsetSpec.substr(4, 2), &minuteOffset).isOK()) {
                 return boost::none;
             }
             return duration_cast<Seconds>(Hours(bias * hourOffset) + Minutes(bias * minuteOffset));
@@ -366,6 +360,16 @@ TimeZone TimeZoneDatabase::getTimeZone(StringData timeZoneId) const {
 
     uasserted(40485,
               str::stream() << "unrecognized time zone identifier: \"" << timeZoneId << "\"");
+}
+
+std::vector<std::string> TimeZoneDatabase::getTimeZoneStrings() const {
+    std::vector<std::string> timeZoneStrings = {};
+
+    for (auto const& timezone : _timeZones) {
+        timeZoneStrings.push_back(timezone.first);
+    }
+
+    return timeZoneStrings;
 }
 
 void TimeZone::adjustTimeZone(timelib_time* timelibTime) const {
@@ -557,9 +561,11 @@ void TimeZone::validateFromStringFormat(StringData format) {
     return validateFormat(format, kDateFromStringFormatMap);
 }
 
-std::string TimeZone::formatDate(StringData format, Date_t date) const {
+StatusWith<std::string> TimeZone::formatDate(StringData format, Date_t date) const {
     StringBuilder formatted;
-    outputDateWithFormat(formatted, format, date);
-    return formatted.str();
+    if (auto status = outputDateWithFormat(formatted, format, date); status != Status::OK())
+        return status;
+    else
+        return formatted.str();
 }
 }  // namespace mongo

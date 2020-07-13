@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,19 +27,20 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/sharding_logging.h"
 #include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -83,17 +85,17 @@ public:
         return cmdObj.firstElement().str();
     }
 
-
     bool run(OperationContext* opCtx,
              const std::string& dbname_unused,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
-        if (serverGlobalParams.clusterRole != ClusterRole::ConfigServer) {
-            return CommandHelpers::appendCommandStatus(
-                result,
-                Status(ErrorCodes::IllegalOperation,
-                       "_configsvrDropDatabase can only be run on config servers"));
-        }
+        uassert(ErrorCodes::IllegalOperation,
+                "_configsvrDropDatabase can only be run on config servers",
+                serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+
+        // Set the operation context read concern level to local for reads into the config database.
+        repl::ReadConcernArgs::get(opCtx) =
+            repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
 
         const std::string dbname = parseNs("", cmdObj);
 
@@ -110,6 +112,9 @@ public:
         auto const catalogClient = Grid::get(opCtx)->catalogClient();
         auto const catalogManager = ShardingCatalogManager::get(opCtx);
 
+        auto scopedLock =
+            ShardingCatalogManager::get(opCtx)->serializeCreateOrDropDatabase(opCtx, dbname);
+
         auto dbDistLock = uassertStatusOK(catalogClient->getDistLockManager()->lock(
             opCtx, dbname, "dropDatabase", DistLockManager::kDefaultLockTimeout));
 
@@ -117,7 +122,7 @@ public:
         ON_BLOCK_EXIT([opCtx, dbname] { Grid::get(opCtx)->catalogCache()->purgeDatabase(dbname); });
 
         auto dbInfo =
-            catalogClient->getDatabase(opCtx, dbname, repl::ReadConcernLevel::kLocalReadConcern);
+            catalogClient->getDatabase(opCtx, dbname, repl::ReadConcernArgs::get(opCtx).getLevel());
 
         // If the namespace isn't found, treat the drop as a success. In case the drop just happened
         // and has not fully propagated, set the client's last optime to the system's last optime to
@@ -132,37 +137,34 @@ public:
         // error.
         auto dbType = uassertStatusOK(dbInfo).value;
 
-        catalogClient
-            ->logChange(opCtx,
-                        "dropDatabase.start",
-                        dbname,
-                        BSONObj(),
-                        ShardingCatalogClient::kMajorityWriteConcern)
-            .transitional_ignore();
+        uassertStatusOK(ShardingLogging::get(opCtx)->logChangeChecked(
+            opCtx,
+            "dropDatabase.start",
+            dbname,
+            BSONObj(),
+            ShardingCatalogClient::kMajorityWriteConcern));
 
         // Drop the database's collections.
         for (const auto& nss : catalogClient->getAllShardedCollectionsForDb(
-                 opCtx, dbname, repl::ReadConcernLevel::kLocalReadConcern)) {
+                 opCtx, dbname, repl::ReadConcernArgs::get(opCtx).getLevel())) {
             auto collDistLock = uassertStatusOK(catalogClient->getDistLockManager()->lock(
                 opCtx, nss.ns(), "dropCollection", DistLockManager::kDefaultLockTimeout));
-            uassertStatusOK(catalogManager->dropCollection(opCtx, nss));
+            catalogManager->dropCollection(opCtx, nss);
         }
 
         // Drop the database from the primary shard first.
         _dropDatabaseFromShard(opCtx, dbType.getPrimary(), dbname);
 
         // Drop the database from each of the remaining shards.
-        {
-            std::vector<ShardId> allShardIds;
-            Grid::get(opCtx)->shardRegistry()->getAllShardIdsNoReload(&allShardIds);
-
-            for (const ShardId& shardId : allShardIds) {
-                _dropDatabaseFromShard(opCtx, shardId, dbname);
-            }
+        std::vector<ShardId> allShardIds;
+        Grid::get(opCtx)->shardRegistry()->getAllShardIdsNoReload(&allShardIds);
+        for (const ShardId& shardId : allShardIds) {
+            _dropDatabaseFromShard(opCtx, shardId, dbname);
         }
 
+
         // Remove the database entry from the metadata.
-        Status status =
+        const Status status =
             catalogClient->removeConfigDocuments(opCtx,
                                                  DatabaseType::ConfigNS,
                                                  BSON(DatabaseType::name(dbname)),
@@ -170,13 +172,21 @@ public:
         uassertStatusOKWithContext(
             status, str::stream() << "Could not remove database '" << dbname << "' from metadata");
 
-        catalogClient
-            ->logChange(opCtx,
-                        "dropDatabase",
-                        dbname,
-                        BSONObj(),
-                        ShardingCatalogClient::kMajorityWriteConcern)
-            .transitional_ignore();
+        // Send _flushDatabaseCacheUpdates to all shards
+        for (const ShardId& shardId : allShardIds) {
+            const auto shard =
+                uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardId));
+            auto cmdResponse = uassertStatusOK(shard->runCommandWithFixedRetryAttempts(
+                opCtx,
+                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                "admin",
+                BSON("_flushDatabaseCacheUpdates" << dbname),
+                Shard::RetryPolicy::kIdempotent));
+            uassertStatusOK(cmdResponse.commandStatus);
+        }
+
+        ShardingLogging::get(opCtx)->logChange(
+            opCtx, "dropDatabase", dbname, BSONObj(), ShardingCatalogClient::kMajorityWriteConcern);
 
         result.append("dropped", dbname);
         return true;

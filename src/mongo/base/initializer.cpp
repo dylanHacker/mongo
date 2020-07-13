@@ -1,55 +1,62 @@
-/*    Copyright 2012 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/base/initializer.h"
 
+#include <iostream>
+
 #include "mongo/base/deinitializer_context.h"
 #include "mongo/base/global_initializer.h"
+#include "mongo/base/initializer_context.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/quick_exit.h"
-#include <iostream>
+#include "mongo/util/str.h"
 
 namespace mongo {
 
-Initializer::Initializer() {}
-Initializer::~Initializer() {}
+Status Initializer::executeInitializers(const std::vector<std::string>& args) {
+    auto oldState = std::exchange(_lifecycleState, State::kInitializing);
+    invariant(oldState == State::kUninitialized, "invalid initializer state transition");
 
-Status Initializer::executeInitializers(const InitializerContext::ArgumentVector& args,
-                                        const InitializerContext::EnvironmentMap& env,
-                                        ServiceContext* serviceContext) {
-    std::vector<std::string> sortedNodes;
-    Status status = _graph.topSort(&sortedNodes);
-    if (Status::OK() != status)
-        return status;
+    if (_sortedNodes.empty()) {
+        if (Status status = _graph.topSort(&_sortedNodes); !status.isOK()) {
+            return status;
+        }
+    }
+    _graph.freeze();
 
-    InitializerContext context(args, env, serviceContext);
+    InitializerContext context(args);
 
-    for (size_t i = 0; i < sortedNodes.size(); ++i) {
-        InitializerDependencyNode* node = _graph.getInitializerNode(sortedNodes[i]);
+    for (const auto& nodeName : _sortedNodes) {
+        InitializerDependencyNode* node = _graph.getInitializerNode(nodeName);
 
         // If already initialized then this node is a legacy initializer without re-initialization
         // support.
@@ -59,88 +66,65 @@ Status Initializer::executeInitializers(const InitializerContext::ArgumentVector
         auto const& fn = node->getInitializerFunction();
         if (!fn) {
             return Status(ErrorCodes::InternalError,
-                          "topSort returned a node that has no associated function: \"" +
-                              sortedNodes[i] + '"');
+                          "topSort returned a node that has no associated function: \"" + nodeName +
+                              '"');
         }
         try {
-            status = fn(&context);
+            if (Status status = fn(&context); !status.isOK()) {
+                return status;
+            }
         } catch (const DBException& xcp) {
             return xcp.toStatus();
         }
 
-        if (Status::OK() != status)
-            return status;
-
         node->setInitialized(true);
     }
+
+    oldState = std::exchange(_lifecycleState, State::kInitialized);
+    invariant(oldState == State::kInitializing, "invalid initializer state transition");
+
     return Status::OK();
 }
 
-Status Initializer::executeDeinitializers(ServiceContext* serviceContext) {
-    std::vector<std::string> sortedNodes;
-    Status status = _graph.topSort(&sortedNodes);
-    if (Status::OK() != status)
-        return status;
+Status Initializer::executeDeinitializers() {
+    auto oldState = std::exchange(_lifecycleState, State::kDeinitializing);
+    invariant(oldState == State::kInitialized, "invalid initializer state transition");
 
-    DeinitializerContext context(serviceContext);
+    DeinitializerContext context{};
 
     // Execute deinitialization in reverse order from initialization.
-    for (auto it = sortedNodes.rbegin(), end = sortedNodes.rend(); it != end; ++it) {
+    for (auto it = _sortedNodes.rbegin(), end = _sortedNodes.rend(); it != end; ++it) {
         InitializerDependencyNode* node = _graph.getInitializerNode(*it);
         auto const& fn = node->getDeinitializerFunction();
         if (fn) {
             try {
-                status = fn(&context);
+                if (Status status = fn(&context); !status.isOK()) {
+                    return status;
+                }
             } catch (const DBException& xcp) {
                 return xcp.toStatus();
             }
 
-            if (Status::OK() != status)
-                return status;
-
             node->setInitialized(false);
         }
     }
+
+    oldState = std::exchange(_lifecycleState, State::kUninitialized);
+    invariant(oldState == State::kDeinitializing, "invalid initializer state transition");
+
     return Status::OK();
 }
 
-Status runGlobalInitializers(const InitializerContext::ArgumentVector& args,
-                             const InitializerContext::EnvironmentMap& env,
-                             ServiceContext* serviceContext) {
-    return getGlobalInitializer().executeInitializers(args, env, serviceContext);
+Status runGlobalInitializers(const std::vector<std::string>& argv) {
+    return getGlobalInitializer().executeInitializers(argv);
 }
 
-Status runGlobalInitializers(int argc,
-                             const char* const* argv,
-                             const char* const* envp,
-                             ServiceContext* serviceContext) {
-    InitializerContext::ArgumentVector args(argc);
-    std::copy(argv, argv + argc, args.begin());
-
-    InitializerContext::EnvironmentMap env;
-
-    if (envp) {
-        for (; *envp; ++envp) {
-            const char* firstEqualSign = strchr(*envp, '=');
-            if (!firstEqualSign) {
-                return Status(ErrorCodes::BadValue, "malformed environment block");
-            }
-            env[std::string(*envp, firstEqualSign)] = std::string(firstEqualSign + 1);
-        }
-    }
-
-    return runGlobalInitializers(args, env, serviceContext);
+Status runGlobalDeinitializers() {
+    return getGlobalInitializer().executeDeinitializers();
 }
 
-Status runGlobalDeinitializers(ServiceContext* serviceContext) {
-    return getGlobalInitializer().executeDeinitializers(serviceContext);
-}
-
-void runGlobalInitializersOrDie(int argc,
-                                const char* const* argv,
-                                const char* const* envp,
-                                ServiceContext* serviceContext) {
-    Status status = runGlobalInitializers(argc, argv, envp, serviceContext);
+void runGlobalInitializersOrDie(const std::vector<std::string>& argv) {
+    Status status = runGlobalInitializers(argv);
     if (!status.isOK()) {
         std::cerr << "Failed global initialization: " << status << std::endl;
         quickExit(1);

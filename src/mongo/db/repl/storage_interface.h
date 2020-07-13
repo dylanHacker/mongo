@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -34,7 +35,6 @@
 #include <iosfwd>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/collection.h"
@@ -59,7 +59,7 @@ struct TimestampedBSONObj {
 
 /**
  * Storage interface used by the replication system to interact with storage.
- * This interface provides seperation of concerns and a place for mocking out test
+ * This interface provides separation of concerns and a place for mocking out test
  * interactions.
  *
  * The grouping of functionality includes general collection helpers, and more specific replication
@@ -70,7 +70,8 @@ struct TimestampedBSONObj {
  *      * Insert documents into a collection
  */
 class StorageInterface {
-    MONGO_DISALLOW_COPYING(StorageInterface);
+    StorageInterface(const StorageInterface&) = delete;
+    StorageInterface& operator=(const StorageInterface&) = delete;
 
 public:
     // Operation Context binding.
@@ -149,8 +150,7 @@ public:
      * Implementations are allowed to be "fuzzy" and delete documents when the actual size is
      * slightly above or below this, so callers should not rely on its exact value.
      */
-    virtual StatusWith<size_t> getOplogMaxSize(OperationContext* opCtx,
-                                               const NamespaceString& nss) = 0;
+    virtual StatusWith<size_t> getOplogMaxSize(OperationContext* opCtx) = 0;
 
     /**
      * Creates a collection.
@@ -312,6 +312,29 @@ public:
                                   const NamespaceString& nss,
                                   const BSONObj& filter) = 0;
 
+    /**
+     * Searches for an oplog entry with a timestamp <= 'timestamp'. Returns boost::none if no
+     * matches are found.
+     */
+    virtual boost::optional<BSONObj> findOplogEntryLessThanOrEqualToTimestamp(
+        OperationContext* opCtx, Collection* oplog, const Timestamp& timestamp) = 0;
+
+    /**
+     * Calls findOplogEntryLessThanOrEqualToTimestamp with endless WriteConflictException retries.
+     * Other errors get thrown. Concurrent oplog reads with the validate cmd on the same collection
+     * may throw WCEs. Obeys opCtx interrupts.
+     *
+     * Call this function instead of findOplogEntryLessThanOrEqualToTimestamp if the caller cannot
+     * fail, say for correctness.
+     */
+    virtual boost::optional<BSONObj> findOplogEntryLessThanOrEqualToTimestampRetryOnWCE(
+        OperationContext* opCtx, Collection* oplog, const Timestamp& timestamp) = 0;
+
+    /**
+     * Fetches the latest oplog entry's timestamp. Bypasses the oplog visibility rules.
+     */
+    virtual Timestamp getLatestOplogTimestamp(OperationContext* opCtx) = 0;
+
     using CollectionSize = uint64_t;
     using CollectionCount = uint64_t;
 
@@ -359,13 +382,28 @@ public:
      * "local.replset.minvalid" which should be reverted to the last stable timestamp.
      *
      * The 'stable' timestamp is set by calling StorageInterface::setStableTimestamp.
+     *
+     * Returns the stable timestamp to which it reverted the data.
      */
-    virtual StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) = 0;
+    virtual Timestamp recoverToStableTimestamp(OperationContext* opCtx) = 0;
 
     /**
      * Returns whether the storage engine supports "recover to stable timestamp".
      */
     virtual bool supportsRecoverToStableTimestamp(ServiceContext* serviceCtx) const = 0;
+
+    /**
+     * Returns whether the storage engine can provide a recovery timestamp.
+     */
+    virtual bool supportsRecoveryTimestamp(ServiceContext* serviceCtx) const = 0;
+
+    /**
+     * Responsible for initializing independent processes for replication that manage
+     * and interact with the storage layer.
+     *
+     * Initializes the OplogCapMaintainerThread to control deletion of oplog stones.
+     */
+    virtual void initializeStorageControlsForReplication(ServiceContext* serviceCtx) const = 0;
 
     /**
      * Returns the stable timestamp that the storage engine recovered to on startup. If the
@@ -377,8 +415,35 @@ public:
      * Waits for oplog writes to be visible in the oplog.
      * This function is used to ensure tests do not fail due to initial sync receiving an empty
      * batch.
+     *
+     * primaryOnly: If this node is not primary, do nothing.
      */
-    virtual void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) = 0;
+    virtual void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx,
+                                                         bool primaryOnly = false) = 0;
+
+    /**
+     * Returns the all_durable timestamp. All transactions with timestamps earlier than the
+     * all_durable timestamp are committed. Only storage engines that support document level locking
+     * must provide an implementation. Other storage engines may provide a no-op implementation.
+     *
+     * The all_durable timestamp only includes non-prepared transactions that have been given a
+     * commit_timestamp and prepared transactions that have been given a durable_timestamp.
+     * Previously, the deprecated all_committed timestamp would also include prepared transactions
+     * that were prepared but not committed which could make the stable timestamp briefly jump back.
+     */
+    virtual Timestamp getAllDurableTimestamp(ServiceContext* serviceCtx) const = 0;
+
+    /**
+     * Returns the oldest read timestamp in use by an open transaction. Storage engines that support
+     * the 'snapshot' ReadConcern must provide an implementation. Other storage engines may provide
+     * a no-op implementation.
+     */
+    virtual Timestamp getOldestOpenReadTimestamp(ServiceContext* serviceCtx) const = 0;
+
+    /**
+     * Returns true if the storage engine supports document level locking.
+     */
+    virtual bool supportsDocLocking(ServiceContext* serviceCtx) const = 0;
 
     /**
      * Registers a timestamp with the storage engine so that it can enforce oplog visiblity rules.
@@ -389,6 +454,24 @@ public:
     virtual void oplogDiskLocRegister(OperationContext* opCtx,
                                       const Timestamp& ts,
                                       bool orderedCommit) = 0;
+
+    /**
+     * Returns a timestamp that is guaranteed to exist on storage engine recovery to a stable
+     * timestamp. This indicates when the storage engine can safely rollback to stable; and for
+     * durable engines, it is also the guaranteed minimum stable recovery point on server restart
+     * after crash or shutdown.
+     *
+     * Returns `Timestamp::min()` if no stable recovery timestamp has yet been established.
+     * Replication recoverable rollback may not succeed before establishment, and restart will
+     * require resync. Returns boost::none if `supportsRecoverToStableTimestamp` returns false.
+     */
+    virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp(
+        ServiceContext* serviceCtx) const = 0;
+
+    /**
+     * Returns the read timestamp of the recovery unit of the given operation context.
+     */
+    virtual Timestamp getPointInTimeReadTimestamp(OperationContext* opCtx) const = 0;
 };
 
 }  // namespace repl

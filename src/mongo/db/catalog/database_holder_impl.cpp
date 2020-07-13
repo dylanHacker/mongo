@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,66 +27,29 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/database_holder_impl.h"
 
-#include "mongo/base/init.h"
 #include "mongo/db/audit.h"
-#include "mongo/db/background.h"
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/catalog/database_catalog_entry.h"
-#include "mongo/db/catalog/namespace_uuid_cache.h"
-#include "mongo/db/catalog/uuid_catalog.h"
-#include "mongo/db/client.h"
-#include "mongo/db/clientcursor.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_impl.h"
+#include "mongo/db/catalog/database_impl.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/repl/oplog.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/stats/top.h"
 #include "mongo/db/storage/storage_engine.h"
-#include "mongo/util/log.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
 
-DatabaseHolder* _dbHolder = nullptr;
-
-DatabaseHolder& dbHolderImpl() {
-    return *_dbHolder;
-}
-
-GlobalInitializerRegisterer dbHolderImplInitializer("InitializeDbHolderimpl",
-                                                    {"InitializeDatabaseHolderFactory"},
-                                                    [](InitializerContext* const) {
-                                                        _dbHolder = new DatabaseHolder();
-                                                        registerDbHolderImpl(dbHolderImpl);
-                                                        return Status::OK();
-                                                    },
-                                                    [](DeinitializerContext* const) {
-                                                        delete _dbHolder;
-                                                        _dbHolder = nullptr;
-                                                        return Status::OK();
-                                                    });
-
-MONGO_INITIALIZER(InitializeDatabaseHolderFactory)(InitializerContext* const) {
-    DatabaseHolder::registerFactory([] { return stdx::make_unique<DatabaseHolderImpl>(); });
-    return Status::OK();
-}
-
-}  // namespace
-
-using std::set;
-using std::size_t;
-using std::string;
-using std::stringstream;
-
-namespace {
-
 StringData _todb(StringData ns) {
-    size_t i = ns.find('.');
+    std::size_t i = ns.find('.');
     if (i == std::string::npos) {
         uassert(13074, "db name can't be empty", ns.size());
         return ns;
@@ -104,9 +68,10 @@ StringData _todb(StringData ns) {
 }  // namespace
 
 
-Database* DatabaseHolderImpl::get(OperationContext* opCtx, StringData ns) const {
+Database* DatabaseHolderImpl::getDb(OperationContext* opCtx, StringData ns) const {
     const StringData db = _todb(ns);
-    invariant(opCtx->lockState()->isDbLockedForMode(db, MODE_IS));
+    invariant(opCtx->lockState()->isDbLockedForMode(db, MODE_IS) ||
+              (db.compare("local") == 0 && opCtx->lockState()->isLocked()));
 
     stdx::lock_guard<SimpleMutex> lk(_m);
     DBs::const_iterator it = _dbs.find(db);
@@ -114,7 +79,7 @@ Database* DatabaseHolderImpl::get(OperationContext* opCtx, StringData ns) const 
         return it->second;
     }
 
-    return NULL;
+    return nullptr;
 }
 
 std::set<std::string> DatabaseHolderImpl::_getNamesWithConflictingCasing_inlock(StringData name) {
@@ -133,9 +98,18 @@ std::set<std::string> DatabaseHolderImpl::getNamesWithConflictingCasing(StringDa
     return _getNamesWithConflictingCasing_inlock(name);
 }
 
+std::vector<std::string> DatabaseHolderImpl::getNames() {
+    stdx::lock_guard<SimpleMutex> lk(_m);
+    std::vector<std::string> names;
+    for (const auto& nameAndPointer : _dbs) {
+        names.push_back(nameAndPointer.first);
+    }
+    return names;
+}
+
 Database* DatabaseHolderImpl::openDb(OperationContext* opCtx, StringData ns, bool* justCreated) {
     const StringData dbname = _todb(ns);
-    invariant(opCtx->lockState()->isDbLockedForMode(dbname, MODE_X));
+    invariant(opCtx->lockState()->isDbLockedForMode(dbname, MODE_IX));
 
     if (justCreated)
         *justCreated = false;  // Until proven otherwise.
@@ -148,7 +122,7 @@ Database* DatabaseHolderImpl::openDb(OperationContext* opCtx, StringData ns, boo
         return db;
 
     // We've inserted a nullptr entry for dbname: make sure to remove it on unsuccessful exit.
-    auto removeDbGuard = MakeGuard([this, &lk, dbname] {
+    auto removeDbGuard = makeGuard([this, &lk, dbname] {
         if (!lk.owns_lock())
             lk.lock();
         _dbs.erase(dbname);
@@ -158,53 +132,90 @@ Database* DatabaseHolderImpl::openDb(OperationContext* opCtx, StringData ns, boo
     auto duplicates = _getNamesWithConflictingCasing_inlock(dbname);
     uassert(ErrorCodes::DatabaseDifferCase,
             str::stream() << "db already exists with different case already have: ["
-                          << *duplicates.cbegin()
-                          << "] trying to create ["
-                          << dbname.toString()
+                          << *duplicates.cbegin() << "] trying to create [" << dbname.toString()
                           << "]",
             duplicates.empty());
 
-
     // Do the catalog lookup and database creation outside of the scoped lock, because these may
-    // block. Only one thread can be inside this method for the same DB name, because of the
-    // requirement for X-lock on the database when we enter. So there is no way we can insert two
-    // different databases for the same name.
+    // block.
     lk.unlock();
-    StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
-    DatabaseCatalogEntry* entry = storageEngine->getDatabaseCatalogEntry(opCtx, dbname);
 
-    if (!entry->exists()) {
-        audit::logCreateDatabase(&cc(), dbname);
+    if (CollectionCatalog::get(opCtx).getAllCollectionUUIDsFromDb(dbname).empty()) {
+        audit::logCreateDatabase(opCtx->getClient(), dbname);
         if (justCreated)
             *justCreated = true;
     }
 
-    auto newDb = stdx::make_unique<Database>(opCtx, dbname, entry);
+    auto newDb = std::make_unique<DatabaseImpl>(dbname);
+    newDb->init(opCtx);
 
     // Finally replace our nullptr entry with the new Database pointer.
-    removeDbGuard.Dismiss();
+    removeDbGuard.dismiss();
     lk.lock();
     auto it = _dbs.find(dbname);
-    invariant(it != _dbs.end() && it->second == nullptr);
+    // Dropping a database requires a MODE_X lock, so the entry in the `_dbs` map cannot disappear.
+    invariant(it != _dbs.end());
+    if (it->second) {
+        // Creating databases only requires a DB lock in MODE_IX. Thus databases can concurrently
+        // created. If this thread "lost the race", return the database object that was persisted in
+        // the `_dbs` map.
+        return it->second;
+    }
+
     it->second = newDb.release();
     invariant(_getNamesWithConflictingCasing_inlock(dbname.toString()).empty());
 
     return it->second;
 }
 
-namespace {
-void evictDatabaseFromUUIDCatalog(OperationContext* opCtx, Database* db) {
-    UUIDCatalog::get(opCtx).onCloseDatabase(db);
-    for (auto&& coll : *db) {
-        NamespaceUUIDCache::get(opCtx).evictNamespace(coll->ns());
+void DatabaseHolderImpl::dropDb(OperationContext* opCtx, Database* db) {
+    invariant(db);
+
+    // Store the name so we have if for after the db object is deleted
+    auto name = db->name();
+
+    LOGV2_DEBUG(20310, 1, "dropDatabase {name}", "name"_attr = name);
+
+    invariant(opCtx->lockState()->isDbLockedForMode(name, MODE_X));
+
+    for (auto collIt = db->begin(opCtx); collIt != db->end(opCtx); ++collIt) {
+        auto coll = *collIt;
+        if (!coll) {
+            break;
+        }
+
+        // It is the caller's responsibility to ensure that no index builds are active in the
+        // database.
+        invariant(!coll->getIndexCatalog()->haveAnyIndexesInProgress(),
+                  str::stream() << "An index is building on collection '" << coll->ns() << "'.");
     }
+
+    audit::logDropDatabase(opCtx->getClient(), name);
+
+    auto const serviceContext = opCtx->getServiceContext();
+
+    for (auto collIt = db->begin(opCtx); collIt != db->end(opCtx); ++collIt) {
+        auto coll = *collIt;
+        if (!coll) {
+            break;
+        }
+
+        Top::get(serviceContext).collectionDropped(coll->ns());
+    }
+
+    // Clean up the in-memory database state.
+    CollectionCatalog::get(opCtx).clearDatabaseProfileLevel(name);
+    close(opCtx, name);
+
+    auto const storageEngine = serviceContext->getStorageEngine();
+    writeConflictRetry(opCtx, "dropDatabase", name, [&] {
+        storageEngine->dropDatabase(opCtx, name).transitional_ignore();
+    });
 }
-}  // namespace
 
-void DatabaseHolderImpl::close(OperationContext* opCtx, StringData ns, const std::string& reason) {
-    invariant(opCtx->lockState()->isW());
-
+void DatabaseHolderImpl::close(OperationContext* opCtx, StringData ns) {
     const StringData dbName = _todb(ns);
+    invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_X));
 
     stdx::lock_guard<SimpleMutex> lk(_m);
 
@@ -214,50 +225,43 @@ void DatabaseHolderImpl::close(OperationContext* opCtx, StringData ns, const std
     }
 
     auto db = it->second;
-    repl::oplogCheckCloseDatabase(opCtx, db);
-    evictDatabaseFromUUIDCatalog(opCtx, db);
+    CollectionCatalog::get(opCtx).onCloseDatabase(opCtx, dbName.toString());
 
-    db->close(opCtx, reason);
     delete db;
     db = nullptr;
 
     _dbs.erase(it);
 
-    getGlobalServiceContext()
-        ->getGlobalStorageEngine()
-        ->closeDatabase(opCtx, dbName.toString())
-        .transitional_ignore();
+    auto* const storageEngine = opCtx->getServiceContext()->getStorageEngine();
+    storageEngine->closeDatabase(opCtx, dbName.toString()).transitional_ignore();
 }
 
-void DatabaseHolderImpl::closeAll(OperationContext* opCtx, const std::string& reason) {
+void DatabaseHolderImpl::closeAll(OperationContext* opCtx) {
     invariant(opCtx->lockState()->isW());
 
     stdx::lock_guard<SimpleMutex> lk(_m);
 
-    set<string> dbs;
+    std::set<std::string> dbs;
     for (DBs::const_iterator i = _dbs.begin(); i != _dbs.end(); ++i) {
+        // It is the caller's responsibility to ensure that no index builds are active in the
+        // database.
+        IndexBuildsCoordinator::get(opCtx)->assertNoBgOpInProgForDb(i->first);
         dbs.insert(i->first);
     }
 
-    for (set<string>::iterator i = dbs.begin(); i != dbs.end(); ++i) {
-        string name = *i;
+    auto* const storageEngine = opCtx->getServiceContext()->getStorageEngine();
 
-        LOG(2) << "DatabaseHolder::closeAll name:" << name;
-
-        BackgroundOperation::assertNoBgOpInProgForDb(name);
+    for (const auto& name : dbs) {
+        LOGV2_DEBUG(20311, 2, "DatabaseHolder::closeAll name:{name}", "name"_attr = name);
 
         Database* db = _dbs[name];
-        repl::oplogCheckCloseDatabase(opCtx, db);
-        evictDatabaseFromUUIDCatalog(opCtx, db);
-        db->close(opCtx, reason);
+        CollectionCatalog::get(opCtx).onCloseDatabase(opCtx, name);
         delete db;
 
         _dbs.erase(name);
 
-        getGlobalServiceContext()
-            ->getGlobalStorageEngine()
-            ->closeDatabase(opCtx, name)
-            .transitional_ignore();
+        storageEngine->closeDatabase(opCtx, name).transitional_ignore();
     }
 }
+
 }  // namespace mongo

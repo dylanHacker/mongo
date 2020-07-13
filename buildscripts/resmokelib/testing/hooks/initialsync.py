@@ -1,18 +1,18 @@
 """Test hook for verifying correctness of initial sync."""
 
-from __future__ import absolute_import
-
 import os.path
 import random
 
 import bson
+import bson.errors
 import pymongo.errors
 
-from . import cleanup
-from . import interface
-from . import jsfile
-from ..fixtures import replicaset
-from ... import errors
+from buildscripts.resmokelib import errors
+from buildscripts.resmokelib.testing.fixtures import interface as fixture_interface
+from buildscripts.resmokelib.testing.fixtures import replicaset
+from buildscripts.resmokelib.testing.hooks import cleanup
+from buildscripts.resmokelib.testing.hooks import interface
+from buildscripts.resmokelib.testing.hooks import jsfile
 
 
 class BackgroundInitialSync(interface.Hook):
@@ -50,7 +50,7 @@ class BackgroundInitialSync(interface.Hook):
         self.tests_run += 1
 
         hook_test_case = BackgroundInitialSyncTestCase.create_after_test(
-            self.logger.test_case_logger, test, self, self._shell_options)
+            self.logger, test, self, self._shell_options)
         hook_test_case.configure(self.fixture)
         hook_test_case.run_dynamic_test(test_report)
 
@@ -73,12 +73,15 @@ class BackgroundInitialSyncTestCase(jsfile.DynamicJSTestCase):
 
         # If it's been 'n' tests so far, wait for the initial sync node to finish syncing.
         if self._hook.tests_run >= self._hook.n:
-            self.logger.info("%d tests have been run against the fixture, waiting for initial sync"
-                             " node to go into SECONDARY state", self._hook.tests_run)
+            self.logger.info(
+                "%d tests have been run against the fixture, waiting for initial sync"
+                " node to go into SECONDARY state", self._hook.tests_run)
             self._hook.tests_run = 0
 
-            cmd = bson.SON([("replSetTest", 1), ("waitForMemberState", 2), ("timeoutMillis",
-                                                                            20 * 60 * 1000)])
+            cmd = bson.SON(
+                [("replSetTest", 1), ("waitForMemberState", 2),
+                 ("timeoutMillis",
+                  fixture_interface.ReplFixture.AWAIT_REPL_TIMEOUT_FOREVER_MINS * 60 * 1000)])
             sync_node_conn.admin.command(cmd)
 
         # Check if the initial sync node is in SECONDARY state. If it's been 'n' tests, then it
@@ -86,15 +89,16 @@ class BackgroundInitialSyncTestCase(jsfile.DynamicJSTestCase):
         # Otherwise, we just skip the hook and will check again after the next test.
         try:
             state = sync_node_conn.admin.command("replSetGetStatus").get("myState")
+
             if state != 2:
                 if self._hook.tests_run == 0:
-                    msg = "Initial sync node did not catch up after waiting 20 minutes"
+                    msg = "Initial sync node did not catch up after waiting 24 hours"
                     self.logger.exception("{0} failed: {1}".format(self._hook.description, msg))
                     raise errors.TestFailure(msg)
 
-                self.logger.info("Initial sync node is in state %d, not state SECONDARY (2)."
-                                 " Skipping BackgroundInitialSync hook for %s", state,
-                                 self._base_test_name)
+                self.logger.info(
+                    "Initial sync node is in state %d, not state SECONDARY (2)."
+                    " Skipping BackgroundInitialSync hook for %s", state, self._base_test_name)
 
                 # If we have not restarted initial sync since the last time we ran the data
                 # validation, restart initial sync with a 20% probability.
@@ -167,8 +171,7 @@ class IntermediateInitialSync(interface.Hook):
         if not self._should_run_after_test():
             return
 
-        hook_test_case = IntermediateInitialSyncTestCase.create_after_test(
-            self.logger.test_case_logger, test, self)
+        hook_test_case = IntermediateInitialSyncTestCase.create_after_test(self.logger, test, self)
         hook_test_case.configure(self.fixture)
         hook_test_case.run_dynamic_test(test_report)
 
@@ -197,8 +200,10 @@ class IntermediateInitialSyncTestCase(jsfile.DynamicJSTestCase):
 
         # Do initial sync round.
         self.logger.info("Waiting for initial sync node to go into SECONDARY state")
-        cmd = bson.SON([("replSetTest", 1), ("waitForMemberState", 2), ("timeoutMillis",
-                                                                        20 * 60 * 1000)])
+        cmd = bson.SON(
+            [("replSetTest", 1), ("waitForMemberState", 2),
+             ("timeoutMillis",
+              fixture_interface.ReplFixture.AWAIT_REPL_TIMEOUT_FOREVER_MINS * 60 * 1000)])
         sync_node_conn.admin.command(cmd)
 
         # Run data validation and dbhash checking.

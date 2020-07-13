@@ -1,54 +1,68 @@
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/commands/txn_cmds_gen.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/transaction_coordinator_service.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/session_catalog.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/db/transaction_participant.h"
+#include "mongo/db/transaction_validation.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(participantReturnNetworkErrorForAbortAfterExecutingAbortLogic);
+MONGO_FAIL_POINT_DEFINE(participantReturnNetworkErrorForCommitAfterExecutingCommitLogic);
+MONGO_FAIL_POINT_DEFINE(hangBeforeCommitingTxn);
+MONGO_FAIL_POINT_DEFINE(hangBeforeAbortingTxn);
+// TODO SERVER-39704: Remove this fail point once the router can safely retry within a transaction
+// on stale version and snapshot errors.
+MONGO_FAIL_POINT_DEFINE(dontRemoveTxnCoordinatorOnAbort);
 
 class CmdCommitTxn : public BasicCommand {
 public:
     CmdCommitTxn() : BasicCommand("commitTransaction") {}
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kAlways;
+        return AllowedOnSecondary::kNever;
     }
 
     virtual bool adminOnly() const {
@@ -73,28 +87,79 @@ public:
              const std::string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        auto session = OperationContextSession::get(opCtx);
-        uassert(
-            ErrorCodes::CommandFailed, "commitTransaction must be run within a session", session);
+        IDLParserErrorContext ctx("commitTransaction");
+        auto cmd = CommitTransaction::parse(ctx, cmdObj);
 
-        // TODO SERVER-33501 Change this when commitTransaction is retryable.
+        auto txnParticipant = TransactionParticipant::get(opCtx);
+        uassert(ErrorCodes::CommandFailed,
+                "commitTransaction must be run within a transaction",
+                txnParticipant);
+
+        LOGV2_DEBUG(20507,
+                    3,
+                    "Received commitTransaction for transaction with txnNumber "
+                    "{txnNumber} on session {sessionId}",
+                    "Received commitTransaction",
+                    "txnNumber"_attr = opCtx->getTxnNumber(),
+                    "sessionId"_attr = opCtx->getLogicalSessionId()->toBSON());
+
+        // commitTransaction is retryable.
+        if (txnParticipant.transactionIsCommitted()) {
+            // We set the client last op to the last optime observed by the system to ensure that
+            // we wait for the specified write concern on an optime greater than or equal to the
+            // commit oplog entry.
+            auto& replClient = repl::ReplClientInfo::forClient(opCtx->getClient());
+            replClient.setLastOpToSystemLastOpTime(opCtx);
+            if (MONGO_unlikely(
+                    participantReturnNetworkErrorForCommitAfterExecutingCommitLogic.shouldFail())) {
+                uasserted(ErrorCodes::HostUnreachable,
+                          "returning network error because failpoint is on");
+            }
+
+            return true;
+        }
+
         uassert(ErrorCodes::NoSuchTransaction,
                 "Transaction isn't in progress",
-                session->inMultiDocumentTransaction());
+                txnParticipant.transactionIsOpen());
 
-        session->commitTransaction(opCtx);
+        CurOpFailpointHelpers::waitWhileFailPointEnabled(
+            &hangBeforeCommitingTxn, opCtx, "hangBeforeCommitingTxn");
+
+        auto optionalCommitTimestamp = cmd.getCommitTimestamp();
+        if (optionalCommitTimestamp) {
+            // commitPreparedTransaction will throw if the transaction is not prepared.
+            txnParticipant.commitPreparedTransaction(opCtx, optionalCommitTimestamp.get(), {});
+        } else {
+            if (ShardingState::get(opCtx)->canAcceptShardedCommands().isOK() ||
+                serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+                TransactionCoordinatorService::get(opCtx)->cancelIfCommitNotYetStarted(
+                    opCtx, *opCtx->getLogicalSessionId(), *opCtx->getTxnNumber());
+            }
+
+            // commitUnpreparedTransaction will throw if the transaction is prepared.
+            txnParticipant.commitUnpreparedTransaction(opCtx);
+        }
+
+        if (MONGO_unlikely(
+                participantReturnNetworkErrorForCommitAfterExecutingCommitLogic.shouldFail())) {
+            uasserted(ErrorCodes::HostUnreachable,
+                      "returning network error because failpoint is on");
+        }
 
         return true;
     }
 
 } commitTxn;
 
-MONGO_FP_DECLARE(pauseAfterTransactionPrepare);
+static const Status kOnlyTransactionsReadConcernsSupported{
+    ErrorCodes::InvalidOptions, "only read concerns valid in transactions are supported"};
+static const Status kDefaultReadConcernNotPermitted{ErrorCodes::InvalidOptions,
+                                                    "default read concern not permitted"};
 
-// TODO: This is a stub for testing storage prepare functionality.
-class CmdPrepareTxn : public BasicCommand {
+class CmdAbortTxn : public BasicCommand {
 public:
-    CmdPrepareTxn() : BasicCommand("prepareTransaction") {}
+    CmdAbortTxn() : BasicCommand("abortTransaction") {}
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
@@ -108,64 +173,16 @@ public:
         return true;
     }
 
-    std::string help() const override {
-        return "Preprares a transaction. THIS IS A STUB FOR TESTING.";
-    }
-
-    Status checkAuthForOperation(OperationContext* opCtx,
-                                 const std::string& dbname,
-                                 const BSONObj& cmdObj) const override {
-        return Status::OK();
-    }
-
-    bool run(OperationContext* opCtx,
-             const std::string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) override {
-        auto session = OperationContextSession::get(opCtx);
-        uassert(
-            ErrorCodes::CommandFailed, "prepareTransaction must be run within a session", session);
-
-        uassert(ErrorCodes::NoSuchTransaction,
-                "Transaction isn't in progress",
-                session->inMultiDocumentTransaction());
-
-        auto opObserver = opCtx->getServiceContext()->getOpObserver();
-        invariant(opObserver);
-        opObserver->onTransactionPrepare(opCtx);
-
-        // For testing purposes, this command prepares and immediately aborts the transaction,
-        // Running commit after prepare is not allowed yet.
-        // Prepared units of work cannot be released by the session, so we immediately abort here.
-        opCtx->getWriteUnitOfWork()->prepare();
-        // This failpoint will cause readers of prepared documents to return prepare conflicts.
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(pauseAfterTransactionPrepare);
-        session->abortActiveTransaction(opCtx);
-        return true;
-    }
-};
-
-MONGO_INITIALIZER(RegisterPrepareTxnCmd)(InitializerContext* context) {
-    if (getTestCommandsEnabled()) {
-        new CmdPrepareTxn();
-    }
-    return Status::OK();
-}
-
-class CmdAbortTxn : public BasicCommand {
-public:
-    CmdAbortTxn() : BasicCommand("abortTransaction") {}
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kAlways;
-    }
-
-    virtual bool adminOnly() const {
-        return true;
-    }
-
-    bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
+    ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
+                                                 repl::ReadConcernLevel level) const override {
+        // abortTransaction commences running inside a transaction (even though the transaction will
+        // be ended by the time it completes).  Therefore it needs to accept any readConcern which
+        // is valid within a transaction.  However it is not appropriate to apply the default
+        // readConcern, since the readConcern of the transaction (set by the first operation) is
+        // what must apply.
+        return {{!isReadConcernLevelAllowedInTransaction(level),
+                 kOnlyTransactionsReadConcernsSupported},
+                {kDefaultReadConcernNotPermitted}};
     }
 
     std::string help() const override {
@@ -182,16 +199,41 @@ public:
              const std::string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        auto session = OperationContextSession::get(opCtx);
-        uassert(
-            ErrorCodes::CommandFailed, "abortTransaction must be run within a session", session);
+        auto txnParticipant = TransactionParticipant::get(opCtx);
+        uassert(ErrorCodes::CommandFailed,
+                "abortTransaction must be run within a transaction",
+                txnParticipant);
 
-        // TODO SERVER-33501 Change this when abortTransaction is retryable.
+        LOGV2_DEBUG(20508,
+                    3,
+                    "Received abortTransaction for transaction with txnNumber {txnNumber} "
+                    "on session {sessionId}",
+                    "Received abortTransaction",
+                    "txnNumber"_attr = opCtx->getTxnNumber(),
+                    "sessionId"_attr = opCtx->getLogicalSessionId()->toBSON());
+
         uassert(ErrorCodes::NoSuchTransaction,
                 "Transaction isn't in progress",
-                session->inMultiDocumentTransaction());
+                txnParticipant.transactionIsOpen());
 
-        session->abortActiveTransaction(opCtx);
+        CurOpFailpointHelpers::waitWhileFailPointEnabled(
+            &hangBeforeAbortingTxn, opCtx, "hangBeforeAbortingTxn");
+
+        if (!MONGO_unlikely(dontRemoveTxnCoordinatorOnAbort.shouldFail()) &&
+            (ShardingState::get(opCtx)->canAcceptShardedCommands().isOK() ||
+             serverGlobalParams.clusterRole == ClusterRole::ConfigServer)) {
+            TransactionCoordinatorService::get(opCtx)->cancelIfCommitNotYetStarted(
+                opCtx, *opCtx->getLogicalSessionId(), *opCtx->getTxnNumber());
+        }
+
+        txnParticipant.abortTransaction(opCtx);
+
+        if (MONGO_unlikely(
+                participantReturnNetworkErrorForAbortAfterExecutingAbortLogic.shouldFail())) {
+            uasserted(ErrorCodes::HostUnreachable,
+                      "returning network error because failpoint is on");
+        }
+
         return true;
     }
 

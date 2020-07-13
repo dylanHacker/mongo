@@ -1,25 +1,24 @@
-// write_conflict_exception.h
-
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -35,8 +34,11 @@
 #include "mongo/base/string_data.h"
 #include "mongo/db/curop.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
+
+extern FailPoint skipWriteConflictRetries;
 
 /**
  * This is thrown if during a write, two or more operations conflict with each other.
@@ -59,7 +61,7 @@ public:
      * If true, will call printStackTrace on every WriteConflictException created.
      * Can be set via setParameter named traceWriteConflictExceptions.
      */
-    static AtomicBool trace;
+    static AtomicWord<bool> trace;
 
 private:
     void defineOnlyInFinalSubclassToPreventSlicing() final {}
@@ -81,7 +83,8 @@ auto writeConflictRetry(OperationContext* opCtx, StringData opStr, StringData ns
     invariant(opCtx->lockState());
     invariant(opCtx->recoveryUnit());
 
-    if (opCtx->lockState()->inAWriteUnitOfWork()) {
+    if (opCtx->lockState()->inAWriteUnitOfWork() ||
+        MONGO_unlikely(skipWriteConflictRetries.shouldFail())) {
         return f();
     }
 
@@ -90,7 +93,7 @@ auto writeConflictRetry(OperationContext* opCtx, StringData opStr, StringData ns
         try {
             return f();
         } catch (WriteConflictException const&) {
-            ++CurOp::get(opCtx)->debug().writeConflicts;
+            CurOp::get(opCtx)->debug().additiveMetrics.incrementWriteConflicts(1);
             WriteConflictException::logAndBackoff(attempts, opStr, ns);
             ++attempts;
             opCtx->recoveryUnit()->abandonSnapshot();

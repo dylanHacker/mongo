@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -133,7 +134,7 @@ public:
      * The object must have exactly one field which is the value of the point interval.
      */
     static Interval makePointInterval(const BSONObj& obj);
-    static Interval makePointInterval(const std::string& str);
+    static Interval makePointInterval(StringData str);
     static Interval makePointInterval(double d);
 
     /**
@@ -163,6 +164,11 @@ public:
      * Returns an Interval from minKey to maxKey
      */
     static Interval allValues();
+
+    /**
+     * Returns an Interval from minKey to maxKey, preserving the specified inclusion.
+     */
+    static Interval allValuesRespectingInclusion(BoundInclusion bi);
 
     static void translateRegex(const RegexMatchExpression* rme,
                                const IndexEntry& index,
@@ -201,6 +207,46 @@ public:
                                  bool* startKeyInclusive,
                                  BSONObj* endKey,
                                  bool* endKeyInclusive);
+
+    /**
+     * Appends the startKey and endKey of the given "all values" 'interval' (which is either
+     * [MinKey, MaxKey] or [MaxKey, MinKey] interval) to the 'startBob' and 'endBob' respectively,
+     * handling inclusivity of each bound through the relevant '*KeyInclusive' parameter.
+     *
+     * If the 'interval' is not an "all values" interval, does nothing.
+     *
+     * Precondition: startBob and endBob should contain one or more leading intervals which are not
+     * "all values" intervals, to make the constructed interval valid.
+     *
+     * The decision whether to append MinKey or MaxKey value either to startBob or endBob is based
+     * on the interval type (min -> max or max -> min), and inclusivity flags.
+     *
+     * As an example, consider the index {a:1, b:1} and a count for {a: {$gt: 2}}. Our start key
+     * isn't inclusive (as it's $gt: 2) and looks like {"":2} so far. Because {a: 2, b: MaxKey}
+     * sorts *after* any real-world data pair {a: 2, b: anything}, setting it as the start value
+     * ensures that the first index entry we encounter will be the smallest key with a > 2.
+     *
+     * Same logic applies if the end key is not inclusive. Consider the index {a:1, b:1} and a count
+     * for {a: {$lt: 2}}. Our end key isn't inclusive as ($lt: 2) and looks like {"":2} so far.
+     * Because {a: 2, b: MinKey} sorts *before* any real-world data pair {a: 2, b: anything},
+     * setting it as the end value ensures that the final index entry we encounter will be the last
+     * key with a < 2.
+     */
+    static void appendTrailingAllValuesInterval(const Interval& interval,
+                                                bool startKeyInclusive,
+                                                bool endKeyInclusive,
+                                                BSONObjBuilder* startBob,
+                                                BSONObjBuilder* endBob);
+
+private:
+    /**
+     * Performs the heavy lifting for IndexBoundsBuilder::translate().
+     */
+    static void _translatePredicate(const MatchExpression* expr,
+                                    const BSONElement& elt,
+                                    const IndexEntry& index,
+                                    OrderedIntervalList* oilOut,
+                                    BoundsTightness* tightnessOut);
 };
 
 }  // namespace mongo

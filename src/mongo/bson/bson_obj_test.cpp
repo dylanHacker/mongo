@@ -1,28 +1,30 @@
-/*    Copyright 2013 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/bson/bsonelement_comparator.h"
@@ -186,8 +188,16 @@ TEST(BSONObjCompare, NumberLong_Double) {
         const double equal = -9223372036854775808.0;         // 2**63
         const double closestAbove = -9223372036854774784.0;  // -2**63 + epsilon
 
+// VS2017 Doesn't like the tests below, even though we're using static_cast
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4056)  // warning C4056: overflow in floating-point constant arithmetic
+#endif
         invariant(static_cast<double>(minLL) == equal);
         invariant(static_cast<long long>(equal) == minLL);
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
         ASSERT_BSONOBJ_LT(BSON("" << minLL), BSON("" << (minLL + 1)));
 
@@ -627,10 +637,7 @@ TEST(BSONObj, getFields) {
 TEST(BSONObj, getFieldsWithDuplicates) {
     auto e = BSON("a" << 2 << "b"
                       << "3"
-                      << "a"
-                      << 9
-                      << "b"
-                      << 10);
+                      << "a" << 9 << "b" << 10);
     std::array<StringData, 2> fieldNames{"a", "b"};
     std::array<BSONElement, 2> fields;
     e.getFields(fieldNames, &fields);
@@ -673,6 +680,92 @@ TEST(BSONObj, addField) {
 
     // Check that after all this obj is unchanged.
     ASSERT_BSONOBJ_EQ(obj, BSON("a" << 1 << "b" << 2));
+}
+
+TEST(BSONObj, addFieldsWithoutSpecifyingFields) {
+    // New fields are appended to the end in the order in which they appear in the 'from' object.
+    auto obj = BSON("p" << 1 << "q" << 1);
+    auto output = obj.addFields(BSON("a" << 2 << "b" << 2), boost::none);
+    ASSERT_BSONOBJ_EQ(output, BSON("p" << 1 << "q" << 1 << "a" << 2 << "b" << 2));
+
+    // Duplicate fields names are merged at original poistion.
+    obj = BSON("p" << 1 << "q" << 1 << "a" << 1 << "b" << 1);
+    output = obj.addFields(BSON("b" << 2 << "a" << BSON("a" << 2)), boost::none);
+    ASSERT_BSONOBJ_EQ(output, BSON("p" << 1 << "q" << 1 << "a" << BSON("a" << 2) << "b" << 2));
+
+    // New fields are appended to the end while duplicates are merged in place.
+    obj = BSON("p" << 1 << "q" << 1 << "a" << BSON("a" << 1) << "b" << 1);
+    output = obj.addFields(BSON("c" << 2 << "a" << 2), boost::none);
+    ASSERT_BSONOBJ_EQ(output, BSON("p" << 1 << "q" << 1 << "a" << 2 << "b" << 1 << "c" << 2));
+
+    // No fields added when the set is empty
+    obj = BSON("p" << 1);
+    std::set<std::string> emptySet;
+    output = obj.addFields(BSON("q" << 2), emptySet);
+    ASSERT_BSONOBJ_EQ(output, BSON("p" << 1));
+}
+
+TEST(BSONObj, addFields) {
+    // Fields that are not present in the 'from' object are ignored.
+    auto obj = BSON("p" << 1 << "q" << 1);
+    auto output = obj.addFields(BSON("a" << 2 << "b" << BSON("b" << 2)),
+                                boost::optional<std::set<std::string>>({"b", "c"}));
+    ASSERT_BSONOBJ_EQ(output, BSON("p" << 1 << "q" << 1 << "b" << BSON("b" << 2)));
+
+    // Duplicate fields names are merged at original poistion.
+    obj = BSON("p" << 2 << "q" << 2 << "b" << 2);
+    output = obj.addFields(BSON("q" << 1 << "p" << BSON("p" << 1)),
+                           boost::optional<std::set<std::string>>({"q", "p", "b", "c"}));
+    ASSERT_BSONOBJ_EQ(output, BSON("p" << BSON("p" << 1) << "q" << 1 << "b" << 2));
+
+    // New fields are appended to the end, in the order in which they appear in the 'from'
+    // object.
+    obj = BSON("p" << 1 << "q" << 1 << "b" << BSON("a" << 1));
+    output = obj.addFields(BSON("d" << 2 << "b" << 2 << "c" << 2),
+                           boost::optional<std::set<std::string>>({"b", "c", "d"}));
+    ASSERT_BSONOBJ_EQ(output, BSON("p" << 1 << "q" << 1 << "b" << 2 << "d" << 2 << "c" << 2));
+}
+
+TEST(BSONObj, sizeChecks) {
+    auto generateBuffer = [](std::int32_t size) {
+        std::vector<char> buffer(size);
+        DataRange bufferRange(&buffer.front(), &buffer.back());
+        ASSERT_OK(bufferRange.writeNoThrow(LittleEndian<int32_t>(size)));
+
+        return buffer;
+    };
+
+    {
+        // Implicitly assert that BSONObj constructor does not throw
+        // with standard size buffers.
+        auto normalBuffer = generateBuffer(15 * 1024 * 1024);
+        BSONObj obj(normalBuffer.data());
+    }
+
+    // Large buffers cause an exception to be thrown.
+    ASSERT_THROWS_CODE(
+        [&] {
+            auto largeBuffer = generateBuffer(17 * 1024 * 1024);
+            BSONObj obj(largeBuffer.data());
+        }(),
+        DBException,
+        ErrorCodes::BSONObjectTooLarge);
+
+
+    // Assert that the max size can be increased by passing BSONObj a tag type.
+    {
+        auto largeBuffer = generateBuffer(17 * 1024 * 1024);
+        BSONObj obj(largeBuffer.data(), BSONObj::LargeSizeTrait{});
+    }
+
+    // But a size is in fact being enforced.
+    ASSERT_THROWS_CODE(
+        [&]() {
+            auto hugeBuffer = generateBuffer(70 * 1024 * 1024);
+            BSONObj obj(hugeBuffer.data(), BSONObj::LargeSizeTrait{});
+        }(),
+        DBException,
+        ErrorCodes::BSONObjectTooLarge);
 }
 
 }  // unnamed namespace

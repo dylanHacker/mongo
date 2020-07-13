@@ -1,23 +1,24 @@
-/*-
- *    Copyright (C) 2017 MongoDB Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -35,7 +36,7 @@
 #include "mongo/db/matcher/expression_internal_expr_eq.h"
 #include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/expression_tree.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -43,16 +44,28 @@ using CmpOp = ExpressionCompare::CmpOp;
 
 RewriteExpr::RewriteResult RewriteExpr::rewrite(const boost::intrusive_ptr<Expression>& expression,
                                                 const CollatorInterface* collator) {
-    LOG(5) << "Expression prior to rewrite: " << expression->serialize(false);
+    LOGV2_DEBUG(20725,
+                5,
+                "Expression prior to rewrite: {expression}",
+                "Expression prior to rewrite",
+                "expression"_attr = expression->serialize(false));
 
     RewriteExpr rewriteExpr(collator);
     std::unique_ptr<MatchExpression> matchExpression;
 
     if (auto matchTree = rewriteExpr._rewriteExpression(expression)) {
         matchExpression = std::move(matchTree);
-        LOG(5) << "Post-rewrite MatchExpression: " << matchExpression->toString();
+        LOGV2_DEBUG(20726,
+                    5,
+                    "Post-rewrite MatchExpression: {expression}",
+                    "Post-rewrite MatchExpression",
+                    "expression"_attr = matchExpression->debugString());
         matchExpression = MatchExpression::optimize(std::move(matchExpression));
-        LOG(5) << "Post-rewrite/post-optimized MatchExpression: " << matchExpression->toString();
+        LOGV2_DEBUG(20727,
+                    5,
+                    "Post-rewrite/post-optimized MatchExpression: {expression}",
+                    "Post-rewrite/post-optimized MatchExpression",
+                    "expression"_attr = matchExpression->debugString());
     }
 
     return {std::move(matchExpression), std::move(rewriteExpr._matchExprElemStorage)};
@@ -75,7 +88,7 @@ std::unique_ptr<MatchExpression> RewriteExpr::_rewriteExpression(
 std::unique_ptr<MatchExpression> RewriteExpr::_rewriteAndExpression(
     const boost::intrusive_ptr<ExpressionAnd>& currExprNode) {
 
-    auto andMatch = stdx::make_unique<AndMatchExpression>();
+    auto andMatch = std::make_unique<AndMatchExpression>();
 
     for (auto&& child : currExprNode->getOperandList()) {
         if (auto childMatch = _rewriteExpression(child)) {
@@ -93,7 +106,7 @@ std::unique_ptr<MatchExpression> RewriteExpr::_rewriteAndExpression(
 std::unique_ptr<MatchExpression> RewriteExpr::_rewriteOrExpression(
     const boost::intrusive_ptr<ExpressionOr>& currExprNode) {
 
-    auto orMatch = stdx::make_unique<OrMatchExpression>();
+    auto orMatch = std::make_unique<OrMatchExpression>();
     for (auto&& child : currExprNode->getOperandList()) {
         if (auto childExpr = _rewriteExpression(child)) {
             orMatch->add(childExpr.release());
@@ -150,7 +163,7 @@ std::unique_ptr<MatchExpression> RewriteExpr::_buildComparisonMatchExpression(
     invariant(comparisonOp == ExpressionCompare::EQ);
 
     auto eqMatchExpr =
-        stdx::make_unique<InternalExprEqMatchExpression>(fieldAndValue.fieldName(), fieldAndValue);
+        std::make_unique<InternalExprEqMatchExpression>(fieldAndValue.fieldName(), fieldAndValue);
     eqMatchExpr->setCollator(_collator);
 
     return std::move(eqMatchExpr);

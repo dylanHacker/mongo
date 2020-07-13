@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,16 +29,16 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
+#include <memory>
+
 #include "mongo/base/string_data.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/database_version_gen.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/notification.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/string_map.h"
@@ -52,12 +53,79 @@ class OperationContext;
 static constexpr int kMaxNumStaleVersionRetries = 10;
 
 /**
+ * If true, this operation should block behind a catalog cache refresh. Otherwise, the operation
+ * will block skip the catalog cache refresh.
+ */
+extern const OperationContext::Decoration<bool> operationShouldBlockBehindCatalogCacheRefresh;
+
+/**
+ * Constructed exclusively by the CatalogCache, contains a reference to the cached information for
+ * the specified database.
+ */
+class CachedDatabaseInfo {
+public:
+    const ShardId& primaryId() const;
+    std::shared_ptr<Shard> primary() const {
+        return _primaryShard;
+    };
+
+    bool shardingEnabled() const;
+    DatabaseVersion databaseVersion() const;
+
+private:
+    friend class CatalogCache;
+    CachedDatabaseInfo(DatabaseType dbt, std::shared_ptr<Shard> primaryShard);
+
+    DatabaseType _dbt;
+    std::shared_ptr<Shard> _primaryShard;
+};
+
+/**
+ * Constructed exclusively by the CatalogCache.
+ *
+ * This RoutingInfo can be considered a "package" of routing info for the database and for the
+ * collection. Once unsharded collections are treated as sharded collections with a single chunk,
+ * they will also have a ChunkManager with a "chunk distribution." At that point, this "package" can
+ * be dismantled: routing for commands that route by database can directly retrieve the
+ * CachedDatabaseInfo, while routing for commands that route by collection can directly retrieve the
+ * ChunkManager.
+ */
+class CachedCollectionRoutingInfo {
+public:
+    CachedDatabaseInfo db() const {
+        return _db;
+    };
+
+    std::shared_ptr<ChunkManager> cm() const {
+        return _cm;
+    }
+
+private:
+    friend class CatalogCache;
+    friend class CachedDatabaseInfo;
+
+    CachedCollectionRoutingInfo(NamespaceString nss,
+                                CachedDatabaseInfo db,
+                                std::shared_ptr<ChunkManager> cm);
+
+    NamespaceString _nss;
+
+    // Copy of the database's cached info.
+    CachedDatabaseInfo _db;
+
+    // Shared reference to the collection's cached chunk distribution if sharded, otherwise null.
+    // This is a shared reference rather than a copy because the chunk distribution can be large.
+    std::shared_ptr<ChunkManager> _cm;
+};
+
+/**
  * This is the root of the "read-only" hierarchy of cached catalog metadata. It is read only
  * in the sense that it only reads from the persistent store, but never writes to it. Instead
  * writes happen through the ShardingCatalogManager and the cache hierarchy needs to be invalidated.
  */
 class CatalogCache {
-    MONGO_DISALLOW_COPYING(CatalogCache);
+    CatalogCache(const CatalogCache&) = delete;
+    CatalogCache& operator=(const CatalogCache&) = delete;
 
 public:
     CatalogCache(CatalogCacheLoader& cacheLoader);
@@ -104,9 +172,21 @@ public:
 
     /**
      * Same as getCollectionRoutingInfo above, but in addition causes the namespace to be refreshed.
+     *
+     * When forceRefreshFromThisThread is false, it's possible for this call to
+     * join an ongoing refresh from another thread forceRefreshFromThisThread.
+     * forceRefreshFromThisThread checks whether it joined another thread and
+     * then forces it to try again, which is necessary in cases where calls to
+     * getCollectionRoutingInfoWithRefresh must be causally consistent
+     *
+     * TODO: Remove this parameter in favor of using collection creation time +
+     * collection version to decide when a refresh is necessary and provide
+     * proper causal consistency
      */
     StatusWith<CachedCollectionRoutingInfo> getCollectionRoutingInfoWithRefresh(
-        OperationContext* opCtx, const NamespaceString& nss);
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        bool forceRefreshFromThisThread = false);
 
     /**
      * Same as getCollectionRoutingInfoWithRefresh above, but in addition returns a
@@ -114,14 +194,6 @@ public:
      */
     StatusWith<CachedCollectionRoutingInfo> getShardedCollectionRoutingInfoWithRefresh(
         OperationContext* opCtx, const NamespaceString& nss);
-
-    /**
-     * Retuns the routing history table for the collection instead of the chunk manager (the chunk
-     * manager is a part of CachedCollectionRoutingInfo). The chunk manager represents a specific
-     * state at some point in time, on the other hand a routing history table has the whole history.
-     */
-    std::shared_ptr<RoutingTableHistory> getCollectionRoutingTableHistoryNoRefresh(
-        const NamespaceString& nss);
 
     /**
      * Non-blocking method that marks the current cached database entry as needing refresh if the
@@ -138,7 +210,48 @@ public:
      *
      * To be called if using the input routing info caused a StaleShardVersion to be received.
      */
-    void onStaleShardVersion(CachedCollectionRoutingInfo&&);
+    void onStaleShardVersion(CachedCollectionRoutingInfo&&, const ShardId& staleShardId);
+
+    /**
+     * Gets whether this operation should block behind a catalog cache refresh.
+     */
+    static bool getOperationShouldBlockBehindCatalogCacheRefresh(OperationContext* opCtx);
+
+    /**
+     * Sets whether this operation should block behind a catalog cache refresh.
+     */
+    static void setOperationShouldBlockBehindCatalogCacheRefresh(OperationContext* opCtx,
+                                                                 bool shouldBlock);
+
+    /**
+     * Invalidates a single shard for the current collection if the epochs given in the chunk
+     * versions match. Otherwise, invalidates the entire collection, causing any future targetting
+     * requests to block on an upcoming catalog cache refresh.
+     */
+    void invalidateShardOrEntireCollectionEntryForShardedCollection(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        boost::optional<ChunkVersion> wantedVersion,
+        const ChunkVersion& receivedVersion,
+        ShardId shardId);
+
+    /**
+     * Non-blocking method that marks the current collection entry for the namespace as needing
+     * refresh due to an epoch change. Will cause all further targetting attempts for this
+     * namespace to block on a catalog cache refresh.
+     */
+    void onEpochChange(const NamespaceString& nss);
+
+    /**
+     * Throws a StaleConfigException if this catalog cache does not have an entry for the given
+     * namespace, or if the entry for the given namespace does not have the same epoch as
+     * 'targetCollectionVersion'. Does not perform any refresh logic. Ignores everything except the
+     * epoch of 'targetCollectionVersion' when performing the check, but needs the entire target
+     * version to throw a StaleConfigException.
+     */
+    void checkEpochOrThrow(const NamespaceString& nss,
+                           ChunkVersion targetCollectionVersion,
+                           const ShardId& shardId) const;
 
     /**
      * Non-blocking method, which indiscriminately causes the database entry for the specified
@@ -147,10 +260,24 @@ public:
     void invalidateDatabaseEntry(const StringData dbName);
 
     /**
-     * Non-blocking method, which indiscriminately causes the routing table for the specified
-     * namespace to be refreshed the next time getCollectionRoutingInfo is called.
+     * Non-blocking method, which invalidates the shard for the routing table for the specified
+     * namespace. If that shard is targetted in the future, getCollectionRoutingInfo will wait on a
+     * refresh.
      */
-    void invalidateShardedCollection(const NamespaceString& nss);
+    void invalidateShardForShardedCollection(const NamespaceString& nss,
+                                             const ShardId& staleShardId);
+
+    /**
+     * Non-blocking method, which invalidates all namespaces which contain data on the specified
+     * shard and all databases which have the shard listed as their primary shard.
+     */
+    void invalidateEntriesThatReferenceShard(const ShardId& shardId);
+
+    /**
+     * Non-blocking method, which removes the entire specified collection from the cache (resulting
+     * in full refresh on subsequent access)
+     */
+    void purgeCollection(const NamespaceString& nss);
 
     /**
      * Non-blocking method, which removes the entire specified database (including its collections)
@@ -169,6 +296,12 @@ public:
      */
     void report(BSONObjBuilder* builder) const;
 
+    /**
+     * Checks if the current operation was ever marked as needing refresh. If the curent operation
+     * was marked as needing refresh, updates the relevant counters inside the Stats struct.
+     */
+    void checkAndRecordOperationBlockedByRefresh(OperationContext* opCtx, mongo::LogicalOp opType);
+
 private:
     // Make the cache entries friends so they can access the private classes below
     friend class CachedDatabaseInfo;
@@ -178,9 +311,18 @@ private:
      * Cache entry describing a collection.
      */
     struct CollectionRoutingInfoEntry {
+        CollectionRoutingInfoEntry() = default;
+        // Disable copy (and move) semantics
+        CollectionRoutingInfoEntry(const CollectionRoutingInfoEntry&) = delete;
+        CollectionRoutingInfoEntry& operator=(const CollectionRoutingInfoEntry&) = delete;
+
         // Specifies whether this cache entry needs a refresh (in which case routingInfo should not
         // be relied on) or it doesn't, in which case there should be a non-null routingInfo.
         bool needsRefresh{true};
+
+        // Specifies whether the namespace has had an epoch change, which indicates that every
+        // shard should block on an upcoming refresh.
+        bool epochHasChanged{true};
 
         // Contains a notification to be waited on for the refresh to complete (only available if
         // needsRefresh is true)
@@ -198,9 +340,21 @@ private:
         // unset if the cache entry has never been loaded, or should not be relied on).
         bool needsRefresh{true};
 
+        // Contains a notification to be waited on for the refresh to complete (only available if
+        // needsRefresh is true)
+        std::shared_ptr<Notification<Status>> refreshCompletionNotification;
+
         // Contains the cached info about the database (only available if needsRefresh is false)
         boost::optional<DatabaseType> dbt;
     };
+
+    /**
+     * Non-blocking call which schedules an asynchronous refresh for the specified database. The
+     * database entry must be in the 'needsRefresh' state.
+     */
+    void _scheduleDatabaseRefresh(WithLock,
+                                  const std::string& dbName,
+                                  std::shared_ptr<DatabaseInfoEntry> dbEntry);
 
     /**
      * Non-blocking call which schedules an asynchronous refresh for the specified namespace. The
@@ -211,7 +365,75 @@ private:
                                     NamespaceString const& nss,
                                     int refreshAttempt);
 
-    StatusWith<CachedCollectionRoutingInfo> _getCollectionRoutingInfoAt(
+    /**
+     * Marks a collection entry as needing refresh. Will create the collection entry if one does
+     * not exist. Also marks the epoch as changed, which will cause all further targetting requests
+     * against this namespace to block upon a catalog cache refresh.
+     */
+    void _createOrGetCollectionEntryAndMarkEpochStale(const NamespaceString& nss);
+
+    /**
+     * Marks a collection entry as needing refresh. Will create the collection entry if one does
+     * not exist. Will mark the given shard ID as stale, which will cause all further targetting
+     * requests for the given shard for this namespace to block upon a catalog cache refresh.
+     */
+    void _createOrGetCollectionEntryAndMarkShardStale(const NamespaceString& nss,
+                                                      const ShardId& shardId);
+
+    /**
+     * Marks a collection entry as needing refresh. Will create the collection entry if one does
+     * not exist.
+     */
+    void _createOrGetCollectionEntryAndMarkAsNeedsRefresh(const NamespaceString& nss);
+
+    /**
+     * Retrieves the collection entry for the given namespace, creating the entry if one does not
+     * already exist.
+     */
+    std::shared_ptr<CollectionRoutingInfoEntry> _createOrGetCollectionEntry(
+        WithLock wl, const NamespaceString& nss);
+
+    /**
+     * Used as a flag to indicate whether or not this thread performed its own
+     * refresh for certain helper functions
+     *
+     * kPerformedRefresh is used only when the calling thread performed the
+     * refresh *itself*
+     *
+     * kDidNotPerformRefresh is used either when there was an error or when
+     * this thread joined an ongoing refresh
+     */
+    enum class RefreshAction {
+        kPerformedRefresh,
+        kDidNotPerformRefresh,
+    };
+
+    /**
+     * Return type for helper functions performing refreshes so that they can
+     * indicate both status and whether or not this thread performed its own
+     * refresh
+     */
+    struct RefreshResult {
+        // Status containing result of refresh
+        StatusWith<CachedCollectionRoutingInfo> statusWithInfo;
+        RefreshAction actionTaken;
+    };
+
+    /**
+     * Retrieves the collection routing info for this namespace after blocking on a catalog cache
+     * refresh.
+     */
+    CatalogCache::RefreshResult _getCollectionRoutingInfoWithForcedRefresh(
+        OperationContext* opctx, const NamespaceString& nss);
+
+    /**
+     * Helper function used when we need the refresh action taken (e.g. when we
+     * want to force refresh)
+     */
+    CatalogCache::RefreshResult _getCollectionRoutingInfo(OperationContext* opCtx,
+                                                          const NamespaceString& nss);
+
+    CatalogCache::RefreshResult _getCollectionRoutingInfoAt(
         OperationContext* opCtx,
         const NamespaceString& nss,
         boost::optional<Timestamp> atClusterTime);
@@ -223,28 +445,40 @@ private:
     struct Stats {
         // Counts how many times threads hit stale config exception (which is what triggers metadata
         // refreshes)
-        AtomicInt64 countStaleConfigErrors{0};
+        AtomicWord<long long> countStaleConfigErrors{0};
 
         // Cumulative, always-increasing counter of how much time threads waiting for refresh
         // combined
-        AtomicInt64 totalRefreshWaitTimeMicros{0};
+        AtomicWord<long long> totalRefreshWaitTimeMicros{0};
 
         // Tracks how many incremental refreshes are waiting to complete currently
-        AtomicInt64 numActiveIncrementalRefreshes{0};
+        AtomicWord<long long> numActiveIncrementalRefreshes{0};
 
         // Cumulative, always-increasing counter of how many incremental refreshes have been kicked
         // off
-        AtomicInt64 countIncrementalRefreshesStarted{0};
+        AtomicWord<long long> countIncrementalRefreshesStarted{0};
 
         // Tracks how many full refreshes are waiting to complete currently
-        AtomicInt64 numActiveFullRefreshes{0};
+        AtomicWord<long long> numActiveFullRefreshes{0};
 
         // Cumulative, always-increasing counter of how many full refreshes have been kicked off
-        AtomicInt64 countFullRefreshesStarted{0};
+        AtomicWord<long long> countFullRefreshesStarted{0};
 
         // Cumulative, always-increasing counter of how many full or incremental refreshes failed
         // for whatever reason
-        AtomicInt64 countFailedRefreshes{0};
+        AtomicWord<long long> countFailedRefreshes{0};
+
+        // Cumulative, always-increasing counter of how many operations have been blocked by a
+        // catalog cache refresh. Broken down by operation type to match the operations tracked
+        // by the OpCounters class.
+        struct OperationsBlockedByRefresh {
+            AtomicWord<long long> countAllOperations{0};
+            AtomicWord<long long> countInserts{0};
+            AtomicWord<long long> countQueries{0};
+            AtomicWord<long long> countUpdates{0};
+            AtomicWord<long long> countDeletes{0};
+            AtomicWord<long long> countCommands{0};
+        } operationsBlockedByRefresh;
 
         /**
          * Reports the accumulated statistics for serverStatus.
@@ -258,72 +492,12 @@ private:
     using CollectionsByDbMap = StringMap<CollectionInfoMap>;
 
     // Mutex to serialize access to the structures below
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("CatalogCache::_mutex");
 
     // Map from DB name to the info for that database
     DatabaseInfoMap _databases;
     // Map from full collection name to the routing info for that collection, grouped by database
     CollectionsByDbMap _collectionsByDb;
-};
-
-/**
- * Constructed exclusively by the CatalogCache, contains a reference to the cached information for
- * the specified database.
- */
-class CachedDatabaseInfo {
-public:
-    const ShardId& primaryId() const;
-    std::shared_ptr<Shard> primary() const {
-        return _primaryShard;
-    };
-
-    bool shardingEnabled() const;
-    boost::optional<DatabaseVersion> databaseVersion() const;
-
-private:
-    friend class CatalogCache;
-    CachedDatabaseInfo(DatabaseType dbt, std::shared_ptr<Shard> primaryShard);
-
-    DatabaseType _dbt;
-    std::shared_ptr<Shard> _primaryShard;
-};
-
-/**
- * Constructed exclusively by the CatalogCache.
- *
- * This RoutingInfo can be considered a "package" of routing info for the database and for the
- * collection. Once unsharded collections are treated as sharded collections with a single chunk,
- * they will also have a ChunkManager with a "chunk distribution." At that point, this "package" can
- * be dismantled: routing for commands that route by database can directly retrieve the
- * CachedDatabaseInfo, while routing for commands that route by collection can directly retrieve the
- * ChunkManager.
- */
-class CachedCollectionRoutingInfo {
-public:
-    CachedDatabaseInfo db() const {
-        return _db;
-    };
-
-    std::shared_ptr<ChunkManager> cm() const {
-        return _cm;
-    }
-
-private:
-    friend class CatalogCache;
-    friend class CachedDatabaseInfo;
-
-    CachedCollectionRoutingInfo(NamespaceString nss,
-                                CachedDatabaseInfo db,
-                                std::shared_ptr<ChunkManager> cm);
-
-    NamespaceString _nss;
-
-    // Copy of the database's cached info.
-    CachedDatabaseInfo _db;
-
-    // Shared reference to the collection's cached chunk distribution if sharded, otherwise null.
-    // This is a shared reference rather than a copy because the chunk distribution can be large.
-    std::shared_ptr<ChunkManager> _cm;
 };
 
 }  // namespace mongo

@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -42,10 +43,10 @@ namespace mongo {
 namespace {
 
 using SetNodeTest = UpdateNodeTest;
-using mongo::mutablebson::Element;
 using mongo::mutablebson::countChildren;
+using mongo::mutablebson::Element;
 
-DEATH_TEST(SetNodeTest, InitFailsForEmptyElement, "Invariant failure modExpr.ok()") {
+DEATH_TEST_REGEX(SetNodeTest, InitFailsForEmptyElement, R"#(Invariant failure.*modExpr.ok\(\))#") {
     auto update = fromjson("{$set: {}}");
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     SetNode node;
@@ -68,12 +69,13 @@ TEST_F(SetNodeTest, ApplyNoOp) {
     mutablebson::Document doc(fromjson("{a: 5}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 5}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyEmptyPathToCreate) {
@@ -85,12 +87,13 @@ TEST_F(SetNodeTest, ApplyEmptyPathToCreate) {
     mutablebson::Document doc(fromjson("{a: 5}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 6}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: 6}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyCreatePath) {
@@ -103,12 +106,13 @@ TEST_F(SetNodeTest, ApplyCreatePath) {
     setPathToCreate("b.c");
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {d: 5, b: {c: 6}}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {'a.b.c': 6}}"), getLogDoc());
+    ASSERT_EQUALS("{a.b.c}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyCreatePathFromRoot) {
@@ -120,12 +124,13 @@ TEST_F(SetNodeTest, ApplyCreatePathFromRoot) {
     mutablebson::Document doc(fromjson("{c: 5}"));
     setPathToCreate("a.b");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()));
+    auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{c: 5, a: {b: 6}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {'a.b': 6}}"), getLogDoc());
+    ASSERT_EQUALS("{a.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyPositional) {
@@ -138,12 +143,13 @@ TEST_F(SetNodeTest, ApplyPositional) {
     setPathTaken("a.1");
     setMatchedField("1");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"][1]));
+    auto result = node.apply(getApplyParams(doc.root()["a"][1]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [0, 6, 2]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {'a.1': 6}}"), getLogDoc());
+    ASSERT_EQUALS("{a.1}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyNonViablePathToCreate) {
@@ -156,10 +162,11 @@ TEST_F(SetNodeTest, ApplyNonViablePathToCreate) {
     setPathToCreate("b");
     setPathTaken("a");
     addIndexedPath("a");
-    ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root()["a"])),
-                                AssertionException,
-                                ErrorCodes::PathNotViable,
-                                "Cannot create field 'b' in element {a: 5}");
+    ASSERT_THROWS_CODE_AND_WHAT(
+        node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams()),
+        AssertionException,
+        ErrorCodes::PathNotViable,
+        "Cannot create field 'b' in element {a: 5}");
 }
 
 TEST_F(SetNodeTest, ApplyNonViablePathToCreateFromReplicationIsNoOp) {
@@ -173,12 +180,13 @@ TEST_F(SetNodeTest, ApplyNonViablePathToCreateFromReplicationIsNoOp) {
     setPathTaken("a");
     addIndexedPath("a");
     setFromOplogApplication(true);
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 5}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+    ASSERT_EQUALS("{a.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyNoIndexDataNoLogBuilder) {
@@ -190,11 +198,12 @@ TEST_F(SetNodeTest, ApplyNoIndexDataNoLogBuilder) {
     mutablebson::Document doc(fromjson("{a: 5}"));
     setPathTaken("a");
     setLogBuilderToNull();
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 6}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyDoesNotAffectIndexes) {
@@ -206,11 +215,12 @@ TEST_F(SetNodeTest, ApplyDoesNotAffectIndexes) {
     mutablebson::Document doc(fromjson("{a: 5}"));
     setPathTaken("a");
     addIndexedPath("b");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 6}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, TypeChangeIsNotANoop) {
@@ -222,11 +232,12 @@ TEST_F(SetNodeTest, TypeChangeIsNotANoop) {
     mutablebson::Document doc(fromjson("{a: NumberInt(2)}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: NumberLong(2)}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, IdentityOpOnDeserializedIsNotANoOp) {
@@ -242,11 +253,12 @@ TEST_F(SetNodeTest, IdentityOpOnDeserializedIsNotANoOp) {
 
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b : NumberInt(2)}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyEmptyDocument) {
@@ -258,11 +270,12 @@ TEST_F(SetNodeTest, ApplyEmptyDocument) {
     mutablebson::Document doc(fromjson("{}"));
     setPathToCreate("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()));
+    auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 2}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyInPlace) {
@@ -274,11 +287,12 @@ TEST_F(SetNodeTest, ApplyInPlace) {
     mutablebson::Document doc(fromjson("{a: 1}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 2}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyOverridePath) {
@@ -290,11 +304,12 @@ TEST_F(SetNodeTest, ApplyOverridePath) {
     mutablebson::Document doc(fromjson("{a: {b: 1}}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 2}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyChangeType) {
@@ -306,11 +321,12 @@ TEST_F(SetNodeTest, ApplyChangeType) {
     mutablebson::Document doc(fromjson("{a: 'str'}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 2}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyNewPath) {
@@ -322,11 +338,12 @@ TEST_F(SetNodeTest, ApplyNewPath) {
     mutablebson::Document doc(fromjson("{b: 1}"));
     setPathToCreate("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()));
+    auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{b: 1, a: 2}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyLog) {
@@ -337,11 +354,12 @@ TEST_F(SetNodeTest, ApplyLog) {
 
     mutablebson::Document doc(fromjson("{a: 1}"));
     setPathTaken("a");
-    node.apply(getApplyParams(doc.root()["a"]));
+    node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_EQUALS(fromjson("{a: 2}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(countChildren(getLogDoc().root()), 1u);
     ASSERT_EQUALS(fromjson("{$set: {a: 2}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyNoOpDottedPath) {
@@ -353,11 +371,12 @@ TEST_F(SetNodeTest, ApplyNoOpDottedPath) {
     mutablebson::Document doc(fromjson("{a: {b: 2}}"));
     setPathTaken("a.b");
     addIndexedPath("a.b");
-    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b : 2}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, TypeChangeOnDottedPathIsNotANoOp) {
@@ -369,11 +388,12 @@ TEST_F(SetNodeTest, TypeChangeOnDottedPathIsNotANoOp) {
     mutablebson::Document doc(fromjson("{a: {b: NumberLong(2)}}"));
     setPathTaken("a.b");
     addIndexedPath("a.b");
-    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b : NumberLong(2)}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyPathNotViable) {
@@ -385,10 +405,11 @@ TEST_F(SetNodeTest, ApplyPathNotViable) {
     mutablebson::Document doc(fromjson("{a:1}"));
     setPathToCreate("b");
     setPathTaken("a");
-    ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root()["a"])),
-                                AssertionException,
-                                ErrorCodes::PathNotViable,
-                                "Cannot create field 'b' in element {a: 1}");
+    ASSERT_THROWS_CODE_AND_WHAT(
+        node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams()),
+        AssertionException,
+        ErrorCodes::PathNotViable,
+        "Cannot create field 'b' in element {a: 1}");
 }
 
 TEST_F(SetNodeTest, ApplyPathNotViableArrray) {
@@ -400,10 +421,11 @@ TEST_F(SetNodeTest, ApplyPathNotViableArrray) {
     mutablebson::Document doc(fromjson("{a:[{b:1}]}"));
     setPathToCreate("b");
     setPathTaken("a");
-    ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root()["a"])),
-                                AssertionException,
-                                ErrorCodes::PathNotViable,
-                                "Cannot create field 'b' in element {a: [ { b: 1 } ]}");
+    ASSERT_THROWS_CODE_AND_WHAT(
+        node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams()),
+        AssertionException,
+        ErrorCodes::PathNotViable,
+        "Cannot create field 'b' in element {a: [ { b: 1 } ]}");
 }
 
 TEST_F(SetNodeTest, ApplyInPlaceDottedPath) {
@@ -415,11 +437,12 @@ TEST_F(SetNodeTest, ApplyInPlaceDottedPath) {
     mutablebson::Document doc(fromjson("{a: {b: 1}}"));
     setPathTaken("a.b");
     addIndexedPath("a.b");
-    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: 2}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyChangeTypeDottedPath) {
@@ -431,11 +454,12 @@ TEST_F(SetNodeTest, ApplyChangeTypeDottedPath) {
     mutablebson::Document doc(fromjson("{a: {b: 'str'}}"));
     setPathTaken("a.b");
     addIndexedPath("a.b");
-    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: 2}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyChangePath) {
@@ -447,11 +471,12 @@ TEST_F(SetNodeTest, ApplyChangePath) {
     mutablebson::Document doc(fromjson("{a: {b: {c: 1}}}"));
     setPathTaken("a.b");
     addIndexedPath("a.b");
-    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: 2}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyExtendPath) {
@@ -464,11 +489,12 @@ TEST_F(SetNodeTest, ApplyExtendPath) {
     setPathToCreate("b");
     setPathTaken("a");
     addIndexedPath("a.b");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {c: 1, b: 2}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyNewDottedPath) {
@@ -480,11 +506,12 @@ TEST_F(SetNodeTest, ApplyNewDottedPath) {
     mutablebson::Document doc(fromjson("{c: 1}"));
     setPathToCreate("a.b");
     addIndexedPath("a.b");
-    auto result = node.apply(getApplyParams(doc.root()));
+    auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{c: 1, a: {b: 2}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyEmptyDoc) {
@@ -496,11 +523,12 @@ TEST_F(SetNodeTest, ApplyEmptyDoc) {
     mutablebson::Document doc(fromjson("{}"));
     setPathToCreate("a.b");
     addIndexedPath("a.b");
-    auto result = node.apply(getApplyParams(doc.root()));
+    auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: 2}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyFieldWithDot) {
@@ -512,11 +540,12 @@ TEST_F(SetNodeTest, ApplyFieldWithDot) {
     mutablebson::Document doc(fromjson("{'a.b':4}"));
     setPathToCreate("a.b");
     addIndexedPath("a.b");
-    auto result = node.apply(getApplyParams(doc.root()));
+    auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{'a.b':4, a: {b: 2}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyNoOpArrayIndex) {
@@ -528,11 +557,12 @@ TEST_F(SetNodeTest, ApplyNoOpArrayIndex) {
     mutablebson::Document doc(fromjson("{a: [{b: 0},{b: 1},{b: 2}]}"));
     setPathTaken("a.2.b");
     addIndexedPath("a.2.b");
-    auto result = node.apply(getApplyParams(doc.root()["a"][2]["b"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"][2]["b"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [{b: 0},{b: 1},{b: 2}]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a.2.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, TypeChangeInArrayIsNotANoOp) {
@@ -544,11 +574,12 @@ TEST_F(SetNodeTest, TypeChangeInArrayIsNotANoOp) {
     mutablebson::Document doc(fromjson("{a: [{b: 0},{b: 1},{b: 2.0}]}"));
     setPathTaken("a.2.b");
     addIndexedPath("a.2.b");
-    auto result = node.apply(getApplyParams(doc.root()["a"][2]["b"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"][2]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [{b: 0},{b: 1},{b: NumberInt(2)}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a.2.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyNonViablePath) {
@@ -560,10 +591,11 @@ TEST_F(SetNodeTest, ApplyNonViablePath) {
     mutablebson::Document doc(fromjson("{a: 0}"));
     setPathToCreate("2.b");
     setPathTaken("a");
-    ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root()["a"])),
-                                AssertionException,
-                                ErrorCodes::PathNotViable,
-                                "Cannot create field '2' in element {a: 0}");
+    ASSERT_THROWS_CODE_AND_WHAT(
+        node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams()),
+        AssertionException,
+        ErrorCodes::PathNotViable,
+        "Cannot create field '2' in element {a: 0}");
 }
 
 TEST_F(SetNodeTest, ApplyInPlaceArrayIndex) {
@@ -575,11 +607,12 @@ TEST_F(SetNodeTest, ApplyInPlaceArrayIndex) {
     mutablebson::Document doc(fromjson("{a: [{b: 0},{b: 1},{b: 1}]}"));
     setPathTaken("a.2.b");
     addIndexedPath("a.2.b");
-    auto result = node.apply(getApplyParams(doc.root()["a"][2]["b"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"][2]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [{b: 0},{b: 1},{b: 2}]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a.2.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyNormalArray) {
@@ -592,11 +625,12 @@ TEST_F(SetNodeTest, ApplyNormalArray) {
     setPathToCreate("2.b");
     setPathTaken("a");
     addIndexedPath("a.2.b");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [{b: 0},{b: 1},{b: 2}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyPaddingArray) {
@@ -609,11 +643,12 @@ TEST_F(SetNodeTest, ApplyPaddingArray) {
     setPathToCreate("2.b");
     setPathTaken("a");
     addIndexedPath("a.2.b");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [{b: 0},null,{b: 2}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyNumericObject) {
@@ -626,11 +661,12 @@ TEST_F(SetNodeTest, ApplyNumericObject) {
     setPathToCreate("2.b");
     setPathTaken("a");
     addIndexedPath("a.2.b");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: 0, '2': {b: 2}}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a.2.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyNumericField) {
@@ -642,11 +678,12 @@ TEST_F(SetNodeTest, ApplyNumericField) {
     mutablebson::Document doc(fromjson("{a: {'2': {b: 1}}}"));
     setPathTaken("a.2.b");
     addIndexedPath("a.2.b");
-    auto result = node.apply(getApplyParams(doc.root()["a"]["2"]["b"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]["2"]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {'2': {b: 2}}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a.2.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyExtendNumericField) {
@@ -659,11 +696,12 @@ TEST_F(SetNodeTest, ApplyExtendNumericField) {
     setPathToCreate("b");
     setPathTaken("a.2");
     addIndexedPath("a.2.b");
-    auto result = node.apply(getApplyParams(doc.root()["a"]["2"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]["2"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {'2': {c: 1, b: 2}}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a.2.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyEmptyObject) {
@@ -676,11 +714,12 @@ TEST_F(SetNodeTest, ApplyEmptyObject) {
     setPathToCreate("2.b");
     setPathTaken("a");
     addIndexedPath("a.2.b");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {'2': {b: 2}}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a.2.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyEmptyArray) {
@@ -693,11 +732,12 @@ TEST_F(SetNodeTest, ApplyEmptyArray) {
     setPathToCreate("2.b");
     setPathTaken("a");
     addIndexedPath("a.2.b");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [null, null, {b: 2}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyLogDottedPath) {
@@ -709,11 +749,12 @@ TEST_F(SetNodeTest, ApplyLogDottedPath) {
     mutablebson::Document doc(fromjson("{a: [{b:0}, {b:1}]}"));
     setPathToCreate("2.b");
     setPathTaken("a");
-    node.apply(getApplyParams(doc.root()["a"]));
+    node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_EQUALS(fromjson("{a: [{b:0}, {b:1}, {b:2}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(countChildren(getLogDoc().root()), 1u);
     ASSERT_EQUALS(fromjson("{$set: {'a.2.b': 2}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, LogEmptyArray) {
@@ -725,11 +766,12 @@ TEST_F(SetNodeTest, LogEmptyArray) {
     mutablebson::Document doc(fromjson("{a: []}"));
     setPathToCreate("2.b");
     setPathTaken("a");
-    node.apply(getApplyParams(doc.root()["a"]));
+    node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_EQUALS(fromjson("{a: [null, null, {b:2}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(countChildren(getLogDoc().root()), 1u);
     ASSERT_EQUALS(fromjson("{$set: {'a.2.b': 2}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, LogEmptyObject) {
@@ -741,11 +783,12 @@ TEST_F(SetNodeTest, LogEmptyObject) {
     mutablebson::Document doc(fromjson("{a: {}}"));
     setPathToCreate("2.b");
     setPathTaken("a");
-    node.apply(getApplyParams(doc.root()["a"]));
+    node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_EQUALS(fromjson("{a: {'2': {b: 2}}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(countChildren(getLogDoc().root()), 1u);
     ASSERT_EQUALS(fromjson("{$set: {'a.2.b': 2}}"), getLogDoc());
+    ASSERT_EQUALS("{a.2.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyNoOpComplex) {
@@ -757,11 +800,12 @@ TEST_F(SetNodeTest, ApplyNoOpComplex) {
     mutablebson::Document doc(fromjson("{a: [{b: {c: 0, d: 0}}, {b: {c: 1, d: 1}}]}}"));
     setPathTaken("a.1.b");
     addIndexedPath("a.1.b");
-    auto result = node.apply(getApplyParams(doc.root()["a"][1]["b"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"][1]["b"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [{b: {c: 0, d: 0}}, {b: {c: 1, d: 1}}]}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a.1.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplySameStructure) {
@@ -773,11 +817,12 @@ TEST_F(SetNodeTest, ApplySameStructure) {
     mutablebson::Document doc(fromjson("{a: [{b: {c: 0, d: 0}}, {b: {c: 1, xxx: 1}}]}}"));
     setPathTaken("a.1.b");
     addIndexedPath("a.1.b");
-    auto result = node.apply(getApplyParams(doc.root()["a"][1]["b"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"][1]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [{b: {c: 0, d: 0}}, {b: {c: 1, d: 1}}]}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a.1.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, NonViablePathWithoutRepl) {
@@ -789,10 +834,11 @@ TEST_F(SetNodeTest, NonViablePathWithoutRepl) {
     mutablebson::Document doc(fromjson("{a: 1}"));
     setPathToCreate("1.b");
     setPathTaken("a");
-    ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root()["a"])),
-                                AssertionException,
-                                ErrorCodes::PathNotViable,
-                                "Cannot create field '1' in element {a: 1}");
+    ASSERT_THROWS_CODE_AND_WHAT(
+        node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams()),
+        AssertionException,
+        ErrorCodes::PathNotViable,
+        "Cannot create field '1' in element {a: 1}");
 }
 
 TEST_F(SetNodeTest, SingleFieldFromReplication) {
@@ -806,11 +852,12 @@ TEST_F(SetNodeTest, SingleFieldFromReplication) {
     setPathTaken("a");
     addIndexedPath("a.1.b");
     setFromOplogApplication(true);
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{_id:1, a: 1}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a.1.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, SingleFieldNoIdFromReplication) {
@@ -824,11 +871,12 @@ TEST_F(SetNodeTest, SingleFieldNoIdFromReplication) {
     setPathTaken("a");
     addIndexedPath("a.1.b");
     setFromOplogApplication(true);
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 1}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a.1.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, NestedFieldFromReplication) {
@@ -842,11 +890,12 @@ TEST_F(SetNodeTest, NestedFieldFromReplication) {
     setPathTaken("a.a");
     addIndexedPath("a.a.1.b");
     setFromOplogApplication(true);
-    auto result = node.apply(getApplyParams(doc.root()["a"]["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{_id:1, a: {a: 1}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a.a.1.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, DoubleNestedFieldFromReplication) {
@@ -860,11 +909,12 @@ TEST_F(SetNodeTest, DoubleNestedFieldFromReplication) {
     setPathTaken("a.b.c");
     addIndexedPath("a.b.c.d");
     setFromOplogApplication(true);
-    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]["c"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]["c"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{_id:1, a: {b: {c: 1}}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a.b.c.d}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, NestedFieldNoIdFromReplication) {
@@ -878,11 +928,12 @@ TEST_F(SetNodeTest, NestedFieldNoIdFromReplication) {
     setPathTaken("a.a");
     addIndexedPath("a.a.1.b");
     setFromOplogApplication(true);
-    auto result = node.apply(getApplyParams(doc.root()["a"]["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {a: 1}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a.a.1.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ReplayArrayFieldNotAppendedIntermediateFromReplication) {
@@ -896,11 +947,12 @@ TEST_F(SetNodeTest, ReplayArrayFieldNotAppendedIntermediateFromReplication) {
     setPathTaken("a.0");
     addIndexedPath("a.1.b");
     setFromOplogApplication(true);
-    auto result = node.apply(getApplyParams(doc.root()["a"][0]));
+    auto result = node.apply(getApplyParams(doc.root()["a"][0]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{_id: 0, a: [1, {b: [1]}]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a.0.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, Set6) {
@@ -912,13 +964,14 @@ TEST_F(SetNodeTest, Set6) {
     mutablebson::Document doc(fromjson("{_id: 1, r: {a:1, b:2}}"));
     setPathTaken("r.a");
     addIndexedPath("r.a");
-    auto result = node.apply(getApplyParams(doc.root()["r"]["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["r"]["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{_id: 1, r: {a:2, b:2}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(countChildren(getLogDoc().root()), 1u);
     ASSERT_EQUALS(fromjson("{$set: {'r.a': 2}}"), getLogDoc());
+    ASSERT_EQUALS("{r.a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, Set6FromRepl) {
@@ -931,13 +984,14 @@ TEST_F(SetNodeTest, Set6FromRepl) {
     setPathTaken("r.a");
     addIndexedPath("r.a");
     setFromOplogApplication(true);
-    auto result = node.apply(getApplyParams(doc.root()["r"]["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["r"]["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{_id: 1, r: {a:2, b:2} }"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(countChildren(getLogDoc().root()), 1u);
     ASSERT_EQUALS(fromjson("{$set: {'r.a': 2}}"), getLogDoc());
+    ASSERT_EQUALS("{r.a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplySetModToEphemeralDocument) {
@@ -957,7 +1011,7 @@ TEST_F(SetNodeTest, ApplySetModToEphemeralDocument) {
 
     setPathTaken("x");
     addIndexedPath("x");
-    auto result = node.apply(getApplyParams(doc.root()["x"]));
+    auto result = node.apply(getApplyParams(doc.root()["x"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{ x : { a : 100, b : 2 } }"), doc);
@@ -973,7 +1027,7 @@ TEST_F(SetNodeTest, ApplyCannotCreateDollarPrefixedFieldInsideSetElement) {
     mutablebson::Document doc(fromjson("{a: 5}"));
     setPathTaken("a");
     ASSERT_THROWS_CODE_AND_WHAT(
-        node.apply(getApplyParams(doc.root()["a"])),
+        node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams()),
         AssertionException,
         ErrorCodes::DollarPrefixedFieldName,
         "The dollar ($) prefixed field '$bad' in 'a.$bad' is not valid for storage.");
@@ -988,7 +1042,7 @@ TEST_F(SetNodeTest, ApplyCannotCreateDollarPrefixedFieldAtStartOfPath) {
     mutablebson::Document doc(fromjson("{}"));
     setPathToCreate("$bad.a");
     ASSERT_THROWS_CODE_AND_WHAT(
-        node.apply(getApplyParams(doc.root())),
+        node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams()),
         AssertionException,
         ErrorCodes::DollarPrefixedFieldName,
         "The dollar ($) prefixed field '$bad' in '$bad' is not valid for storage.");
@@ -1003,7 +1057,7 @@ TEST_F(SetNodeTest, ApplyCannotCreateDollarPrefixedFieldInMiddleOfPath) {
     mutablebson::Document doc(fromjson("{}"));
     setPathToCreate("a.$bad.b");
     ASSERT_THROWS_CODE_AND_WHAT(
-        node.apply(getApplyParams(doc.root())),
+        node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams()),
         AssertionException,
         ErrorCodes::DollarPrefixedFieldName,
         "The dollar ($) prefixed field '$bad' in 'a.$bad' is not valid for storage.");
@@ -1018,7 +1072,7 @@ TEST_F(SetNodeTest, ApplyCannotCreateDollarPrefixedFieldAtEndOfPath) {
     mutablebson::Document doc(fromjson("{}"));
     setPathToCreate("a.$bad");
     ASSERT_THROWS_CODE_AND_WHAT(
-        node.apply(getApplyParams(doc.root())),
+        node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams()),
         AssertionException,
         ErrorCodes::DollarPrefixedFieldName,
         "The dollar ($) prefixed field '$bad' in 'a.$bad' is not valid for storage.");
@@ -1034,13 +1088,14 @@ TEST_F(SetNodeTest, ApplyCanCreateDollarPrefixedFieldNameWhenValidateForStorageI
     setPathToCreate("$bad");
     addIndexedPath("$bad");
     setValidateForStorage(false);
-    auto result = node.apply(getApplyParams(doc.root()));
+    auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{$bad: 1}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(countChildren(getLogDoc().root()), 1u);
     ASSERT_EQUALS(fromjson("{$set: {$bad: 1}}"), getLogDoc());
+    ASSERT_EQUALS("{$bad}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyCannotOverwriteImmutablePath) {
@@ -1053,7 +1108,7 @@ TEST_F(SetNodeTest, ApplyCannotOverwriteImmutablePath) {
     setPathTaken("a.b");
     addImmutablePath("a.b");
     ASSERT_THROWS_CODE_AND_WHAT(
-        node.apply(getApplyParams(doc.root()["a"]["b"])),
+        node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams()),
         AssertionException,
         ErrorCodes::ImmutableField,
         "Performing an update on the path 'a.b' would modify the immutable field 'a.b'");
@@ -1069,13 +1124,14 @@ TEST_F(SetNodeTest, ApplyCanPerformNoopOnImmutablePath) {
     setPathTaken("a.b");
     addImmutablePath("a.b");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: 2}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(countChildren(getLogDoc().root()), 0u);
     ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+    ASSERT_EQUALS("{a.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyCannotOverwritePrefixToRemoveImmutablePath) {
@@ -1088,7 +1144,7 @@ TEST_F(SetNodeTest, ApplyCannotOverwritePrefixToRemoveImmutablePath) {
     setPathTaken("a");
     addImmutablePath("a.b");
     ASSERT_THROWS_CODE_AND_WHAT(
-        node.apply(getApplyParams(doc.root()["a"])),
+        node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams()),
         AssertionException,
         ErrorCodes::ImmutableField,
         "After applying the update, the immutable field 'a.b' was found to have been removed.");
@@ -1103,11 +1159,12 @@ TEST_F(SetNodeTest, ApplyCannotOverwritePrefixToModifyImmutablePath) {
     mutablebson::Document doc(fromjson("{a: {b: 2}}"));
     setPathTaken("a");
     addImmutablePath("a.b");
-    ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root()["a"])),
-                                AssertionException,
-                                ErrorCodes::ImmutableField,
-                                "After applying the update, the immutable field 'a.b' was found to "
-                                "have been altered to b: 1");
+    ASSERT_THROWS_CODE_AND_WHAT(
+        node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams()),
+        AssertionException,
+        ErrorCodes::ImmutableField,
+        "After applying the update, the immutable field 'a.b' was found to "
+        "have been altered to b: 1");
 }
 
 TEST_F(SetNodeTest, ApplyCanPerformNoopOnPrefixOfImmutablePath) {
@@ -1120,13 +1177,14 @@ TEST_F(SetNodeTest, ApplyCanPerformNoopOnPrefixOfImmutablePath) {
     setPathTaken("a");
     addImmutablePath("a.b");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: 2}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(countChildren(getLogDoc().root()), 0u);
     ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyCanOverwritePrefixToCreateImmutablePath) {
@@ -1139,13 +1197,14 @@ TEST_F(SetNodeTest, ApplyCanOverwritePrefixToCreateImmutablePath) {
     setPathTaken("a");
     addImmutablePath("a.b");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: 2}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(countChildren(getLogDoc().root()), 1u);
     ASSERT_EQUALS(fromjson("{$set: {a: {b: 2}}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyCanOverwritePrefixOfImmutablePathIfNoopOnImmutablePath) {
@@ -1158,13 +1217,14 @@ TEST_F(SetNodeTest, ApplyCanOverwritePrefixOfImmutablePathIfNoopOnImmutablePath)
     setPathTaken("a");
     addImmutablePath("a.b");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: 2, c: 3}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(countChildren(getLogDoc().root()), 1u);
     ASSERT_EQUALS(fromjson("{$set: {a: {b: 2, c: 3}}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyCannotOverwriteSuffixOfImmutablePath) {
@@ -1177,7 +1237,7 @@ TEST_F(SetNodeTest, ApplyCannotOverwriteSuffixOfImmutablePath) {
     setPathTaken("a.b.c");
     addImmutablePath("a.b");
     ASSERT_THROWS_CODE_AND_WHAT(
-        node.apply(getApplyParams(doc.root()["a"]["b"]["c"])),
+        node.apply(getApplyParams(doc.root()["a"]["b"]["c"]), getUpdateNodeApplyParams()),
         AssertionException,
         ErrorCodes::ImmutableField,
         "Performing an update on the path 'a.b.c' would modify the immutable field 'a.b'");
@@ -1193,13 +1253,14 @@ TEST_F(SetNodeTest, ApplyCanPerformNoopOnSuffixOfImmutablePath) {
     setPathTaken("a.b.c");
     addImmutablePath("a.b");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]["c"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]["b"]["c"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: {c: 2}}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(countChildren(getLogDoc().root()), 0u);
     ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+    ASSERT_EQUALS("{a.b.c}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyCannotCreateFieldAtEndOfImmutablePath) {
@@ -1213,7 +1274,7 @@ TEST_F(SetNodeTest, ApplyCannotCreateFieldAtEndOfImmutablePath) {
     setPathTaken("a.b");
     addImmutablePath("a.b");
     ASSERT_THROWS_CODE_AND_WHAT(
-        node.apply(getApplyParams(doc.root()["a"]["b"])),
+        node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams()),
         AssertionException,
         ErrorCodes::ImmutableField,
         "Updating the path 'a.b' to b: { c: 1 } would modify the immutable field 'a.b'");
@@ -1230,7 +1291,7 @@ TEST_F(SetNodeTest, ApplyCannotCreateFieldBeyondEndOfImmutablePath) {
     setPathTaken("a.b");
     addImmutablePath("a");
     ASSERT_THROWS_CODE_AND_WHAT(
-        node.apply(getApplyParams(doc.root()["a"]["b"])),
+        node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams()),
         AssertionException,
         ErrorCodes::ImmutableField,
         "Updating the path 'a.b' to b: { c: 1 } would modify the immutable field 'a'");
@@ -1247,13 +1308,14 @@ TEST_F(SetNodeTest, ApplyCanCreateImmutablePath) {
     setPathTaken("a");
     addImmutablePath("a.b");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: 2}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(countChildren(getLogDoc().root()), 1u);
     ASSERT_EQUALS(fromjson("{$set: {'a.b': 2}}"), getLogDoc());
+    ASSERT_EQUALS("{a.b}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplyCanCreatePrefixOfImmutablePath) {
@@ -1266,13 +1328,14 @@ TEST_F(SetNodeTest, ApplyCanCreatePrefixOfImmutablePath) {
     setPathToCreate("a");
     addImmutablePath("a.b");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()));
+    auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 2}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(countChildren(getLogDoc().root()), 1u);
     ASSERT_EQUALS(fromjson("{$set: {a: 2}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplySetFieldInNonExistentArrayElementAffectsIndexOnSiblingField) {
@@ -1285,13 +1348,14 @@ TEST_F(SetNodeTest, ApplySetFieldInNonExistentArrayElementAffectsIndexOnSiblingF
     setPathToCreate("1.c");
     setPathTaken("a");
     addIndexedPath("a.b");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [{b: 0}, {c: 2}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(countChildren(getLogDoc().root()), 1u);
     ASSERT_EQUALS(fromjson("{$set: {'a.1.c': 2}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplySetFieldInExistingArrayElementDoesNotAffectIndexOnSiblingField) {
@@ -1304,13 +1368,14 @@ TEST_F(SetNodeTest, ApplySetFieldInExistingArrayElementDoesNotAffectIndexOnSibli
     setPathToCreate("c");
     setPathTaken("a.0");
     addIndexedPath("a.b");
-    auto result = node.apply(getApplyParams(doc.root()["a"][0]));
+    auto result = node.apply(getApplyParams(doc.root()["a"][0]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [{b: 0, c: 2}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(countChildren(getLogDoc().root()), 1u);
     ASSERT_EQUALS(fromjson("{$set: {'a.0.c': 2}}"), getLogDoc());
+    ASSERT_EQUALS("{a.0.c}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplySetFieldInNonExistentNumericFieldDoesNotAffectIndexOnSiblingField) {
@@ -1324,13 +1389,14 @@ TEST_F(SetNodeTest, ApplySetFieldInNonExistentNumericFieldDoesNotAffectIndexOnSi
     setPathTaken("a");
     addIndexedPath("a.b");
     addIndexedPath("a.1.b");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {'0': {b: 0}, '1': {c: 2}}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(countChildren(getLogDoc().root()), 1u);
     ASSERT_EQUALS(fromjson("{$set: {'a.1.c': 2}}"), getLogDoc());
+    ASSERT_EQUALS("{a.1.c}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplySetOnInsertIsNoopWhenInsertIsFalse) {
@@ -1342,12 +1408,13 @@ TEST_F(SetNodeTest, ApplySetOnInsertIsNoopWhenInsertIsFalse) {
     mutablebson::Document doc(fromjson("{}"));
     setPathToCreate("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()));
+    auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplySetOnInsertIsAppliedWhenInsertIsTrue) {
@@ -1361,11 +1428,12 @@ TEST_F(SetNodeTest, ApplySetOnInsertIsAppliedWhenInsertIsTrue) {
     setInsert(true);
     addIndexedPath("a");
     setLogBuilderToNull();  // The log builder is null for inserts.
-    auto result = node.apply(getApplyParams(doc.root()));
+    auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 2}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(SetNodeTest, ApplySetOnInsertExistingPath) {
@@ -1379,11 +1447,12 @@ TEST_F(SetNodeTest, ApplySetOnInsertExistingPath) {
     setInsert(true);
     addIndexedPath("a");
     setLogBuilderToNull();  // The log builder is null for inserts.
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 2}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 }  // namespace

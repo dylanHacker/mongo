@@ -2,42 +2,49 @@
 // usernames)
 
 (function() {
-    'use strict';
+'use strict';
 
-    const mongod = MongoRunner.runMongod({auth: ""});
+// This test makes assertions about the number of sessions, which are not compatible with
+// implicit sessions.
+TestData.disableImplicitSessions = true;
 
-    const refresh = {refreshLogicalSessionCacheNow: 1};
-    const startSession = {startSession: 1};
+const mongod = MongoRunner.runMongod({auth: ""});
 
-    const admin = mongod.getDB('admin');
-    const db = mongod.getDB("test");
-    const config = mongod.getDB("config");
+const refresh = {
+    refreshLogicalSessionCacheNow: 1
+};
+const startSession = {
+    startSession: 1
+};
 
-    admin.createUser({user: 'admin', pwd: 'pass', roles: jsTest.adminUserRoles});
-    assert(admin.auth('admin', 'pass'));
+const admin = mongod.getDB('admin');
+const db = mongod.getDB("test");
+const config = mongod.getDB("config");
 
-    const longUserName = "x".repeat(1000);
+admin.createUser({user: 'admin', pwd: 'pass', roles: jsTest.adminUserRoles});
+assert(admin.auth('admin', 'pass'));
 
-    // Create a user with a long name, so that the refresh records have a chance to blow out the
-    // 16MB limit, if all the sessions are flushed in one batch
-    db.createUser({user: longUserName, pwd: 'pass', roles: jsTest.basicUserRoles});
-    admin.logout();
+const longUserName = "x".repeat(1000);
 
-    assert(db.auth(longUserName, 'pass'));
+// Create a user with a long name, so that the refresh records have a chance to blow out the
+// 16MB limit, if all the sessions are flushed in one batch
+db.createUser({user: longUserName, pwd: 'pass', roles: jsTest.basicUserRoles});
+admin.logout();
 
-    // 20k * 1k = 20mb which is greater than 16mb
-    const numSessions = 20000;
-    for (var i = 0; i < numSessions; i++) {
-        assert.commandWorked(admin.runCommand(startSession), "unable to start session");
-    }
+assert(db.auth(longUserName, 'pass'));
 
-    assert.commandWorked(admin.runCommand(refresh), "failed to refresh");
+// 20k * 1k = 20mb which is greater than 16mb
+const numSessions = 20000;
+for (var i = 0; i < numSessions; i++) {
+    assert.commandWorked(admin.runCommand(startSession), "unable to start session");
+}
 
-    // Make sure we actually flushed the sessions
-    assert.eq(numSessions,
-              config.system.sessions.aggregate([{'$listSessions': {}}, {'$count': "count"}])
-                  .next()
-                  .count);
+assert.commandWorked(admin.runCommand(refresh), "failed to refresh");
 
-    MongoRunner.stopMongod(mongod);
+// Make sure we actually flushed the sessions
+assert.eq(
+    numSessions,
+    config.system.sessions.aggregate([{'$listSessions': {}}, {'$count': "count"}]).next().count);
+
+MongoRunner.stopMongod(mongod);
 })();

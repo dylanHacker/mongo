@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,6 +31,7 @@
 
 #include "mongo/s/write_ops/write_op.h"
 
+#include "mongo/s/transaction_router.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -50,56 +52,44 @@ const WriteErrorDetail& WriteOp::getOpError() const {
     return *_error;
 }
 
-Status WriteOp::targetWrites(OperationContext* opCtx,
-                             const NSTargeter& targeter,
-                             std::vector<TargetedWrite*>* targetedWrites) {
-    const bool isIndexInsert = _itemRef.getRequest()->isInsertIndexRequest();
-
-    auto swEndpoints = [&]() -> StatusWith<std::vector<ShardEndpoint>> {
+void WriteOp::targetWrites(OperationContext* opCtx,
+                           const NSTargeter& targeter,
+                           std::vector<TargetedWrite*>* targetedWrites) {
+    auto endpoints = [&] {
         if (_itemRef.getOpType() == BatchedCommandRequest::BatchType_Insert) {
-            if (isIndexInsert) {
-                // TODO: Remove the index targeting stuff once there is a command for it?
-                // TODO: Retry index writes with stale version?
-                return targeter.targetCollection();
-            }
-
-            auto swEndpoint = targeter.targetInsert(opCtx, _itemRef.getDocument());
-            if (!swEndpoint.isOK())
-                return swEndpoint.getStatus();
-
-            return std::vector<ShardEndpoint>{std::move(swEndpoint.getValue())};
+            return std::vector{targeter.targetInsert(opCtx, _itemRef.getDocument())};
         } else if (_itemRef.getOpType() == BatchedCommandRequest::BatchType_Update) {
-            return targeter.targetUpdate(opCtx, _itemRef.getUpdate());
+            return targeter.targetUpdate(opCtx, _itemRef);
         } else if (_itemRef.getOpType() == BatchedCommandRequest::BatchType_Delete) {
-            return targeter.targetDelete(opCtx, _itemRef.getDelete());
-        } else {
-            MONGO_UNREACHABLE;
+            return targeter.targetDelete(opCtx, _itemRef);
         }
+        MONGO_UNREACHABLE;
     }();
 
-    // If we're targeting more than one endpoint with an update/delete, we have to target everywhere
-    // since we cannot currently retry partial results.
+    // Unless executing as part of a transaction, if we're targeting more than one endpoint with an
+    // update/delete, we have to target everywhere since we cannot currently retry partial results.
     //
     // NOTE: Index inserts are currently specially targeted only at the current collection to avoid
     // creating collections everywhere.
-    if (swEndpoints.isOK() && swEndpoints.getValue().size() > 1u && !isIndexInsert) {
-        swEndpoints = targeter.targetAllShards(opCtx);
+    const bool inTransaction = bool(TransactionRouter::get(opCtx));
+    if (endpoints.size() > 1u && !inTransaction) {
+        endpoints = targeter.targetAllShards(opCtx);
     }
 
-    // If we had an error, stop here
-    if (!swEndpoints.isOK())
-        return swEndpoints.getStatus();
-
-    auto& endpoints = swEndpoints.getValue();
-
     for (auto&& endpoint : endpoints) {
+        // If the operation was already successfull on that shard, do not repeat it
+        if (_successfulShardSet.count(endpoint.shardName))
+            continue;
+
         _childOps.emplace_back(this);
 
         WriteOpRef ref(_itemRef.getItemIndex(), _childOps.size() - 1);
 
-        // For now, multiple endpoints imply no versioning - we can't retry half a multi-write
-        if (endpoints.size() > 1u) {
+        // Outside of a transaction, multiple endpoints currently imply no versioning, since we
+        // can't retry half a regular multi-write.
+        if (endpoints.size() > 1u && !inTransaction) {
             endpoint.shardVersion = ChunkVersion::IGNORED();
+            endpoint.shardVersion.canThrowSSVOnIgnored();
         }
 
         targetedWrites->push_back(new TargetedWrite(std::move(endpoint), ref));
@@ -108,8 +98,9 @@ Status WriteOp::targetWrites(OperationContext* opCtx,
         _childOps.back().state = WriteOpState_Pending;
     }
 
-    _state = WriteOpState_Pending;
-    return Status::OK();
+    // If all operations currently targeted were successful on a previous round we might have 0
+    // childOps, that would mean that the operation is finished.
+    _state = _childOps.size() ? WriteOpState_Pending : WriteOpState_Completed;
 }
 
 size_t WriteOp::getNumTargeted() {
@@ -117,14 +108,24 @@ size_t WriteOp::getNumTargeted() {
 }
 
 static bool isRetryErrCode(int errCode) {
-    return errCode == ErrorCodes::StaleShardVersion ||
-        errCode == ErrorCodes::CannotImplicitlyCreateCollection;
+    return errCode == ErrorCodes::StaleShardVersion || errCode == ErrorCodes::StaleDbVersion;
+}
+
+static bool errorsAllSame(const vector<ChildWriteOp const*>& errOps) {
+    auto errCode = errOps.front()->error->toStatus().code();
+    if (std::all_of(++errOps.begin(), errOps.end(), [errCode](const ChildWriteOp* errOp) {
+            return errOp->error->toStatus().code() == errCode;
+        })) {
+        return true;
+    }
+
+    return false;
 }
 
 // Aggregate a bunch of errors for a single op together
 static void combineOpErrors(const vector<ChildWriteOp const*>& errOps, WriteErrorDetail* error) {
-    // Special case single response
-    if (errOps.size() == 1) {
+    // Special case single response or all errors are the same
+    if (errOps.size() == 1 || errorsAllSame(errOps)) {
         errOps.front()->error->cloneTo(error);
         return;
     }
@@ -156,30 +157,38 @@ void WriteOp::_updateOpState() {
     std::vector<ChildWriteOp const*> childErrors;
 
     bool isRetryError = true;
+    bool hasPendingChild = false;
     for (const auto& childOp : _childOps) {
-        // Don't do anything till we have all the info
+        // Don't do anything till we have all the info. Unless we're in a transaction because
+        // we abort aggresively whenever we get an error during a transaction.
         if (childOp.state != WriteOpState_Completed && childOp.state != WriteOpState_Error) {
-            return;
+            hasPendingChild = true;
+
+            if (!_inTxn) {
+                return;
+            }
         }
 
         if (childOp.state == WriteOpState_Error) {
             childErrors.push_back(&childOp);
 
             // Any non-retry error aborts all
-            if (!isRetryErrCode(childOp.error->toStatus().code())) {
+            if (_inTxn || !isRetryErrCode(childOp.error->toStatus().code())) {
                 isRetryError = false;
             }
         }
     }
 
     if (!childErrors.empty() && isRetryError) {
-        // Since we're using broadcast mode for multi-shard writes, which cannot SCE
-        invariant(childErrors.size() == 1u);
         _state = WriteOpState_Ready;
     } else if (!childErrors.empty()) {
         _error.reset(new WriteErrorDetail);
         combineOpErrors(childErrors, _error.get());
         _state = WriteOpState_Error;
+    } else if (hasPendingChild && _inTxn) {
+        // Return early here since this means that there were no errors while in txn
+        // but there are still ops that have not yet finished.
+        return;
     } else {
         _state = WriteOpState_Completed;
     }
@@ -211,7 +220,8 @@ void WriteOp::noteWriteComplete(const TargetedWrite& targetedWrite) {
     const WriteOpRef& ref = targetedWrite.writeOpRef;
     auto& childOp = _childOps[ref.second];
 
-    childOp.pendingWrite = NULL;
+    _successfulShardSet.emplace(targetedWrite.endpoint.shardName);
+    childOp.pendingWrite = nullptr;
     childOp.endpoint.reset(new ShardEndpoint(targetedWrite.endpoint));
     childOp.state = WriteOpState_Completed;
     _updateOpState();
@@ -221,7 +231,7 @@ void WriteOp::noteWriteError(const TargetedWrite& targetedWrite, const WriteErro
     const WriteOpRef& ref = targetedWrite.writeOpRef;
     auto& childOp = _childOps[ref.second];
 
-    childOp.pendingWrite = NULL;
+    childOp.pendingWrite = nullptr;
     childOp.endpoint.reset(new ShardEndpoint(targetedWrite.endpoint));
     childOp.error.reset(new WriteErrorDetail);
     error.cloneTo(childOp.error.get());

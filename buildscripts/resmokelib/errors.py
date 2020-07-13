@@ -18,7 +18,12 @@ class StopExecution(ResmokeError):  # noqa: D204
 
 class UserInterrupt(StopExecution):  # noqa: D204
     """Exception raised when a user signals resmoke.py to unconditionally stop executing tests."""
-    pass
+    EXIT_CODE = 130  # Simulate SIGINT as exit code.
+
+
+class LoggerRuntimeConfigError(StopExecution):  # noqa: D204
+    """Exception raised when a logging handler couldn't be configured at runtime."""
+    EXIT_CODE = 75
 
 
 class TestFailure(ResmokeError):  # noqa: D204
@@ -44,4 +49,23 @@ class PortAllocationError(ResmokeError):  # noqa: D204
     Raised if a port is requested outside of the range of valid ports, or if a
     fixture requests more ports than were reserved for that job.
     """
+    pass
+
+
+class ProcessError(ResmokeError):
+    """Exception raised in the process wrapper.
+
+    Raised if a termination mode is given to the process wrapper that it doesn't
+    know how to send a signal for.
+    """
+
+    pass
+
+
+class UnsafeExitError(ResmokeError):
+    """Exception raised by process test cases.
+
+    Raised if a process terminates in such a way that further test execution may be unsafe.
+    """
+
     pass

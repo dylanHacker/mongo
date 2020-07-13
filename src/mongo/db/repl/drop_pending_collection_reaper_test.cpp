@@ -1,23 +1,24 @@
 /**
- *    Copyright 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,7 +31,7 @@
 
 #include <memory>
 
-#include "mongo/db/catalog/uuid_catalog.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/op_observer_registry.h"
@@ -42,9 +43,8 @@
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/death_test.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace {
 
@@ -74,9 +74,9 @@ protected:
 
 void DropPendingCollectionReaperTest::setUp() {
     ServiceContextMongoDTest::setUp();
-    _storageInterface = stdx::make_unique<StorageInterfaceImpl>();
+    _storageInterface = std::make_unique<StorageInterfaceImpl>();
     auto service = getServiceContext();
-    ReplicationCoordinator::set(service, stdx::make_unique<ReplicationCoordinatorMock>(service));
+    ReplicationCoordinator::set(service, std::make_unique<ReplicationCoordinatorMock>(service));
 }
 
 void DropPendingCollectionReaperTest::tearDown() {
@@ -118,7 +118,7 @@ TEST_F(DropPendingCollectionReaperTest, AddDropPendingNamespaceAcceptsNullDropOp
     OpTime nullDropOpTime;
     auto dpns = NamespaceString("test.foo").makeDropPendingNamespace(nullDropOpTime);
     DropPendingCollectionReaper reaper(_storageInterface.get());
-    reaper.addDropPendingNamespace(nullDropOpTime, dpns);
+    reaper.addDropPendingNamespace(makeOpCtx().get(), nullDropOpTime, dpns);
     ASSERT_EQUALS(nullDropOpTime, *reaper.getEarliestDropOpTime());
 }
 
@@ -134,12 +134,12 @@ TEST_F(DropPendingCollectionReaperTest,
 
     OpTime opTime({Seconds(100), 0}, 1LL);
     auto dpns = NamespaceString("test.foo").makeDropPendingNamespace(opTime);
-    reaper.addDropPendingNamespace(opTime, dpns);
-    reaper.addDropPendingNamespace(opTime,
-                                   NamespaceString("test.bar").makeDropPendingNamespace(opTime));
+    auto opCtx = makeOpCtx();
+    reaper.addDropPendingNamespace(opCtx.get(), opTime, dpns);
+    reaper.addDropPendingNamespace(
+        opCtx.get(), opTime, NamespaceString("test.bar").makeDropPendingNamespace(opTime));
 
     // Drop all collections managed by reaper and confirm number of drops.
-    auto opCtx = makeOpCtx();
     reaper.dropCollectionsOlderThan(opCtx.get(), opTime);
     ASSERT_EQUALS(2U, numCollectionsDropped);
 }
@@ -150,8 +150,9 @@ DEATH_TEST_F(DropPendingCollectionReaperTest,
     OpTime opTime({Seconds(100), 0}, 1LL);
     auto dpns = NamespaceString("test.foo").makeDropPendingNamespace(opTime);
     DropPendingCollectionReaper reaper(_storageInterface.get());
-    reaper.addDropPendingNamespace(opTime, dpns);
-    reaper.addDropPendingNamespace(opTime, dpns);
+    auto opCtx = makeOpCtx();
+    reaper.addDropPendingNamespace(opCtx.get(), opTime, dpns);
+    reaper.addDropPendingNamespace(opCtx.get(), opTime, dpns);
 }
 
 TEST_F(DropPendingCollectionReaperTest,
@@ -176,11 +177,11 @@ TEST_F(DropPendingCollectionReaperTest,
     // getEarliestDropOpTime() returns earliest optime.
     DropPendingCollectionReaper reaper(_storageInterface.get());
     ASSERT_FALSE(reaper.getEarliestDropOpTime());
-    reaper.addDropPendingNamespace(opTime[1], dpns[1]);
-    reaper.addDropPendingNamespace(opTime[0], dpns[0]);
-    reaper.addDropPendingNamespace(opTime[2], dpns[2]);
-    reaper.addDropPendingNamespace(opTime[3], dpns[3]);
-    reaper.addDropPendingNamespace(opTime[4], dpns[4]);
+    reaper.addDropPendingNamespace(opCtx.get(), opTime[1], dpns[1]);
+    reaper.addDropPendingNamespace(opCtx.get(), opTime[0], dpns[0]);
+    reaper.addDropPendingNamespace(opCtx.get(), opTime[2], dpns[2]);
+    reaper.addDropPendingNamespace(opCtx.get(), opTime[3], dpns[3]);
+    reaper.addDropPendingNamespace(opCtx.get(), opTime[4], dpns[4]);
     ASSERT_EQUALS(opTime[0], *reaper.getEarliestDropOpTime());
 
     // Committed optime before first drop optime has no effect.
@@ -215,9 +216,9 @@ TEST_F(DropPendingCollectionReaperTest, DropCollectionsOlderThanHasNoEffectIfCol
     auto dpns = ns.makeDropPendingNamespace(optime);
 
     DropPendingCollectionReaper reaper(_storageInterface.get());
-    reaper.addDropPendingNamespace(optime, dpns);
 
     auto opCtx = makeOpCtx();
+    reaper.addDropPendingNamespace(opCtx.get(), optime, dpns);
     reaper.dropCollectionsOlderThan(opCtx.get(), optime);
 }
 
@@ -230,14 +231,15 @@ TEST_F(DropPendingCollectionReaperTest, DropCollectionsOlderThanLogsDropCollecti
     StorageInterfaceMock storageInterfaceMock;
 
     DropPendingCollectionReaper reaper(&storageInterfaceMock);
-    reaper.addDropPendingNamespace(optime, dpns);
-
     auto opCtx = makeOpCtx();
+
+    reaper.addDropPendingNamespace(opCtx.get(), optime, dpns);
     startCapturingLogMessages();
     reaper.dropCollectionsOlderThan(opCtx.get(), optime);
     stopCapturingLogMessages();
 
-    ASSERT_EQUALS(1LL, countLogLinesContaining("Failed to remove drop-pending collection"));
+    ASSERT_EQUALS(1LL,
+                  countTextFormatLogLinesContaining("Failed to remove drop-pending collection"));
 }
 
 TEST_F(DropPendingCollectionReaperTest,
@@ -252,16 +254,16 @@ TEST_F(DropPendingCollectionReaperTest,
     decltype(dpns) droppedNss;
     bool writesAreReplicatedDuringDrop = true;
     storageInterfaceMock.dropCollFn = [&droppedNss, &writesAreReplicatedDuringDrop](
-        OperationContext* opCtx, const NamespaceString& nss) {
+                                          OperationContext* opCtx, const NamespaceString& nss) {
         droppedNss = nss;
         writesAreReplicatedDuringDrop = opCtx->writesAreReplicated();
         return Status::OK();
     };
 
     DropPendingCollectionReaper reaper(&storageInterfaceMock);
-    reaper.addDropPendingNamespace(optime, dpns);
 
     auto opCtx = makeOpCtx();
+    reaper.addDropPendingNamespace(opCtx.get(), optime, dpns);
     reaper.dropCollectionsOlderThan(opCtx.get(), optime);
 
     ASSERT_EQUALS(dpns, droppedNss);
@@ -286,9 +288,9 @@ TEST_F(DropPendingCollectionReaperTest, RollBackDropPendingCollection) {
     }
 
     DropPendingCollectionReaper reaper(_storageInterface.get());
-    reaper.addDropPendingNamespace(opTime[0], dpns[0]);
-    reaper.addDropPendingNamespace(opTime[1], dpns[1]);
-    reaper.addDropPendingNamespace(opTime[2], dpns[2]);
+    reaper.addDropPendingNamespace(opCtx.get(), opTime[0], dpns[0]);
+    reaper.addDropPendingNamespace(opCtx.get(), opTime[1], dpns[1]);
+    reaper.addDropPendingNamespace(opCtx.get(), opTime[2], dpns[2]);
 
     // Rolling back at an optime not in the list returns false.
     ASSERT_FALSE(
@@ -318,7 +320,7 @@ TEST_F(DropPendingCollectionReaperTest, RollBackDropPendingCollection) {
     NamespaceString ns4 = NamespaceString("test", "coll4");
     NamespaceString dpns4 = ns4.makeDropPendingNamespace(opTime[1]);
     ASSERT_OK(_storageInterface->createCollection(opCtx.get(), dpns4, generateOptionsWithUuid()));
-    reaper.addDropPendingNamespace(opTime[1], dpns4);
+    reaper.addDropPendingNamespace(opCtx.get(), opTime[1], dpns4);
     ASSERT_TRUE(reaper.rollBackDropPendingCollection(opCtx.get(), opTime[1], ns[1]));
     ASSERT_EQUALS(opTime[1], *reaper.getEarliestDropOpTime());
     ASSERT_TRUE(collectionExists(opCtx.get(), dpns[0]));

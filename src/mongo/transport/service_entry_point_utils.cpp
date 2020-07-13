@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,18 +27,21 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/transport/service_entry_point_utils.h"
 
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
+#include <fmt/format.h>
+#include <functional>
+#include <memory>
+
+#include "mongo/logv2/log.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/debug_util.h"
-#include "mongo/util/log.h"
+#include "mongo/util/thread_safety_context.h"
 
 #if !defined(_WIN32)
 #include <sys/resource.h>
@@ -47,18 +51,20 @@
 #define __has_feature(x) 0
 #endif
 
+using namespace fmt::literals;
+
 namespace mongo {
 
 namespace {
 void* runFunc(void* ctx) {
-    std::unique_ptr<stdx::function<void()>> taskPtr(static_cast<stdx::function<void()>*>(ctx));
+    std::unique_ptr<std::function<void()>> taskPtr(static_cast<std::function<void()>*>(ctx));
     (*taskPtr)();
 
     return nullptr;
 }
 }  // namespace
 
-Status launchServiceWorkerThread(stdx::function<void()> task) {
+Status launchServiceWorkerThread(std::function<void()> task) noexcept {
 
     try {
 #if defined(_WIN32)
@@ -82,29 +88,40 @@ Status launchServiceWorkerThread(stdx::function<void()> task) {
             int failed = pthread_attr_setstacksize(&attrs, stackSizeToSet);
             if (failed) {
                 const auto ewd = errnoWithDescription(failed);
-                warning() << "pthread_attr_setstacksize failed: " << ewd;
+                LOGV2_WARNING(22949,
+                              "pthread_attr_setstacksize failed: {error}",
+                              "pthread_attr_setstacksize failed",
+                              "error"_attr = ewd);
             }
         } else if (limits.rlim_cur < 1024 * 1024) {
-            warning() << "Stack size set to " << (limits.rlim_cur / 1024) << "KB. We suggest 1MB";
+            LOGV2_WARNING(22950,
+                          "Stack size set to {stackSizeKiB}KiB. We suggest 1024KiB",
+                          "Stack size not set to suggested 1024KiB",
+                          "stackSizeKiB"_attr = (limits.rlim_cur / 1024));
         }
 
+        // Wrap the user-specified `task` so it runs with an installed `sigaltstack`.
+        task = [sigAltStackController = std::make_shared<stdx::support::SigAltStackController>(),
+                f = std::move(task)] {
+            auto sigAltStackGuard = sigAltStackController->makeInstallGuard();
+            f();
+        };
+
         pthread_t thread;
-        auto ctx = stdx::make_unique<stdx::function<void()>>(std::move(task));
+        auto ctx = std::make_unique<std::function<void()>>(std::move(task));
+        ThreadSafetyContext::getThreadSafetyContext()->onThreadCreate();
         int failed = pthread_create(&thread, &attrs, runFunc, ctx.get());
 
         pthread_attr_destroy(&attrs);
-
-        if (failed) {
-            log() << "pthread_create failed: " << errnoWithDescription(failed);
-            throw std::system_error(
-                std::make_error_code(std::errc::resource_unavailable_try_again));
-        }
+        uassert(4850900, "pthread_create failed: {}"_format(errnoWithDescription(failed)), !failed);
 
         ctx.release();
 #endif
 
-    } catch (...) {
-        return {ErrorCodes::InternalError, "failed to create service entry worker thread"};
+    } catch (const std::exception& e) {
+        LOGV2_ERROR(22948, "Thread creation failed", "error"_attr = e.what());
+        return {ErrorCodes::InternalError,
+                format(FMT_STRING("Failed to create service entry worker thread: {}"), e.what())};
     }
 
     return Status::OK();

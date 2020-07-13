@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -45,7 +46,6 @@
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -64,6 +64,16 @@ void ShardingCatalogManager::create(ServiceContext* serviceContext,
     invariant(!shardingCatalogManager);
 
     shardingCatalogManager.emplace(serviceContext, std::move(addShardExecutor));
+}
+
+NamespaceSerializer::ScopedLock ShardingCatalogManager::serializeCreateOrDropDatabase(
+    OperationContext* opCtx, StringData dbName) {
+    return _namespaceSerializer.lock(opCtx, dbName);
+}
+
+NamespaceSerializer::ScopedLock ShardingCatalogManager::serializeCreateOrDropCollection(
+    OperationContext* opCtx, const NamespaceString& nss) {
+    return _namespaceSerializer.lock(opCtx, nss.ns());
 }
 
 void ShardingCatalogManager::clearForTests(ServiceContext* serviceContext) {
@@ -99,7 +109,7 @@ ShardingCatalogManager::~ShardingCatalogManager() {
 }
 
 void ShardingCatalogManager::startup() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     if (_started) {
         return;
     }
@@ -113,7 +123,7 @@ void ShardingCatalogManager::startup() {
 
 void ShardingCatalogManager::shutDown() {
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         _inShutdown = true;
     }
 
@@ -125,7 +135,7 @@ void ShardingCatalogManager::shutDown() {
 
 Status ShardingCatalogManager::initializeConfigDatabaseIfNeeded(OperationContext* opCtx) {
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         if (_configInitialized) {
             return {ErrorCodes::AlreadyInitialized,
                     "Config database was previously loaded into memory"};
@@ -145,14 +155,14 @@ Status ShardingCatalogManager::initializeConfigDatabaseIfNeeded(OperationContext
         return status;
     }
 
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _configInitialized = true;
 
     return Status::OK();
 }
 
 void ShardingCatalogManager::discardCachedConfigDatabaseInitializationState() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _configInitialized = false;
 }
 
@@ -197,8 +207,7 @@ Status ShardingCatalogManager::_initConfigVersion(OperationContext* opCtx) {
     if (versionInfo.getCurrentVersion() < CURRENT_CONFIG_VERSION) {
         return {ErrorCodes::IncompatibleShardingConfigVersion,
                 str::stream() << "need to upgrade current cluster version to v"
-                              << CURRENT_CONFIG_VERSION
-                              << "; currently at v"
+                              << CURRENT_CONFIG_VERSION << "; currently at v"
                               << versionInfo.getCurrentVersion()};
     }
 
@@ -322,6 +331,68 @@ Status ShardingCatalogManager::setFeatureCompatibilityVersionOnShards(OperationC
     }
 
     return Status::OK();
+}
+
+Lock::ExclusiveLock ShardingCatalogManager::lockZoneMutex(OperationContext* opCtx) {
+    Lock::ExclusiveLock lk(opCtx->lockState(), _kZoneOpLock);
+    return lk;
+}
+
+StatusWith<bool> ShardingCatalogManager::_isShardRequiredByZoneStillInUse(
+    OperationContext* opCtx,
+    const ReadPreferenceSetting& readPref,
+    const std::string& shardName,
+    const std::string& zoneName) {
+    auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+    auto findShardStatus =
+        configShard->exhaustiveFindOnConfig(opCtx,
+                                            readPref,
+                                            repl::ReadConcernLevel::kLocalReadConcern,
+                                            ShardType::ConfigNS,
+                                            BSON(ShardType::tags() << zoneName),
+                                            BSONObj(),
+                                            2);
+
+    if (!findShardStatus.isOK()) {
+        return findShardStatus.getStatus();
+    }
+
+    const auto shardDocs = findShardStatus.getValue().docs;
+
+    if (shardDocs.size() == 0) {
+        // The zone doesn't exists.
+        return false;
+    }
+
+    if (shardDocs.size() == 1) {
+        auto shardDocStatus = ShardType::fromBSON(shardDocs.front());
+        if (!shardDocStatus.isOK()) {
+            return shardDocStatus.getStatus();
+        }
+
+        auto shardDoc = shardDocStatus.getValue();
+        if (shardDoc.getName() != shardName) {
+            // The last shard that belongs to this zone is a different shard.
+            return false;
+        }
+
+        auto findChunkRangeStatus =
+            configShard->exhaustiveFindOnConfig(opCtx,
+                                                readPref,
+                                                repl::ReadConcernLevel::kLocalReadConcern,
+                                                TagsType::ConfigNS,
+                                                BSON(TagsType::tag() << zoneName),
+                                                BSONObj(),
+                                                1);
+
+        if (!findChunkRangeStatus.isOK()) {
+            return findChunkRangeStatus.getStatus();
+        }
+
+        return findChunkRangeStatus.getValue().docs.size() > 0;
+    }
+
+    return false;
 }
 
 }  // namespace mongo

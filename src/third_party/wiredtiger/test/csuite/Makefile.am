@@ -7,9 +7,28 @@ AM_LDFLAGS = -static
 all_TESTS=
 noinst_PROGRAMS=
 
+# The import test is only a shell script
+all_TESTS += import/smoke.sh
+
+test_incr_backup_SOURCES = incr_backup/main.c
+noinst_PROGRAMS += test_incr_backup
+all_TESTS += incr_backup/smoke.sh
+
 test_random_abort_SOURCES = random_abort/main.c
 noinst_PROGRAMS += test_random_abort
 all_TESTS += random_abort/smoke.sh
+
+test_random_directio_SOURCES = random_directio/main.c random_directio/util.c
+noinst_PROGRAMS += test_random_directio
+all_TESTS += random_directio/smoke.sh
+
+test_rwlock_SOURCES = rwlock/main.c
+noinst_PROGRAMS += test_rwlock
+all_TESTS += test_rwlock
+
+test_schema_abort_SOURCES = schema_abort/main.c
+noinst_PROGRAMS += test_schema_abort
+all_TESTS += schema_abort/smoke.sh
 
 test_scope_SOURCES = scope/main.c
 noinst_PROGRAMS += test_scope
@@ -33,7 +52,8 @@ all_TESTS += test_wt2403_lsm_workload
 
 test_wt2246_col_append_SOURCES = wt2246_col_append/main.c
 noinst_PROGRAMS += test_wt2246_col_append
-all_TESTS += test_wt2246_col_append
+# Temporarily disabled (WT-5790)
+# all_TESTS += test_wt2246_col_append
 
 test_wt2323_join_visibility_SOURCES = wt2323_join_visibility/main.c
 noinst_PROGRAMS += test_wt2323_join_visibility
@@ -99,13 +119,42 @@ test_wt3874_pad_byte_collator_SOURCES = wt3874_pad_byte_collator/main.c
 noinst_PROGRAMS += test_wt3874_pad_byte_collator
 all_TESTS += test_wt3874_pad_byte_collator
 
-test_rwlock_SOURCES = rwlock/main.c
-noinst_PROGRAMS += test_rwlock
-all_TESTS += test_rwlock
+test_wt4105_large_doc_small_upd_SOURCES = wt4105_large_doc_small_upd/main.c
+noinst_PROGRAMS += test_wt4105_large_doc_small_upd
+# Temporarily disabled (WT-5579)
+# all_TESTS += test_wt4105_large_doc_small_upd
+
+test_wt4117_checksum_SOURCES = wt4117_checksum/main.c
+noinst_PROGRAMS += test_wt4117_checksum
+all_TESTS += test_wt4117_checksum
+
+test_wt4156_metadata_salvage_SOURCES = wt4156_metadata_salvage/main.c
+noinst_PROGRAMS += test_wt4156_metadata_salvage
+all_TESTS += test_wt4156_metadata_salvage
+
+test_wt4333_handle_locks_SOURCES = wt4333_handle_locks/main.c
+noinst_PROGRAMS += test_wt4333_handle_locks
+all_TESTS += test_wt4333_handle_locks
+
+test_wt4699_json_SOURCES = wt4699_json/main.c
+noinst_PROGRAMS += test_wt4699_json
+all_TESTS += test_wt4699_json
+
+test_wt4803_history_store_abort_SOURCES = wt4803_history_store_abort/main.c
+noinst_PROGRAMS += test_wt4803_history_store_abort
+all_TESTS += test_wt4803_history_store_abort
+
+test_wt4891_meta_ckptlist_get_alloc_SOURCES=wt4891_meta_ckptlist_get_alloc/main.c
+noinst_PROGRAMS += test_wt4891_meta_ckptlist_get_alloc
+all_TESTS += test_wt4891_meta_ckptlist_get_alloc
+
+test_wt6185_modify_ts_SOURCES = wt6185_modify_ts/main.c
+noinst_PROGRAMS += test_wt6185_modify_ts
+all_TESTS += test_wt6185_modify_ts
 
 # Run this during a "make check" smoke test.
 TESTS = $(all_TESTS)
-LOG_COMPILER = $(TEST_WRAPPER)
+LOG_COMPILER = env top_builddir=$(top_builddir) top_srcdir=$(top_srcdir) $(TEST_WRAPPER)
 
 clean-local:
-	rm -rf WT_TEST.* *.core
+	rm -rf WT_TEST.* core.* *.core

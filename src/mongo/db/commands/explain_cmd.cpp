@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -31,7 +32,7 @@
 #include "mongo/db/command_can_run_here.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/query/explain.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -74,19 +75,6 @@ public:
         return "explain database reads and writes";
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        uassert(ErrorCodes::BadValue,
-                "explain command requires a nested object",
-                Object == cmdObj.firstElement().type());
-        auto explainedObj = cmdObj.firstElement().Obj();
-        auto explainedCommand = CommandHelpers::findCommand(explainedObj.firstElementFieldName());
-        uassert(ErrorCodes::CommandNotFound,
-                str::stream() << "explain failed due to unknown command: "
-                              << explainedObj.firstElementFieldName(),
-                explainedCommand);
-        return explainedCommand->parseNs(dbname, explainedObj);
-    }
-
 private:
     class Invocation;
 };
@@ -101,42 +89,33 @@ public:
         : CommandInvocation(explainCommand),
           _outerRequest{&request},
           _dbName{_outerRequest->getDatabase().toString()},
-          _ns{explainCommand->parseNs(_dbName, _outerRequest->body)},
           _verbosity{std::move(verbosity)},
           _innerRequest{std::move(innerRequest)},
           _innerInvocation{std::move(innerInvocation)} {}
 
-    void run(OperationContext* opCtx, CommandReplyBuilder* result) override {
+    void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) override {
+        // Explain is never allowed in multi-document transactions.
+        const bool inMultiDocumentTransaction = false;
         uassert(50746,
                 "Explain's child command cannot run on this node. "
                 "Are you explaining a write command on a secondary?",
-                commandCanRunHere(opCtx, _dbName, _innerInvocation->definition()));
-        try {
-            BSONObjBuilder bob = result->getBodyBuilder();
-            _innerInvocation->explain(opCtx, _verbosity, &bob);
-        } catch (const ExceptionFor<ErrorCodes::Unauthorized>&) {
-            CommandHelpers::logAuthViolation(
-                opCtx, command(), *_outerRequest, ErrorCodes::Unauthorized);
-            throw;
-        }
+                commandCanRunHere(
+                    opCtx, _dbName, _innerInvocation->definition(), inMultiDocumentTransaction));
+        _innerInvocation->explain(opCtx, _verbosity, result);
     }
 
     void explain(OperationContext* opCtx,
                  ExplainOptions::Verbosity verbosity,
-                 BSONObjBuilder* result) override {
+                 rpc::ReplyBuilderInterface* result) override {
         uasserted(ErrorCodes::IllegalOperation, "Explain cannot explain itself.");
     }
 
     NamespaceString ns() const override {
-        return _ns;
+        return _innerInvocation->ns();
     }
 
     bool supportsWriteConcern() const override {
         return false;
-    }
-
-    Command::AllowedOnSecondary secondaryAllowed(ServiceContext* context) const override {
-        return command()->secondaryAllowed(context);
     }
 
     /**
@@ -166,16 +145,25 @@ std::unique_ptr<CommandInvocation> CmdExplain::parse(OperationContext* opCtx,
     CommandHelpers::uassertNoDocumentSequences(getName(), request);
     std::string dbname = request.getDatabase().toString();
     const BSONObj& cmdObj = request.body;
+    uassert(ErrorCodes::FailedToParse,
+            "Unrecognized field 'jsonSchema'. This command may be meant for a mongocryptd process.",
+            !cmdObj.hasField("jsonSchema"_sd));
     ExplainOptions::Verbosity verbosity = uassertStatusOK(ExplainOptions::parseCmdBSON(cmdObj));
     uassert(ErrorCodes::BadValue,
             "explain command requires a nested object",
             cmdObj.firstElement().type() == Object);
     auto explainedObj = cmdObj.firstElement().Obj();
+
+    // Extract 'comment' field from the 'explainedObj' only if there is no top-level comment.
+    auto commentField = explainedObj["comment"];
+    if (!opCtx->getComment() && commentField) {
+        opCtx->setComment(commentField.wrap());
+    }
+
     if (auto innerDb = explainedObj["$db"]) {
         uassert(ErrorCodes::InvalidNamespace,
                 str::stream() << "Mismatched $db in explain command. Expected " << dbname
-                              << " but got "
-                              << innerDb.checkAndGetStringData(),
+                              << " but got " << innerDb.checkAndGetStringData(),
                 innerDb.checkAndGetStringData() == dbname);
     }
     auto explainedCommand = CommandHelpers::findCommand(explainedObj.firstElementFieldName());
@@ -184,9 +172,9 @@ std::unique_ptr<CommandInvocation> CmdExplain::parse(OperationContext* opCtx,
                           << explainedObj.firstElementFieldName(),
             explainedCommand);
     auto innerRequest =
-        stdx::make_unique<OpMsgRequest>(OpMsgRequest::fromDBAndBody(dbname, explainedObj));
-    auto innerInvocation = explainedCommand->parse(opCtx, *innerRequest);
-    return stdx::make_unique<Invocation>(
+        std::make_unique<OpMsgRequest>(OpMsgRequest::fromDBAndBody(dbname, explainedObj));
+    auto innerInvocation = explainedCommand->parseForExplain(opCtx, *innerRequest, verbosity);
+    return std::make_unique<Invocation>(
         this, request, std::move(verbosity), std::move(innerRequest), std::move(innerInvocation));
 }
 

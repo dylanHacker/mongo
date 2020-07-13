@@ -1,68 +1,51 @@
 /**
- *    Copyright 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/query/query_request.h"
 
+#include <memory>
+
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/client/dbclientinterface.h"
-#include "mongo/db/catalog/uuid_catalog.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/read_concern_args.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
-
-using std::string;
-using std::unique_ptr;
-
-const std::string QueryRequest::kUnwrappedReadPrefField("$queryOptions");
-const std::string QueryRequest::kWrappedReadPrefField("$readPreference");
-
-const char QueryRequest::cmdOptionMaxTimeMS[] = "maxTimeMS";
-const char QueryRequest::queryOptionMaxTimeMS[] = "$maxTimeMS";
-
-const string QueryRequest::metaGeoNearDistance("geoNearDistance");
-const string QueryRequest::metaGeoNearPoint("geoNearPoint");
-const string QueryRequest::metaIndexKey("indexKey");
-const string QueryRequest::metaRecordId("recordId");
-const string QueryRequest::metaSortKey("sortKey");
-const string QueryRequest::metaTextScore("textScore");
-
-const long long QueryRequest::kDefaultBatchSize = 101;
 
 namespace {
 
@@ -77,46 +60,15 @@ Status checkFieldType(const BSONElement& el, BSONType type) {
     return Status::OK();
 }
 
-// Find command field names.
-const char kFilterField[] = "filter";
-const char kProjectionField[] = "projection";
-const char kSortField[] = "sort";
-const char kHintField[] = "hint";
-const char kCollationField[] = "collation";
-const char kSkipField[] = "skip";
-const char kLimitField[] = "limit";
-const char kBatchSizeField[] = "batchSize";
-const char kNToReturnField[] = "ntoreturn";
-const char kSingleBatchField[] = "singleBatch";
-const char kCommentField[] = "comment";
-const char kMaxScanField[] = "maxScan";
-const char kMaxField[] = "max";
-const char kMinField[] = "min";
-const char kReturnKeyField[] = "returnKey";
-const char kShowRecordIdField[] = "showRecordId";
-const char kTailableField[] = "tailable";
-const char kOplogReplayField[] = "oplogReplay";
-const char kNoCursorTimeoutField[] = "noCursorTimeout";
-const char kAwaitDataField[] = "awaitData";
-const char kPartialResultsField[] = "allowPartialResults";
-const char kTermField[] = "term";
-const char kOptionsField[] = "options";
-
-// Field names for sorting options.
-const char kNaturalSortField[] = "$natural";
-
 }  // namespace
 
-const char QueryRequest::kFindCommandName[] = "find";
-const char QueryRequest::kShardVersionField[] = "shardVersion";
-
-QueryRequest::QueryRequest(NamespaceString nss) : _nss(std::move(nss)) {}
-QueryRequest::QueryRequest(CollectionUUID uuid) : _uuid(std::move(uuid)) {}
+QueryRequest::QueryRequest(NamespaceStringOrUUID nssOrUuid)
+    : _nss(nssOrUuid.nss() ? *nssOrUuid.nss() : NamespaceString()), _uuid(nssOrUuid.uuid()) {}
 
 void QueryRequest::refreshNSS(OperationContext* opCtx) {
     if (_uuid) {
-        const UUIDCatalog& catalog = UUIDCatalog::get(opCtx);
-        auto foundColl = catalog.lookupCollectionByUUID(_uuid.get());
+        const CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
+        auto foundColl = catalog.lookupCollectionByUUID(opCtx, _uuid.get());
         uassert(ErrorCodes::NamespaceNotFound,
                 str::stream() << "UUID " << _uuid.get() << " specified in query request not found",
                 foundColl);
@@ -127,9 +79,8 @@ void QueryRequest::refreshNSS(OperationContext* opCtx) {
 }
 
 // static
-StatusWith<unique_ptr<QueryRequest>> QueryRequest::parseFromFindCommand(unique_ptr<QueryRequest> qr,
-                                                                        const BSONObj& cmdObj,
-                                                                        bool isExplain) {
+StatusWith<std::unique_ptr<QueryRequest>> QueryRequest::parseFromFindCommand(
+    std::unique_ptr<QueryRequest> qr, const BSONObj& cmdObj, bool isExplain) {
     qr->_explain = isExplain;
     bool tailable = false;
     bool awaitData = false;
@@ -258,22 +209,13 @@ StatusWith<unique_ptr<QueryRequest>> QueryRequest::parseFromFindCommand(unique_p
             }
 
             qr->_wantMore = !el.boolean();
-        } else if (fieldName == kCommentField) {
-            Status status = checkFieldType(el, String);
+        } else if (fieldName == kAllowDiskUseField) {
+            Status status = checkFieldType(el, Bool);
             if (!status.isOK()) {
                 return status;
             }
 
-            qr->_comment = el.str();
-        } else if (fieldName == kMaxScanField) {
-            if (!el.isNumber()) {
-                str::stream ss;
-                ss << "Failed to parse: " << cmdObj.toString() << ". "
-                   << "'maxScan' field must be numeric.";
-                return Status(ErrorCodes::FailedToParse, ss);
-            }
-
-            qr->_maxScan = el.numberInt();
+            qr->_allowDiskUse = el.boolean();
         } else if (fieldName == cmdOptionMaxTimeMS) {
             StatusWith<int> maxTimeMS = parseMaxTimeMS(el);
             if (!maxTimeMS.isOK()) {
@@ -322,7 +264,9 @@ StatusWith<unique_ptr<QueryRequest>> QueryRequest::parseFromFindCommand(unique_p
                 return status;
             }
 
-            qr->_oplogReplay = el.boolean();
+            // Ignore the 'oplogReplay' field for compatibility with old clients. Nodes 4.4 and
+            // greater will apply the 'oplogReplay' optimization to eligible oplog scans regardless
+            // of whether the flag is set explicitly, so the flag is no longer meaningful.
         } else if (fieldName == kNoCursorTimeoutField) {
             Status status = checkFieldType(el, Bool);
             if (!status.isOK()) {
@@ -344,6 +288,18 @@ StatusWith<unique_ptr<QueryRequest>> QueryRequest::parseFromFindCommand(unique_p
             }
 
             qr->_allowPartialResults = el.boolean();
+        } else if (fieldName == kRuntimeConstantsField) {
+            Status status = checkFieldType(el, Object);
+            if (!status.isOK()) {
+                return status;
+            }
+            qr->_runtimeConstants =
+                RuntimeConstants::parse(IDLParserErrorContext(kRuntimeConstantsField),
+                                        cmdObj.getObjectField(kRuntimeConstantsField));
+        } else if (fieldName == kLetField) {
+            if (auto status = checkFieldType(el, Object); !status.isOK())
+                return status;
+            qr->_letParameters = el.Obj().getOwned();
         } else if (fieldName == kOptionsField) {
             // 3.0.x versions of the shell may generate an explain of a find command with an
             // 'options' field. We accept this only if the 'options' field is empty so that
@@ -375,12 +331,50 @@ StatusWith<unique_ptr<QueryRequest>> QueryRequest::parseFromFindCommand(unique_p
                 return status;
             }
             qr->_replicationTerm = el._numberLong();
+        } else if (fieldName == kReadOnceField) {
+            Status status = checkFieldType(el, Bool);
+            if (!status.isOK()) {
+                return status;
+            }
+
+            qr->_readOnce = el.boolean();
+        } else if (fieldName == kAllowSpeculativeMajorityReadField) {
+            Status status = checkFieldType(el, Bool);
+            if (!status.isOK()) {
+                return status;
+            }
+            qr->_allowSpeculativeMajorityRead = el.boolean();
+        } else if (fieldName == kResumeAfterField) {
+            Status status = checkFieldType(el, Object);
+            if (!status.isOK()) {
+                return status;
+            }
+            qr->_resumeAfter = el.embeddedObject();
+        } else if (fieldName == kRequestResumeTokenField) {
+            Status status = checkFieldType(el, Bool);
+            if (!status.isOK()) {
+                return status;
+            }
+            qr->_requestResumeToken = el.boolean();
+        } else if (fieldName == kUse44SortKeys) {
+            Status status = checkFieldType(el, Bool);
+            if (!status.isOK()) {
+                return status;
+            }
+        } else if (isMongocryptdArgument(fieldName)) {
+            return Status(ErrorCodes::FailedToParse,
+                          str::stream()
+                              << "Failed to parse: " << cmdObj.toString()
+                              << ". Unrecognized field '" << fieldName
+                              << "'. This command may be meant for a mongocryptd process.");
+
+            // TODO SERVER-47065: A 4.6 node still has to accept the '_use44SortKeys' field, since
+            // it could be included in a command sent from a 4.4 mongos. In 4.7 development, this
+            // code to tolerate the '_use44SortKeys' field can be deleted.
         } else if (!isGenericArgument(fieldName)) {
             return Status(ErrorCodes::FailedToParse,
                           str::stream() << "Failed to parse: " << cmdObj.toString() << ". "
-                                        << "Unrecognized field '"
-                                        << fieldName
-                                        << "'.");
+                                        << "Unrecognized field '" << fieldName << "'.");
         }
     }
 
@@ -399,16 +393,16 @@ StatusWith<unique_ptr<QueryRequest>> QueryRequest::parseFromFindCommand(unique_p
     return std::move(qr);
 }
 
-StatusWith<unique_ptr<QueryRequest>> QueryRequest::makeFromFindCommand(NamespaceString nss,
-                                                                       const BSONObj& cmdObj,
-                                                                       bool isExplain) {
+StatusWith<std::unique_ptr<QueryRequest>> QueryRequest::makeFromFindCommand(NamespaceString nss,
+                                                                            const BSONObj& cmdObj,
+                                                                            bool isExplain) {
     BSONElement first = cmdObj.firstElement();
     if (first.type() == BinData && first.binDataType() == BinDataType::newUUID) {
         auto uuid = uassertStatusOK(UUID::parse(first));
-        auto qr = stdx::make_unique<QueryRequest>(uuid);
+        auto qr = std::make_unique<QueryRequest>(NamespaceStringOrUUID(nss.db().toString(), uuid));
         return parseFromFindCommand(std::move(qr), cmdObj, isExplain);
     } else {
-        auto qr = stdx::make_unique<QueryRequest>(nss);
+        auto qr = std::make_unique<QueryRequest>(nss);
         return parseFromFindCommand(std::move(qr), cmdObj, isExplain);
     }
 }
@@ -419,9 +413,24 @@ BSONObj QueryRequest::asFindCommand() const {
     return bob.obj();
 }
 
+BSONObj QueryRequest::asFindCommandWithUuid() const {
+    BSONObjBuilder bob;
+    asFindCommandWithUuid(&bob);
+    return bob.obj();
+}
+
 void QueryRequest::asFindCommand(BSONObjBuilder* cmdBuilder) const {
     cmdBuilder->append(kFindCommandName, _nss.coll());
+    asFindCommandInternal(cmdBuilder);
+}
 
+void QueryRequest::asFindCommandWithUuid(BSONObjBuilder* cmdBuilder) const {
+    invariant(_uuid);
+    _uuid->appendToBuilder(cmdBuilder, kFindCommandName);
+    asFindCommandInternal(cmdBuilder);
+}
+
+void QueryRequest::asFindCommandInternal(BSONObjBuilder* cmdBuilder) const {
     if (!_filter.isEmpty()) {
         cmdBuilder->append(kFilterField, _filter);
     }
@@ -438,8 +447,8 @@ void QueryRequest::asFindCommand(BSONObjBuilder* cmdBuilder) const {
         cmdBuilder->append(kHintField, _hint);
     }
 
-    if (!_readConcern.isEmpty()) {
-        cmdBuilder->append(repl::ReadConcernArgs::kReadConcernFieldName, _readConcern);
+    if (_readConcern) {
+        cmdBuilder->append(repl::ReadConcernArgs::kReadConcernFieldName, *_readConcern);
     }
 
     if (!_collation.isEmpty()) {
@@ -458,20 +467,16 @@ void QueryRequest::asFindCommand(BSONObjBuilder* cmdBuilder) const {
         cmdBuilder->append(kLimitField, *_limit);
     }
 
+    if (_allowDiskUse) {
+        cmdBuilder->append(kAllowDiskUseField, true);
+    }
+
     if (_batchSize) {
         cmdBuilder->append(kBatchSizeField, *_batchSize);
     }
 
     if (!_wantMore) {
         cmdBuilder->append(kSingleBatchField, true);
-    }
-
-    if (!_comment.empty()) {
-        cmdBuilder->append(kCommentField, _comment);
-    }
-
-    if (_maxScan > 0) {
-        cmdBuilder->append(kMaxScanField, _maxScan);
     }
 
     if (_maxTimeMS > 0) {
@@ -509,10 +514,6 @@ void QueryRequest::asFindCommand(BSONObjBuilder* cmdBuilder) const {
         }
     }
 
-    if (_oplogReplay) {
-        cmdBuilder->append(kOplogReplayField, true);
-    }
-
     if (_noCursorTimeout) {
         cmdBuilder->append(kNoCursorTimeoutField, true);
     }
@@ -521,22 +522,43 @@ void QueryRequest::asFindCommand(BSONObjBuilder* cmdBuilder) const {
         cmdBuilder->append(kPartialResultsField, true);
     }
 
+    if (_runtimeConstants) {
+        BSONObjBuilder rtcBuilder(cmdBuilder->subobjStart(kRuntimeConstantsField));
+        _runtimeConstants->serialize(&rtcBuilder);
+        rtcBuilder.doneFast();
+    }
+
+    if (_letParameters) {
+        cmdBuilder->append(kLetField, *_letParameters);
+    }
+
     if (_replicationTerm) {
         cmdBuilder->append(kTermField, *_replicationTerm);
     }
-}
 
-void QueryRequest::addReturnKeyMetaProj() {
-    BSONObjBuilder projBob;
-    projBob.appendElements(_proj);
-    // We use $$ because it's never going to show up in a user's projection.
-    // The exact text doesn't matter.
-    BSONObj indexKey = BSON("$$" << BSON("$meta" << QueryRequest::metaIndexKey));
-    projBob.append(indexKey.firstElement());
-    _proj = projBob.obj();
+    if (_readOnce) {
+        cmdBuilder->append(kReadOnceField, true);
+    }
+
+    if (_allowSpeculativeMajorityRead) {
+        cmdBuilder->append(kAllowSpeculativeMajorityReadField, true);
+    }
+
+    if (_requestResumeToken) {
+        cmdBuilder->append(kRequestResumeTokenField, _requestResumeToken);
+    }
+
+    if (!_resumeAfter.isEmpty()) {
+        cmdBuilder->append(kResumeAfterField, _resumeAfter);
+    }
 }
 
 void QueryRequest::addShowRecordIdMetaProj() {
+    if (_proj["$recordId"]) {
+        // There's already some projection on $recordId. Don't overwrite it.
+        return;
+    }
+
     BSONObjBuilder projBob;
     projBob.appendElements(_proj);
     BSONObj metaRecordId = BSON("$recordId" << BSON("$meta" << QueryRequest::metaRecordId));
@@ -548,37 +570,7 @@ Status QueryRequest::validate() const {
     // Min and Max objects must have the same fields.
     if (!_min.isEmpty() && !_max.isEmpty()) {
         if (!_min.isFieldNamePrefixOf(_max) || (_min.nFields() != _max.nFields())) {
-            return Status(ErrorCodes::BadValue, "min and max must have the same field names");
-        }
-    }
-
-    // Can't combine a normal sort and a $meta projection on the same field.
-    BSONObjIterator projIt(_proj);
-    while (projIt.more()) {
-        BSONElement projElt = projIt.next();
-        if (isTextScoreMeta(projElt)) {
-            BSONElement sortElt = _sort[projElt.fieldName()];
-            if (!sortElt.eoo() && !isTextScoreMeta(sortElt)) {
-                return Status(ErrorCodes::BadValue,
-                              "can't have a non-$meta sort on a $meta projection");
-            }
-        }
-    }
-
-    if (!isValidSortOrder(_sort)) {
-        return Status(ErrorCodes::BadValue, "bad sort specification");
-    }
-
-    // All fields with a $meta sort must have a corresponding $meta projection.
-    BSONObjIterator sortIt(_sort);
-    while (sortIt.more()) {
-        BSONElement sortElt = sortIt.next();
-        if (isTextScoreMeta(sortElt)) {
-            BSONElement projElt = _proj[sortElt.fieldName()];
-            if (projElt.eoo() || !isTextScoreMeta(projElt)) {
-                return Status(ErrorCodes::BadValue,
-                              "must have $meta projection for all $meta sort keys");
-            }
+            return Status(ErrorCodes::Error(51176), "min and max must have the same field names");
         }
     }
 
@@ -587,7 +579,6 @@ Status QueryRequest::validate() const {
                       "'limit' or 'batchSize' fields can not be set with 'ntoreturn' field.");
     }
 
-
     if (_skip && *_skip < 0) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "Skip value must be non-negative, but received: " << *_skip);
@@ -595,32 +586,26 @@ Status QueryRequest::validate() const {
 
     if (_limit && *_limit < 0) {
         return Status(ErrorCodes::BadValue,
-                      str::stream() << "Limit value must be non-negative, but received: "
-                                    << *_limit);
+                      str::stream()
+                          << "Limit value must be non-negative, but received: " << *_limit);
     }
 
     if (_batchSize && *_batchSize < 0) {
         return Status(ErrorCodes::BadValue,
-                      str::stream() << "BatchSize value must be non-negative, but received: "
-                                    << *_batchSize);
+                      str::stream()
+                          << "BatchSize value must be non-negative, but received: " << *_batchSize);
     }
 
     if (_ntoreturn && *_ntoreturn < 0) {
         return Status(ErrorCodes::BadValue,
-                      str::stream() << "NToReturn value must be non-negative, but received: "
-                                    << *_ntoreturn);
-    }
-
-    if (_maxScan < 0) {
-        return Status(ErrorCodes::BadValue,
-                      str::stream() << "MaxScan value must be non-negative, but received: "
-                                    << _maxScan);
+                      str::stream()
+                          << "NToReturn value must be non-negative, but received: " << *_ntoreturn);
     }
 
     if (_maxTimeMS < 0) {
         return Status(ErrorCodes::BadValue,
-                      str::stream() << "MaxTimeMS value must be non-negative, but received: "
-                                    << _maxTimeMS);
+                      str::stream()
+                          << "MaxTimeMS value must be non-negative, but received: " << _maxTimeMS);
     }
 
     if (_tailableMode != TailableModeEnum::kNormal) {
@@ -639,6 +624,29 @@ Status QueryRequest::validate() const {
         }
     }
 
+    if (_requestResumeToken) {
+        if (SimpleBSONObjComparator::kInstance.evaluate(_hint != BSON(kNaturalSortField << 1))) {
+            return Status(ErrorCodes::BadValue,
+                          "hint must be {$natural:1} if 'requestResumeToken' is enabled");
+        }
+        if (!_sort.isEmpty() &&
+            SimpleBSONObjComparator::kInstance.evaluate(_sort != BSON(kNaturalSortField << 1))) {
+            return Status(ErrorCodes::BadValue,
+                          "sort must be unset or {$natural:1} if 'requestResumeToken' is enabled");
+        }
+        if (!_resumeAfter.isEmpty()) {
+            if (_resumeAfter.nFields() != 1 ||
+                _resumeAfter["$recordId"].type() != BSONType::NumberLong) {
+                return Status(ErrorCodes::BadValue,
+                              "Malformed resume token: the '_resumeAfter' object must contain"
+                              " exactly one field named '$recordId', of type NumberLong.");
+            }
+        }
+    } else if (!_resumeAfter.isEmpty()) {
+        return Status(ErrorCodes::BadValue,
+                      "'requestResumeToken' must be true if 'resumeAfter' is"
+                      " specified");
+    }
     return Status::OK();
 }
 
@@ -665,7 +673,6 @@ StatusWith<int> QueryRequest::parseMaxTimeMS(BSONElement maxTimeMSElt) {
     return StatusWith<int>(static_cast<int>(maxTimeMSLongLong));
 }
 
-// static
 bool QueryRequest::isTextScoreMeta(BSONElement elt) {
     // elt must be foo: {$meta: "textScore"}
     if (mongo::Object != elt.type()) {
@@ -678,13 +685,13 @@ bool QueryRequest::isTextScoreMeta(BSONElement elt) {
         return false;
     }
     BSONElement metaElt = metaIt.next();
-    if (!str::equals("$meta", metaElt.fieldName())) {
+    if (metaElt.fieldNameStringData() != "$meta") {
         return false;
     }
     if (mongo::String != metaElt.type()) {
         return false;
     }
-    if (QueryRequest::metaTextScore != metaElt.valuestr()) {
+    if (StringData{metaElt.valuestr()} != QueryRequest::metaTextScore) {
         return false;
     }
     // must have exactly 1 element
@@ -694,34 +701,14 @@ bool QueryRequest::isTextScoreMeta(BSONElement elt) {
     return true;
 }
 
-// static
-bool QueryRequest::isValidSortOrder(const BSONObj& sortObj) {
-    BSONObjIterator i(sortObj);
-    while (i.more()) {
-        BSONElement e = i.next();
-        // fieldNameSize() includes NULL terminator. For empty field name,
-        // we should be checking for 1 instead of 0.
-        if (1 == e.fieldNameSize()) {
-            return false;
-        }
-        if (isTextScoreMeta(e)) {
-            continue;
-        }
-        long long n = e.safeNumberLong();
-        if (!(e.isNumber() && (n == -1LL || n == 1LL))) {
-            return false;
-        }
-    }
-    return true;
-}
-
 //
 // Old QueryRequest parsing code: SOON TO BE DEPRECATED.
 //
 
 // static
-StatusWith<unique_ptr<QueryRequest>> QueryRequest::fromLegacyQueryMessage(const QueryMessage& qm) {
-    auto qr = stdx::make_unique<QueryRequest>(NamespaceString(qm.ns));
+StatusWith<std::unique_ptr<QueryRequest>> QueryRequest::fromLegacyQueryMessage(
+    const QueryMessage& qm) {
+    auto qr = std::make_unique<QueryRequest>(NamespaceString(qm.ns));
 
     Status status = qr->init(qm.ntoskip, qm.ntoreturn, qm.queryOptions, qm.query, qm.fields, true);
     if (!status.isOK()) {
@@ -731,13 +718,14 @@ StatusWith<unique_ptr<QueryRequest>> QueryRequest::fromLegacyQueryMessage(const 
     return std::move(qr);
 }
 
-StatusWith<unique_ptr<QueryRequest>> QueryRequest::fromLegacyQuery(NamespaceString nss,
-                                                                   const BSONObj& queryObj,
-                                                                   const BSONObj& proj,
-                                                                   int ntoskip,
-                                                                   int ntoreturn,
-                                                                   int queryOptions) {
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+StatusWith<std::unique_ptr<QueryRequest>> QueryRequest::fromLegacyQuery(
+    NamespaceStringOrUUID nsOrUuid,
+    const BSONObj& queryObj,
+    const BSONObj& proj,
+    int ntoskip,
+    int ntoreturn,
+    int queryOptions) {
+    auto qr = std::make_unique<QueryRequest>(nsOrUuid);
 
     Status status = qr->init(ntoskip, ntoreturn, queryOptions, queryObj, proj, true);
     if (!status.isOK()) {
@@ -794,6 +782,10 @@ Status QueryRequest::init(int ntoskip,
         } else {
             _filter = queryObj.getOwned();
         }
+        // It's not possible to specify readConcern in a legacy query message, so initialize it to
+        // an empty readConcern object, ie. equivalent to `readConcern: {}`.  This ensures that
+        // mongos passes this empty readConcern to shards.
+        _readConcern = BSONObj();
     } else {
         // This is the debugging code path.
         _filter = queryObj.getOwned();
@@ -809,9 +801,9 @@ Status QueryRequest::initFullQuery(const BSONObj& top) {
 
     while (i.more()) {
         BSONElement e = i.next();
-        const char* name = e.fieldName();
+        StringData name = e.fieldNameStringData();
 
-        if (0 == strcmp("$orderby", name) || 0 == strcmp("orderby", name)) {
+        if (name == "$orderby" || name == "orderby") {
             if (Object == e.type()) {
                 _sort = e.embeddedObject().getOwned();
             } else if (Array == e.type()) {
@@ -849,22 +841,22 @@ Status QueryRequest::initFullQuery(const BSONObj& top) {
             } else {
                 return Status(ErrorCodes::BadValue, "sort must be object or array");
             }
-        } else if ('$' == *name) {
-            name++;
-            if (str::equals("explain", name)) {
+        } else if (name.startsWith("$")) {
+            name = name.substr(1);  // chop first char
+            if (name == "explain") {
                 // Won't throw.
                 _explain = e.trueValue();
-            } else if (str::equals("min", name)) {
+            } else if (name == "min") {
                 if (!e.isABSONObj()) {
                     return Status(ErrorCodes::BadValue, "$min must be a BSONObj");
                 }
                 _min = e.embeddedObject().getOwned();
-            } else if (str::equals("max", name)) {
+            } else if (name == "max") {
                 if (!e.isABSONObj()) {
                     return Status(ErrorCodes::BadValue, "$max must be a BSONObj");
                 }
                 _max = e.embeddedObject().getOwned();
-            } else if (str::equals("hint", name)) {
+            } else if (name == "hint") {
                 if (e.isABSONObj()) {
                     _hint = e.embeddedObject().getOwned();
                 } else if (String == e.type()) {
@@ -873,35 +865,23 @@ Status QueryRequest::initFullQuery(const BSONObj& top) {
                     return Status(ErrorCodes::BadValue,
                                   "$hint must be either a string or nested object");
                 }
-            } else if (str::equals("returnKey", name)) {
+            } else if (name == "returnKey") {
                 // Won't throw.
                 if (e.trueValue()) {
                     _returnKey = true;
-                    addReturnKeyMetaProj();
                 }
-            } else if (str::equals("maxScan", name)) {
-                // Won't throw.
-                _maxScan = e.numberInt();
-            } else if (str::equals("showDiskLoc", name)) {
+            } else if (name == "showDiskLoc") {
                 // Won't throw.
                 if (e.trueValue()) {
                     _showRecordId = true;
                     addShowRecordIdMetaProj();
                 }
-            } else if (str::equals("maxTimeMS", name)) {
+            } else if (name == "maxTimeMS") {
                 StatusWith<int> maxTimeMS = parseMaxTimeMS(e);
                 if (!maxTimeMS.isOK()) {
                     return maxTimeMS.getStatus();
                 }
                 _maxTimeMS = maxTimeMS.getValue();
-            } else if (str::equals("comment", name)) {
-                // Legacy $comment can be any BSON element. Convert to string if it isn't
-                // already.
-                if (e.type() == BSONType::String) {
-                    _comment = e.str();
-                } else {
-                    _comment = e.toString(false);
-                }
             }
         }
     }
@@ -920,9 +900,6 @@ int QueryRequest::getOptions() const {
     if (_slaveOk) {
         options |= QueryOption_SlaveOk;
     }
-    if (_oplogReplay) {
-        options |= QueryOption_OplogReplay;
-    }
     if (_noCursorTimeout) {
         options |= QueryOption_NoCursorTimeout;
     }
@@ -940,18 +917,12 @@ void QueryRequest::initFromInt(int options) {
     bool awaitData = (options & QueryOption_AwaitData) != 0;
     _tailableMode = uassertStatusOK(tailableModeFromBools(tailable, awaitData));
     _slaveOk = (options & QueryOption_SlaveOk) != 0;
-    _oplogReplay = (options & QueryOption_OplogReplay) != 0;
     _noCursorTimeout = (options & QueryOption_NoCursorTimeout) != 0;
     _exhaust = (options & QueryOption_Exhaust) != 0;
     _allowPartialResults = (options & QueryOption_PartialResults) != 0;
 }
 
 void QueryRequest::addMetaProjection() {
-    // We might need to update the projection object with a $meta projection.
-    if (returnKey()) {
-        addReturnKeyMetaProj();
-    }
-
     if (showRecordId()) {
         addShowRecordIdMetaProj();
     }
@@ -973,10 +944,6 @@ StatusWith<BSONObj> QueryRequest::asAggregationCommand() const {
         return {ErrorCodes::InvalidPipelineOperator,
                 str::stream() << "Option " << kMaxField << " not supported in aggregation."};
     }
-    if (_maxScan != 0) {
-        return {ErrorCodes::InvalidPipelineOperator,
-                str::stream() << "Option " << kMaxScanField << " not supported in aggregation."};
-    }
     if (_returnKey) {
         return {ErrorCodes::InvalidPipelineOperator,
                 str::stream() << "Option " << kReturnKeyField << " not supported in aggregation."};
@@ -989,11 +956,6 @@ StatusWith<BSONObj> QueryRequest::asAggregationCommand() const {
     if (isTailable()) {
         return {ErrorCodes::InvalidPipelineOperator,
                 "Tailable cursors are not supported in aggregation."};
-    }
-    if (_oplogReplay) {
-        return {ErrorCodes::InvalidPipelineOperator,
-                str::stream() << "Option " << kOplogReplayField
-                              << " not supported in aggregation."};
     }
     if (_noCursorTimeout) {
         return {ErrorCodes::InvalidPipelineOperator,
@@ -1019,6 +981,28 @@ StatusWith<BSONObj> QueryRequest::asAggregationCommand() const {
     if (!_wantMore && _limit.value_or(0) != 1LL) {
         return {ErrorCodes::InvalidPipelineOperator,
                 str::stream() << "Option " << kSingleBatchField
+                              << " not supported in aggregation."};
+    }
+    if (_readOnce) {
+        return {ErrorCodes::InvalidPipelineOperator,
+                str::stream() << "Option " << kReadOnceField << " not supported in aggregation."};
+    }
+
+    if (_allowSpeculativeMajorityRead) {
+        return {ErrorCodes::InvalidPipelineOperator,
+                str::stream() << "Option " << kAllowSpeculativeMajorityReadField
+                              << " not supported in aggregation."};
+    }
+
+    if (_requestResumeToken) {
+        return {ErrorCodes::InvalidPipelineOperator,
+                str::stream() << "Option " << kRequestResumeTokenField
+                              << " not supported in aggregation."};
+    }
+
+    if (!_resumeAfter.isEmpty()) {
+        return {ErrorCodes::InvalidPipelineOperator,
+                str::stream() << "Option " << kResumeAfterField
                               << " not supported in aggregation."};
     }
 
@@ -1069,14 +1053,22 @@ StatusWith<BSONObj> QueryRequest::asAggregationCommand() const {
     if (!_hint.isEmpty()) {
         aggregationBuilder.append("hint", _hint);
     }
-    if (!_comment.empty()) {
-        aggregationBuilder.append("comment", _comment);
-    }
-    if (!_readConcern.isEmpty()) {
-        aggregationBuilder.append("readConcern", _readConcern);
+    if (_readConcern) {
+        aggregationBuilder.append("readConcern", *_readConcern);
     }
     if (!_unwrappedReadPref.isEmpty()) {
         aggregationBuilder.append(QueryRequest::kUnwrappedReadPrefField, _unwrappedReadPref);
+    }
+    if (_allowDiskUse) {
+        aggregationBuilder.append(QueryRequest::kAllowDiskUseField, _allowDiskUse);
+    }
+    if (_runtimeConstants) {
+        BSONObjBuilder rtcBuilder(aggregationBuilder.subobjStart(kRuntimeConstantsField));
+        _runtimeConstants->serialize(&rtcBuilder);
+        rtcBuilder.doneFast();
+    }
+    if (_letParameters) {
+        aggregationBuilder.append(QueryRequest::kLetField, *_letParameters);
     }
     return StatusWith<BSONObj>(aggregationBuilder.obj());
 }

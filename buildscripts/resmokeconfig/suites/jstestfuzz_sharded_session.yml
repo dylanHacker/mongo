@@ -14,6 +14,7 @@ executor:
       eval: load("jstests/libs/override_methods/enable_sessions.js")
       readMode: commands
   hooks:
+  - class: FuzzerRestoreClusterSettings
   - class: CheckReplDBHash
     shell_options:
       global_vars:
@@ -24,6 +25,7 @@ executor:
       global_vars:
         TestData:
           skipValidationOnInvalidViewDefinitions: true
+          forceValidationWithFeatureCompatibilityVersion: "4.4"
   fixture:
     class: ShardedClusterFixture
     mongos_options:
@@ -34,7 +36,10 @@ executor:
       set_parameters:
         disableLogicalSessionCacheRefresh: false
         enableTestCommands: 1
-        numInitialSyncAttempts: 1
+        transactionLifetimeLimitSeconds: 1
         writePeriodicNoops: 1
       verbose: ''
+    # TODO: SERVER-43927 Make jstestfuzz_sharded and jstestfuzz_sharded_session suite start
+    # shards as replica sets.
+    num_rs_nodes_per_shard: null
     num_shards: 2

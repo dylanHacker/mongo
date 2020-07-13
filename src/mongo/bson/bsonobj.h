@@ -1,30 +1,30 @@
-// @file bsonobj.h
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -33,11 +33,11 @@
 #include <list>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "mongo/base/data_type.h"
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
 #include "mongo/base/string_data_comparator_interface.h"
 #include "mongo/bson/bson_comparator_interface_base.h"
@@ -52,7 +52,11 @@
 
 namespace mongo {
 
+class BSONObjBuilder;
 class BSONObjStlIterator;
+class ExtendedCanonicalV200Generator;
+class ExtendedRelaxedV200Generator;
+class LegacyStrictGenerator;
 
 /**
    C++ representation of a "BSON" object -- that is, an extended JSON-style
@@ -95,6 +99,13 @@ class BSONObjStlIterator;
  */
 class BSONObj {
 public:
+    struct DefaultSizeTrait {
+        constexpr static int MaxSize = BSONObjMaxInternalSize;
+    };
+    struct LargeSizeTrait {
+        constexpr static int MaxSize = BufferMaxSize;
+    };
+
     // Declared in bsonobj_comparator_interface.h.
     class ComparatorInterface;
 
@@ -124,9 +135,10 @@ public:
 
     /** Construct a BSONObj from data in the proper format.
      *  Use this constructor when something else owns bsonData's buffer
-    */
-    explicit BSONObj(const char* bsonData) {
-        init(bsonData);
+     */
+    template <typename Traits = DefaultSizeTrait>
+    explicit BSONObj(const char* bsonData, Traits t = Traits{}) {
+        init<Traits>(bsonData);
     }
 
     explicit BSONObj(ConstSharedBuffer ownedBuffer)
@@ -134,8 +146,8 @@ public:
           _ownedBuffer(std::move(ownedBuffer)) {}
 
     /** Move construct a BSONObj */
-    BSONObj(BSONObj&& other) noexcept : _objdata(std::move(other._objdata)),
-                                        _ownedBuffer(std::move(other._ownedBuffer)) {
+    BSONObj(BSONObj&& other) noexcept
+        : _objdata(std::move(other._objdata)), _ownedBuffer(std::move(other._ownedBuffer)) {
         other._objdata = BSONObj()._objdata;  // To return to an empty state.
         dassert(!other.isOwned());
     }
@@ -232,8 +244,14 @@ public:
     */
     BSONObj getOwned() const;
 
+    /** Returns an owned copy of the given BSON object. */
+    static BSONObj getOwned(const BSONObj& obj);
+
     /** @return a new full (and owned) copy of the object. */
     BSONObj copy() const;
+
+    /** @return a new full (and owned) redacted copy of the object. */
+    BSONObj redact() const;
 
     /** Readable representation of a BSON object in an extended JSON-style notation.
         This is an abbreviated representation which might be used for logging.
@@ -250,12 +268,33 @@ public:
     /** Properly formatted JSON string.
         @param pretty if true we try to add some lf's and indentation
     */
-    std::string jsonString(JsonStringFormat format = Strict,
+    std::string jsonString(JsonStringFormat format = ExtendedCanonicalV2_0_0,
                            int pretty = 0,
-                           bool isArray = false) const;
+                           bool isArray = false,
+                           size_t writeLimit = 0,
+                           BSONObj* outTruncationResult = nullptr) const;
 
-    /** note: addFields always adds _id even if not specified */
-    int addFields(BSONObj& from, std::set<std::string>& fields); /* returns n added */
+    BSONObj jsonStringBuffer(JsonStringFormat format,
+                             int pretty,
+                             bool isArray,
+                             fmt::memory_buffer& buffer,
+                             size_t writeLimit = 0) const;
+
+    BSONObj jsonStringGenerator(ExtendedCanonicalV200Generator const& generator,
+                                int pretty,
+                                bool isArray,
+                                fmt::memory_buffer& buffer,
+                                size_t writeLimit = 0) const;
+    BSONObj jsonStringGenerator(ExtendedRelaxedV200Generator const& generator,
+                                int pretty,
+                                bool isArray,
+                                fmt::memory_buffer& buffer,
+                                size_t writeLimit = 0) const;
+    BSONObj jsonStringGenerator(LegacyStrictGenerator const& generator,
+                                int pretty,
+                                bool isArray,
+                                fmt::memory_buffer& buffer,
+                                size_t writeLimit = 0) const;
 
     /**
      * Add specific field to the end of the object if it did not exist, otherwise replace it
@@ -264,18 +303,37 @@ public:
      */
     BSONObj addField(const BSONElement& field) const;
 
+    /**
+     * Merges the specified 'fields' from the 'from' object into the current BSON and returns the
+     * merged object. If the 'fields' is not specified, all the fields from the 'from' object are
+     * merged.
+     *
+     * Note that if the original object already has a particular field, then the field will be
+     * replaced.
+     */
+    BSONObj addFields(const BSONObj& from,
+                      const boost::optional<std::set<std::string>>& fields = boost::none) const;
+
     /** remove specified field and return a new object with the remaining fields.
         slowish as builds a full new object
      */
     BSONObj removeField(StringData name) const;
+
+    /**
+     * Remove specified fields and return a new object with the remaining fields.
+     */
+    BSONObj removeFields(const std::set<std::string>& fields) const;
 
     /** returns # of top level fields in the object
        note: iterates to count the fields
     */
     int nFields() const;
 
-    /** adds the field names to the fields set.  does NOT clear it (appends). */
-    int getFieldNames(std::set<std::string>& fields) const;
+    /**
+     * Returns a 'Container' populated with the field names of the object.
+     */
+    template <class Container>
+    Container getFieldNames() const;
 
     /** Get the field of the specified name. eoo() is true on the returned
         element if not found.
@@ -348,10 +406,12 @@ public:
      *    this.extractFieldsUnDotted({a : 1 , c : 1}) -> {"" : 4 , "" : 6 }
      *    this.extractFieldsUnDotted({b : "blah"}) -> {"" : 5}
      *
-    */
-    BSONObj extractFieldsUnDotted(const BSONObj& pattern) const;
+     */
+    BSONObj extractFieldsUndotted(const BSONObj& pattern) const;
+    void extractFieldsUndotted(BSONObjBuilder* b, const BSONObj& pattern) const;
 
     BSONObj filterFieldsUndotted(const BSONObj& filter, bool inFilter) const;
+    void filterFieldsUndotted(BSONObjBuilder* b, const BSONObj& filter, bool inFilter) const;
 
     BSONElement getFieldUsingIndexNames(StringData fieldName, const BSONObj& indexKey) const;
 
@@ -371,9 +431,12 @@ public:
     }
 
     /** performs a cursory check on the object's size only. */
+    template <typename Traits = DefaultSizeTrait>
     bool isValid() const {
+        static_assert(Traits::MaxSize > 0 && Traits::MaxSize <= std::numeric_limits<int>::max(),
+                      "BSONObj maximum size must be within possible limits");
         int x = objsize();
-        return x > 0 && x <= BSONObjMaxInternalSize;
+        return x > 0 && x <= Traits::MaxSize;
     }
 
     /**
@@ -386,8 +449,6 @@ public:
     bool isEmpty() const {
         return objsize() <= kMinBSONLength;
     }
-
-    void dump() const;
 
     /** Alternative output format */
     std::string hexDump() const;
@@ -484,6 +545,10 @@ public:
         return *p == EOO ? "" : p + 1;
     }
 
+    StringData firstElementFieldNameStringData() const {
+        return StringData(firstElementFieldName());
+    }
+
     BSONType firstElementType() const {
         const char* p = objdata() + 4;
         return (BSONType)*p;
@@ -506,11 +571,14 @@ public:
         passed object. */
     BSONObj replaceFieldNames(const BSONObj& obj) const;
 
+    static BSONObj stripFieldNames(const BSONObj& obj);
+
+    bool hasFieldNames() const;
+
     /**
-     * Returns true if this object is valid according to the specified BSON version, and returns
-     * false otherwise.
+     * Returns true if this object is valid and returns false otherwise.
      */
-    bool valid(BSONVersion version) const;
+    bool valid() const;
 
     /** add all elements of the object to the specified vector */
     void elems(std::vector<BSONElement>&) const;
@@ -556,17 +624,30 @@ public:
     }
 
 private:
-    void _assertInvalid() const;
+    template <typename Generator>
+    BSONObj _jsonStringGenerator(const Generator& g,
+                                 int pretty,
+                                 bool isArray,
+                                 fmt::memory_buffer& buffer,
+                                 size_t writeLimit) const;
 
+    void _assertInvalid(int maxSize) const;
+
+    template <typename Traits = DefaultSizeTrait>
     void init(const char* data) {
         _objdata = data;
-        if (!isValid())
-            _assertInvalid();
+        if (!isValid<Traits>())
+            _assertInvalid(Traits::MaxSize);
     }
+
+    void _validateUnownedSize(int size) const;
 
     const char* _objdata;
     ConstSharedBuffer _ownedBuffer;
 };
+
+MONGO_STATIC_ASSERT(std::is_nothrow_move_constructible_v<BSONObj>);
+MONGO_STATIC_ASSERT(std::is_nothrow_move_assignable_v<BSONObj>);
 
 std::ostream& operator<<(std::ostream& s, const BSONObj& o);
 std::ostream& operator<<(std::ostream& s, const BSONElement& e);
@@ -666,11 +747,11 @@ private:
 class BSONObjIterator {
 public:
     /** Create an iterator for a BSON object.
-    */
+     */
     explicit BSONObjIterator(const BSONObj& jso) {
         int sz = jso.objsize();
         if (MONGO_unlikely(sz == 0)) {
-            _pos = _theend = 0;
+            _pos = _theend = nullptr;
             return;
         }
         _pos = jso.objdata() + 4;
@@ -683,13 +764,13 @@ public:
     }
 
     /** @return true if more elements exist to be enumerated. */
-    bool more() {
+    bool more() const {
         return _pos < _theend;
     }
 
     /** @return true if more elements exist to be enumerated INCLUDING the EOO element which is
      * always at the end. */
-    bool moreWithEOO() {
+    bool moreWithEOO() const {
         return _pos <= _theend;
     }
 
@@ -734,7 +815,8 @@ private:
 
 /** Base class implementing ordered iteration through BSONElements. */
 class BSONIteratorSorted {
-    MONGO_DISALLOW_COPYING(BSONIteratorSorted);
+    BSONIteratorSorted(const BSONIteratorSorted&) = delete;
+    BSONIteratorSorted& operator=(const BSONIteratorSorted&) = delete;
 
 public:
     ~BSONIteratorSorted() {
@@ -758,7 +840,7 @@ protected:
 
 private:
     const int _nfields;
-    const std::unique_ptr<const char* []> _fields;
+    const std::unique_ptr<const char*[]> _fields;
     int _cur;
 };
 
@@ -798,7 +880,7 @@ struct DataType::Handler<BSONObj> {
                        const char* ptr,
                        size_t length,
                        size_t* advanced,
-                       std::ptrdiff_t debug_offset) {
+                       std::ptrdiff_t debug_offset) noexcept try {
         auto temp = BSONObj(ptr);
         auto len = temp.objsize();
         if (bson) {
@@ -808,13 +890,15 @@ struct DataType::Handler<BSONObj> {
             *advanced = len;
         }
         return Status::OK();
+    } catch (const DBException& e) {
+        return e.toStatus();
     }
 
     static Status store(const BSONObj& bson,
                         char* ptr,
                         size_t length,
                         size_t* advanced,
-                        std::ptrdiff_t debug_offset);
+                        std::ptrdiff_t debug_offset) noexcept;
 
     static BSONObj defaultConstruct() {
         return BSONObj();
@@ -838,4 +922,16 @@ inline void BSONObj::getFields(const std::array<StringData, N>& fieldNames,
             break;
     }
 }
+
+template <class Container>
+Container BSONObj::getFieldNames() const {
+    Container fields;
+    for (auto&& elem : *this) {
+        if (elem.eoo())
+            break;
+        fields.insert(elem.fieldName());
+    }
+    return fields;
+}
+
 }  // namespace mongo

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,9 +38,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog_cache.h"
-#include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/commands/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 
 namespace mongo {
@@ -139,10 +138,10 @@ public:
 
         if (!cm->getShardKeyPattern().isShardKey(minKey) ||
             !cm->getShardKeyPattern().isShardKey(maxKey)) {
-            errmsg = str::stream() << "shard key bounds "
-                                   << "[" << minKey << "," << maxKey << ")"
-                                   << " are not valid for shard key pattern "
-                                   << cm->getShardKeyPattern().toBSON();
+            errmsg = str::stream()
+                << "shard key bounds "
+                << "[" << minKey << "," << maxKey << ")"
+                << " are not valid for shard key pattern " << cm->getShardKeyPattern().toBSON();
             return false;
         }
 
@@ -158,29 +157,29 @@ public:
             ClusterMergeChunksCommand::configField(),
             Grid::get(opCtx)->shardRegistry()->getConfigServerConnectionString().toString());
         remoteCmdObjB.append(ClusterMergeChunksCommand::shardNameField(),
-                             firstChunk->getShardId().toString());
+                             firstChunk.getShardId().toString());
+        remoteCmdObjB.append("epoch", cm->getVersion().epoch());
 
         BSONObj remoteResult;
 
         // Throws, but handled at level above.  Don't want to rewrap to preserve exception
         // formatting.
-        const auto shardStatus =
-            Grid::get(opCtx)->shardRegistry()->getShard(opCtx, firstChunk->getShardId());
-        if (!shardStatus.isOK()) {
-            return CommandHelpers::appendCommandStatus(
-                result,
-                Status(ErrorCodes::ShardNotFound,
-                       str::stream() << "Can't find shard for chunk: " << firstChunk->toString()));
-        }
+        auto shard = uassertStatusOK(
+            Grid::get(opCtx)->shardRegistry()->getShard(opCtx, firstChunk.getShardId()));
 
-        ShardConnection conn(shardStatus.getValue()->getConnString(), "");
-        bool ok = conn->runCommand("admin", remoteCmdObjB.obj(), remoteResult);
-        conn.done();
+        auto response = uassertStatusOK(shard->runCommandWithFixedRetryAttempts(
+            opCtx,
+            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+            "admin",
+            remoteCmdObjB.obj(),
+            Shard::RetryPolicy::kNotIdempotent));
+        uassertStatusOK(response.commandStatus);
 
-        Grid::get(opCtx)->catalogCache()->onStaleShardVersion(std::move(routingInfo));
+        Grid::get(opCtx)->catalogCache()->onStaleShardVersion(std::move(routingInfo),
+                                                              firstChunk.getShardId());
+        CommandHelpers::filterCommandReplyForPassthrough(response.response, &result);
 
-        CommandHelpers::filterCommandReplyForPassthrough(remoteResult, &result);
-        return ok;
+        return true;
     }
 
 } clusterMergeChunksCommand;

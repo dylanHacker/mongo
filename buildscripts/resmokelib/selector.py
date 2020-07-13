@@ -4,21 +4,20 @@ Defines filtering rules for what tests to include in a suite depending
 on whether they apply to C++ unit tests, dbtests, or JS tests.
 """
 
-from __future__ import absolute_import
-
 import collections
 import errno
 import fnmatch
 import os.path
+import random
 import subprocess
 import sys
 
 import buildscripts.ciconfig.tags as _tags
-from . import config
-from . import errors
-from . import utils
-from .utils import globstar
-from .utils import jscomment
+from buildscripts.resmokelib import config
+from buildscripts.resmokelib import errors
+from buildscripts.resmokelib import utils
+from buildscripts.resmokelib.utils import globstar
+from buildscripts.resmokelib.utils import jscomment
 
 ########################
 #  Test file explorer  #
@@ -69,7 +68,7 @@ class TestFileExplorer(object):
             A list of paths as a list(str).
         """
         tests = []
-        with open(root_file_path, "rb") as filep:
+        with open(root_file_path, "r") as filep:
             for test_path in filep:
                 test_path = test_path.strip()
                 tests.append(test_path)
@@ -90,11 +89,12 @@ class TestFileExplorer(object):
 
     def list_dbtests(self, dbtest_binary):
         """List the available dbtests suites."""
-        returncode, stdout = self._run_program(dbtest_binary, ["--list"])
+        returncode, stdout, stderr = self._run_program(dbtest_binary, ["--list"])
 
         if returncode != 0:
-            raise errors.ResmokeError("Getting list of dbtest suites failed")
-
+            raise errors.ResmokeError("Getting list of dbtest suites failed"
+                                      ", dbtest_binary=`{}`: stdout=`{}`, stderr=`{}`".format(
+                                          dbtest_binary, stdout, stderr))
         return stdout.splitlines()
 
     @staticmethod
@@ -109,10 +109,9 @@ class TestFileExplorer(object):
         """
         command = [binary]
         command.extend(args)
-        program = subprocess.Popen(command, stdout=subprocess.PIPE)
-        stdout = program.communicate()[0]
-
-        return program.returncode, stdout
+        program = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = program.communicate()
+        return program.returncode, stdout.decode("utf-8"), stderr.decode("utf-8")
 
     @staticmethod
     def parse_tag_file(test_kind):
@@ -163,7 +162,7 @@ class _TestList(object):
             else:
                 if not self._test_file_explorer.isfile(test):
                     raise ValueError("Unrecognized test file: {}".format(test))
-                expanded_tests.append(test)
+                expanded_tests.append(os.path.normpath(test))
         return expanded_tests
 
     def include_files(self, include_files, force=False):
@@ -205,7 +204,10 @@ class _TestList(object):
             else:
                 path = os.path.normpath(path)
                 if path not in self._roots:
-                    raise ValueError("Unrecognized test file: {}".format(path))
+                    raise ValueError(
+                        ("Excluded test file {} does not exist, perhaps it was renamed or removed"
+                         " , and should be modified in, or removed from, the exclude_files list.".
+                         format(path)))
                 self._filtered.discard(path)
 
     def match_tag_expression(self, tag_expression, get_tags):
@@ -308,7 +310,7 @@ def make_expression(conf):
     elif isinstance(conf, dict):
         if len(conf) != 1:
             raise ValueError("Tag matching expressions should only contain one key")
-        key = conf.keys()[0]
+        key = list(conf.keys())[0]
         value = conf[key]
         if key == "$allOf":
             return _AllOfExpression(_make_expression_list(value))
@@ -433,7 +435,15 @@ class _Selector(object):
         # 5. Apply the include files last with force=True to take precedence over the tags.
         if self._tests_are_files and selector_config.include_files:
             test_list.include_files(selector_config.include_files, force=True)
-        return test_list.get_tests()
+
+        return self.sort_tests(*test_list.get_tests())
+
+    @staticmethod
+    def sort_tests(tests, excluded):
+        """Sort the tests before returning them."""
+        if config.ORDER_TESTS_BY_NAME:
+            return sorted(tests, key=str.lower), sorted(excluded, key=str.lower)
+        return tests, excluded
 
     @staticmethod
     def get_tags(test_file):  # pylint: disable=unused-argument
@@ -442,7 +452,7 @@ class _Selector(object):
 
 
 class _JSTestSelectorConfig(_SelectorConfig):
-    """_SelectorConfig subclass for js_test tests."""
+    """_SelectorConfig subclass for JavaScript tests."""
 
     def __init__(  # pylint: disable=too-many-arguments
             self, roots=None, include_files=None, exclude_files=None, include_with_any_tags=None,
@@ -455,7 +465,7 @@ class _JSTestSelectorConfig(_SelectorConfig):
 
 
 class _JSTestSelector(_Selector):
-    """_Selector subclass for js_test tests."""
+    """_Selector subclass for JavaScript tests."""
 
     def __init__(self, test_file_explorer):
         _Selector.__init__(self, test_file_explorer)
@@ -467,6 +477,74 @@ class _JSTestSelector(_Selector):
         if test_file in self._tags:
             return list(set(file_tags) | set(self._tags[test_file]))
         return file_tags
+
+
+class _MultiJSTestSelectorConfig(_JSTestSelectorConfig):
+    """_SelectorConfig subclass for selecting groups of JavaScript tests."""
+
+    def __init__(self, group_size=None, group_count_multiplier=1, **kwargs):
+        """Init function.
+
+        :param group_size: number of tests in each group.
+        :param group_count_multiplier: number of times to schedule each workload, can be a decimal.
+               E.g. 2.5 means half of the workloads get scheduled twice, and half get scheduled
+               3 times.
+        :param kwargs: arguments forwarded to the superclass.
+        """
+        _JSTestSelectorConfig.__init__(self, **kwargs)
+        self.group_size = group_size
+        self.group_count_multiplier = group_count_multiplier
+
+
+class _MultiJSTestSelector(_JSTestSelector):
+    """_Selector subclass for selecting one group of JavaScript tests at a time.
+
+    Each group can include one or more tests.
+
+    E.g. [[test1.js, test2.js], [test3.js, test4.js]].
+    """
+
+    def select(self, selector_config):
+        """Select the tests as follows.
+
+        1. Create a corpus of tests to group by concatenating shuffled lists of raw tests
+           until we exceed "total_tests" number of tests.
+        2. Slice the corpus into "group_size" lists, put these lists in "grouped_tests".
+        """
+        tests, excluded = _JSTestSelector.select(self, selector_config)
+
+        group_size = selector_config.group_size
+        multi = selector_config.group_count_multiplier
+
+        # We use the group size as a sentinel to determine if the tests are coming from
+        # the command line, in which case group_size would be undefined. For command line
+        # tests, we assume the user is trying to repro a certain issue, so we group all
+        # of the tests together.
+        if group_size is None:
+            multi = 1
+            group_size = len(tests)
+
+        grouped_tests = []
+
+        start = 0
+        corpus = tests[:]
+        random.shuffle(corpus)
+
+        num_groups = len(tests) * multi / group_size
+        while len(grouped_tests) < num_groups:
+            if start + group_size > len(corpus):
+                recycled_tests = corpus[:start]
+                random.shuffle(recycled_tests)
+                corpus = corpus[start:] + recycled_tests
+                start = 0
+            grouped_tests.append(corpus[start:start + group_size])
+            start += group_size
+        return grouped_tests, excluded
+
+    @staticmethod
+    def sort_tests(tests, excluded):
+        """There is no need to sort FSM test groups."""
+        return tests, excluded
 
 
 class _CppTestSelectorConfig(_SelectorConfig):
@@ -555,11 +633,11 @@ class _DbTestSelector(_Selector):
         return test_files.get_tests()
 
 
-class _JsonSchemaTestSelectorConfig(_SelectorConfig):
-    """_SelectorConfig subclass for json_schema_test tests."""
+class _FileBasedSelectorConfig(_SelectorConfig):
+    """_SelectorConfig subclass for json_schema_test and mql_model_mongod_test tests."""
 
     def __init__(self, roots, include_files=None, exclude_files=None):
-        """Initialize _JsonSchemaTestSelectorConfig."""
+        """Initialize _FileBasedSelectorConfig."""
         _SelectorConfig.__init__(self, roots=roots, include_files=include_files,
                                  exclude_files=exclude_files)
 
@@ -588,6 +666,22 @@ class _PyTestCaseSelectorConfig(_SelectorConfig):
                                  exclude_files=exclude_files)
 
 
+class _GennylibTestCaseSelectorConfig(_SelectorConfig):
+    """_SelectorConfig subclass for gennylib_test tests."""
+
+    def __init__(self):
+        """Initialize _GennylibTestCaseSelectorConfig."""
+        _SelectorConfig.__init__(self, roots=["dummy-gennylib-test-roots"])
+
+
+class _GennylibTestCaseSelector(_Selector):
+    """_Selector subclass for gennylib_test tests."""
+
+    def __init__(self, test_file_explorer):
+        """Initialize _GennylibTestCaseSelector."""
+        _Selector.__init__(self, test_file_explorer, tests_are_files=False)
+
+
 ##########################################
 # Module entry point for filtering tests #
 ##########################################
@@ -598,12 +692,22 @@ _SELECTOR_REGISTRY = {
     "cpp_integration_test": (_CppTestSelectorConfig, _CppTestSelector),
     "cpp_unit_test": (_CppTestSelectorConfig, _CppTestSelector),
     "benchmark_test": (_CppTestSelectorConfig, _CppTestSelector),
+    "sdam_json_test": (_FileBasedSelectorConfig, _Selector),
+    "server_selection_json_test": (_FileBasedSelectorConfig, _Selector),
     "db_test": (_DbTestSelectorConfig, _DbTestSelector),
     "fsm_workload_test": (_JSTestSelectorConfig, _JSTestSelector),
-    "json_schema_test": (_JsonSchemaTestSelectorConfig, _Selector),
+    "parallel_fsm_workload_test": (_MultiJSTestSelectorConfig, _MultiJSTestSelector),
+    "json_schema_test": (_FileBasedSelectorConfig, _Selector),
     "js_test": (_JSTestSelectorConfig, _JSTestSelector),
+    "mql_model_haskell_test": (_FileBasedSelectorConfig, _Selector),
+    "mql_model_mongod_test": (_FileBasedSelectorConfig, _Selector),
+    "multi_stmt_txn_passthrough": (_JSTestSelectorConfig, _JSTestSelector),
     "py_test": (_PyTestCaseSelectorConfig, _Selector),
     "sleep_test": (_SleepTestCaseSelectorConfig, _SleepTestCaseSelector),
+    "genny_test": (_FileBasedSelectorConfig, _Selector),
+    "gennylib_test": (_GennylibTestCaseSelectorConfig, _GennylibTestCaseSelector),
+    "cpp_libfuzzer_test": (_CppTestSelectorConfig, _CppTestSelector),
+    "tla_plus_test": (_FileBasedSelectorConfig, _Selector),
 }
 
 
@@ -611,8 +715,7 @@ def filter_tests(test_kind, selector_config, test_file_explorer=_DEFAULT_TEST_FI
     """Filter the tests according to a specified configuration.
 
     Args:
-        test_kind: the test kind, one of 'cpp_integration_test', 'cpp_unit_test', 'db_test',
-            'json_schema_test', 'js_test'.
+        test_kind: the test kind, from _SELECTOR_REGISTRY.
         selector_config: a dict containing the selector configuration.
         test_file_explorer: the TestFileExplorer to use. Using a TestFileExplorer other than
         the default one should not be needed except for mocking purposes.

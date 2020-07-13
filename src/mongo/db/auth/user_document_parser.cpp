@@ -1,32 +1,33 @@
 /**
-*    Copyright (C) 2012 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 #include "mongo/db/auth/user_document_parser.h"
 
@@ -40,26 +41,25 @@
 #include "mongo/db/auth/user.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 namespace {
-const std::string ADMIN_DBNAME = "admin";
+constexpr StringData ADMIN_DBNAME = "admin"_sd;
 
-const std::string ROLES_FIELD_NAME = "roles";
-const std::string PRIVILEGES_FIELD_NAME = "inheritedPrivileges";
-const std::string INHERITED_ROLES_FIELD_NAME = "inheritedRoles";
-const std::string OTHER_DB_ROLES_FIELD_NAME = "otherDBRoles";
-const std::string READONLY_FIELD_NAME = "readOnly";
-const std::string CREDENTIALS_FIELD_NAME = "credentials";
-const std::string ROLE_NAME_FIELD_NAME = "role";
-const std::string ROLE_DB_FIELD_NAME = "db";
-const std::string SCRAMSHA1_CREDENTIAL_FIELD_NAME = "SCRAM-SHA-1";
-const std::string SCRAMSHA256_CREDENTIAL_FIELD_NAME = "SCRAM-SHA-256";
-const std::string MONGODB_EXTERNAL_CREDENTIAL_FIELD_NAME = "external";
+constexpr StringData ROLES_FIELD_NAME = "roles"_sd;
+constexpr StringData PRIVILEGES_FIELD_NAME = "inheritedPrivileges"_sd;
+constexpr StringData INHERITED_ROLES_FIELD_NAME = "inheritedRoles"_sd;
+constexpr StringData OTHER_DB_ROLES_FIELD_NAME = "otherDBRoles"_sd;
+constexpr StringData READONLY_FIELD_NAME = "readOnly"_sd;
+constexpr StringData CREDENTIALS_FIELD_NAME = "credentials"_sd;
+constexpr StringData ROLE_NAME_FIELD_NAME = "role"_sd;
+constexpr StringData ROLE_DB_FIELD_NAME = "db"_sd;
+constexpr StringData SCRAMSHA1_CREDENTIAL_FIELD_NAME = "SCRAM-SHA-1"_sd;
+constexpr StringData SCRAMSHA256_CREDENTIAL_FIELD_NAME = "SCRAM-SHA-256"_sd;
+constexpr StringData MONGODB_EXTERNAL_CREDENTIAL_FIELD_NAME = "external"_sd;
 constexpr StringData AUTHENTICATION_RESTRICTIONS_FIELD_NAME = "authenticationRestrictions"_sd;
 constexpr StringData INHERITED_AUTHENTICATION_RESTRICTIONS_FIELD_NAME =
     "inheritedAuthenticationRestrictions"_sd;
@@ -75,7 +75,7 @@ inline Status _badValue(const std::string& reason) {
 template <typename Credentials>
 bool parseSCRAMCredentials(const BSONElement& credentialsElement,
                            Credentials& scram,
-                           const std::string& fieldName) {
+                           StringData fieldName) {
     const auto scramElement = credentialsElement[fieldName];
     if (scramElement.eoo()) {
         return false;
@@ -126,10 +126,18 @@ Status _checkV2RolesArray(const BSONElement& rolesElement) {
 }
 
 Status V2UserDocumentParser::checkValidUserDocument(const BSONObj& doc) const {
-    BSONElement userElement = doc[AuthorizationManager::USER_NAME_FIELD_NAME];
-    BSONElement userDBElement = doc[AuthorizationManager::USER_DB_FIELD_NAME];
-    BSONElement credentialsElement = doc[CREDENTIALS_FIELD_NAME];
-    BSONElement rolesElement = doc[ROLES_FIELD_NAME];
+    auto userIdElement = doc[AuthorizationManager::USERID_FIELD_NAME];
+    auto userElement = doc[AuthorizationManager::USER_NAME_FIELD_NAME];
+    auto userDBElement = doc[AuthorizationManager::USER_DB_FIELD_NAME];
+    auto credentialsElement = doc[CREDENTIALS_FIELD_NAME];
+    auto rolesElement = doc[ROLES_FIELD_NAME];
+
+    // Validate the "userId" element.
+    if (!userIdElement.eoo()) {
+        if (!userIdElement.isBinData(BinDataType::newUUID)) {
+            return _badValue("User document needs 'userId' field to be a UUID");
+        }
+    }
 
     // Validate the "user" element.
     if (userElement.type() != String)
@@ -144,8 +152,8 @@ Status V2UserDocumentParser::checkValidUserDocument(const BSONObj& doc) const {
     StringData userDBStr = userDBElement.valueStringData();
     if (!NamespaceString::validDBName(userDBStr, NamespaceString::DollarInDbNameBehavior::Allow) &&
         userDBStr != "$external") {
-        return _badValue(mongoutils::str::stream() << "'" << userDBStr
-                                                   << "' is not a valid value for the db field.");
+        return _badValue(str::stream()
+                         << "'" << userDBStr << "' is not a valid value for the db field.");
     }
 
     // Validate the "credentials" element
@@ -176,8 +184,8 @@ Status V2UserDocumentParser::checkValidUserDocument(const BSONObj& doc) const {
                               str::stream() << fieldName << " does not exist");
             }
             if (scramElement.type() != Object) {
-                return _badValue(str::stream() << fieldName
-                                               << " credential must be an object, if present");
+                return _badValue(str::stream()
+                                 << fieldName << " credential must be an object, if present");
             }
             return Status::OK();
         };
@@ -210,6 +218,18 @@ Status V2UserDocumentParser::checkValidUserDocument(const BSONObj& doc) const {
     }
 
     return Status::OK();
+}
+
+User::UserId V2UserDocumentParser::extractUserIDFromUserDocument(const BSONObj& doc) const {
+    auto userId = doc[AuthorizationManager::USERID_FIELD_NAME];
+    if (userId.isBinData(BinDataType::newUUID)) {
+        auto id = userId.uuid();
+        User::UserId ret;
+        std::copy(id.begin(), id.end(), std::back_inserter(ret));
+        return ret;
+    }
+
+    return User::UserId();
 }
 
 std::string V2UserDocumentParser::extractUserNameFromUserDocument(const BSONObj& doc) const {
@@ -436,30 +456,40 @@ Status V2UserDocumentParser::initializeUserPrivilegesFromUserDocument(const BSON
     std::string errmsg;
     for (BSONObjIterator it(privilegesElement.Obj()); it.more(); it.next()) {
         if ((*it).type() != Object) {
-            warning() << "Wrong type of element in inheritedPrivileges array for "
-                      << user->getName() << ": " << *it;
+            LOGV2_WARNING(23743,
+                          "Wrong type of element in inheritedPrivileges array",
+                          "user"_attr = user->getName(),
+                          "element"_attr = *it);
             continue;
         }
         Privilege privilege;
         ParsedPrivilege pp;
         if (!pp.parseBSON((*it).Obj(), &errmsg)) {
-            warning() << "Could not parse privilege element in user document for "
-                      << user->getName() << ": " << errmsg;
+            LOGV2_WARNING(23744,
+                          "Could not parse privilege element in user document",
+                          "user"_attr = user->getName(),
+                          "error"_attr = errmsg);
             continue;
         }
         std::vector<std::string> unrecognizedActions;
         Status status =
             ParsedPrivilege::parsedPrivilegeToPrivilege(pp, &privilege, &unrecognizedActions);
         if (!status.isOK()) {
-            warning() << "Could not parse privilege element in user document for "
-                      << user->getName() << causedBy(status);
+            LOGV2_WARNING(23745,
+                          "Could not parse privilege element in user document",
+                          "user"_attr = user->getName(),
+                          "error"_attr = causedBy(status));
             continue;
         }
         if (unrecognizedActions.size()) {
             std::string unrecognizedActionsString;
-            joinStringDelim(unrecognizedActions, &unrecognizedActionsString, ',');
-            warning() << "Encountered unrecognized actions \" " << unrecognizedActionsString
-                      << "\" while parsing user document for " << user->getName();
+            str::joinStringDelim(unrecognizedActions, &unrecognizedActionsString, ',');
+            LOGV2_WARNING(23746,
+                          "Encountered unrecognized actions \"{action}\" while "
+                          "parsing user document for {user}",
+                          "Encountered unrecognized actions while parsing user document",
+                          "action"_attr = unrecognizedActionsString,
+                          "user"_attr = user->getName());
         }
         privileges.push_back(privilege);
     }

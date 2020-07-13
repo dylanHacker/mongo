@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,14 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
-
 #include "mongo/platform/basic.h"
 
+#include "mongo/s/catalog_cache_test_fixture.h"
+
+#include <memory>
 #include <set>
 #include <vector>
-
-#include "mongo/s/catalog_cache_test_fixture.h"
 
 #include "mongo/client/remote_command_targeter_factory_mock.h"
 #include "mongo/client/remote_command_targeter_mock.h"
@@ -44,8 +44,8 @@
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog_cache.h"
+#include "mongo/s/database_version_helpers.h"
 #include "mongo/s/grid.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/scopeguard.h"
 
@@ -56,43 +56,51 @@ void CatalogCacheTestFixture::setUp() {
     setRemote(HostAndPort("FakeRemoteClient:34567"));
     configTargeter()->setFindHostReturnValue(kConfigHostAndPort);
 
-    CollatorFactoryInterface::set(serviceContext(), stdx::make_unique<CollatorFactoryMock>());
+    CollatorFactoryInterface::set(getServiceContext(), std::make_unique<CollatorFactoryMock>());
 }
 
 executor::NetworkTestEnv::FutureHandle<boost::optional<CachedCollectionRoutingInfo>>
-CatalogCacheTestFixture::scheduleRoutingInfoRefresh(const NamespaceString& nss) {
+CatalogCacheTestFixture::scheduleRoutingInfoForcedRefresh(const NamespaceString& nss) {
     return launchAsync([this, nss] {
-        auto client = serviceContext()->makeClient("Test");
-        auto opCtx = client->makeOperationContext();
-        auto const catalogCache = Grid::get(serviceContext())->catalogCache();
-        catalogCache->invalidateShardedCollection(nss);
+        auto client = getServiceContext()->makeClient("Test");
+        auto const catalogCache = Grid::get(getServiceContext())->catalogCache();
 
-        return boost::make_optional(
-            uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx.get(), nss)));
+        return boost::make_optional(uassertStatusOK(
+            catalogCache->getCollectionRoutingInfoWithRefresh(operationContext(), nss)));
     });
 }
 
-void CatalogCacheTestFixture::setupNShards(int numShards) {
-    setupShards([&]() {
-        std::vector<ShardType> shards;
-        for (int i = 0; i < numShards; i++) {
-            ShardId name(str::stream() << i);
-            HostAndPort host(str::stream() << "Host" << i << ":12345");
+executor::NetworkTestEnv::FutureHandle<boost::optional<CachedCollectionRoutingInfo>>
+CatalogCacheTestFixture::scheduleRoutingInfoUnforcedRefresh(const NamespaceString& nss) {
+    return launchAsync([this, nss] {
+        auto client = getServiceContext()->makeClient("Test");
+        auto const catalogCache = Grid::get(getServiceContext())->catalogCache();
 
-            ShardType shard;
-            shard.setName(name.toString());
-            shard.setHost(host.toString());
-            shards.emplace_back(std::move(shard));
+        return boost::make_optional(
+            uassertStatusOK(catalogCache->getCollectionRoutingInfo(operationContext(), nss)));
+    });
+}
 
-            std::unique_ptr<RemoteCommandTargeterMock> targeter(
-                stdx::make_unique<RemoteCommandTargeterMock>());
-            targeter->setConnectionStringReturnValue(ConnectionString(host));
-            targeter->setFindHostReturnValue(host);
-            targeterFactory()->addTargeterToReturn(ConnectionString(host), std::move(targeter));
-        }
+std::vector<ShardType> CatalogCacheTestFixture::setupNShards(int numShards) {
+    std::vector<ShardType> shards;
+    for (int i = 0; i < numShards; i++) {
+        ShardId name(str::stream() << i);
+        HostAndPort host(str::stream() << "Host" << i << ":12345");
 
-        return shards;
-    }());
+        ShardType shard;
+        shard.setName(name.toString());
+        shard.setHost(host.toString());
+        shards.emplace_back(std::move(shard));
+
+        std::unique_ptr<RemoteCommandTargeterMock> targeter(
+            std::make_unique<RemoteCommandTargeterMock>());
+        targeter->setConnectionStringReturnValue(ConnectionString(host));
+        targeter->setFindHostReturnValue(host);
+        targeterFactory()->addTargeterToReturn(ConnectionString(host), std::move(targeter));
+    }
+
+    setupShards(shards);
+    return shards;
 }
 
 std::shared_ptr<ChunkManager> CatalogCacheTestFixture::makeChunkManager(
@@ -104,7 +112,7 @@ std::shared_ptr<ChunkManager> CatalogCacheTestFixture::makeChunkManager(
     ChunkVersion version(1, 0, OID::gen());
 
     const BSONObj databaseBSON = [&]() {
-        DatabaseType db(nss.db().toString(), {"0"}, true);
+        DatabaseType db(nss.db().toString(), {"0"}, true, databaseVersion::makeNew());
         return db.toBSON();
     }();
 
@@ -137,6 +145,7 @@ std::shared_ptr<ChunkManager> CatalogCacheTestFixture::makeChunkManager(
              shardKeyPattern.getKeyPattern().extendRangeBound(splitPointsIncludingEnds[i], false)},
             version,
             ShardId{str::stream() << (i - 1)});
+        chunk.setName(OID::gen());
 
         initialChunks.push_back(chunk.toConfigBSON());
 
@@ -145,23 +154,22 @@ std::shared_ptr<ChunkManager> CatalogCacheTestFixture::makeChunkManager(
 
     setupNShards(initialChunks.size());
 
-    auto future = scheduleRoutingInfoRefresh(nss);
+    auto future = scheduleRoutingInfoUnforcedRefresh(nss);
 
     expectFindSendBSONObjVector(kConfigHostAndPort, {databaseBSON});
     expectFindSendBSONObjVector(kConfigHostAndPort, {collectionBSON});
-    expectFindSendBSONObjVector(kConfigHostAndPort, {collectionBSON});
     expectFindSendBSONObjVector(kConfigHostAndPort, initialChunks);
 
-    auto routingInfo = future.timed_get(kFutureTimeout);
+    auto routingInfo = future.default_timed_get();
     ASSERT(routingInfo->cm());
     ASSERT(routingInfo->db().primary());
 
     return routingInfo->cm();
 }
 
-void CatalogCacheTestFixture::expectGetDatabase(NamespaceString nss) {
+void CatalogCacheTestFixture::expectGetDatabase(NamespaceString nss, std::string shardId) {
     expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
-        DatabaseType db(nss.db().toString(), {"0"}, true);
+        DatabaseType db(nss.db().toString(), {shardId}, true, databaseVersion::makeNew());
         return std::vector<BSONObj>{db.toBSON()};
     }());
 }
@@ -182,30 +190,47 @@ void CatalogCacheTestFixture::expectGetCollection(NamespaceString nss,
 
 CachedCollectionRoutingInfo CatalogCacheTestFixture::loadRoutingTableWithTwoChunksAndTwoShards(
     NamespaceString nss) {
-    const OID epoch = OID::gen();
-    const ShardKeyPattern shardKeyPattern(BSON("_id" << 1));
 
-    auto future = scheduleRoutingInfoRefresh(nss);
+    return loadRoutingTableWithTwoChunksAndTwoShardsImpl(nss, BSON("_id" << 1));
+}
+
+CachedCollectionRoutingInfo CatalogCacheTestFixture::loadRoutingTableWithTwoChunksAndTwoShardsHash(
+    NamespaceString nss) {
+
+    return loadRoutingTableWithTwoChunksAndTwoShardsImpl(nss,
+                                                         BSON("_id"
+                                                              << "hashed"));
+}
+
+CachedCollectionRoutingInfo CatalogCacheTestFixture::loadRoutingTableWithTwoChunksAndTwoShardsImpl(
+    NamespaceString nss, const BSONObj& shardKey) {
+    const OID epoch = OID::gen();
+    const ShardKeyPattern shardKeyPattern(shardKey);
+
+    auto future = scheduleRoutingInfoForcedRefresh(nss);
 
     // Mock the expected config server queries.
-    expectGetDatabase(nss);
-    expectGetCollection(nss, epoch, shardKeyPattern);
+    if (!nss.isAdminDB() && !nss.isConfigDB()) {
+        expectGetDatabase(nss);
+    }
     expectGetCollection(nss, epoch, shardKeyPattern);
     expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
         ChunkVersion version(1, 0, epoch);
 
         ChunkType chunk1(
             nss, {shardKeyPattern.getKeyPattern().globalMin(), BSON("_id" << 0)}, version, {"0"});
+        chunk1.setName(OID::gen());
         version.incMinor();
 
         ChunkType chunk2(
             nss, {BSON("_id" << 0), shardKeyPattern.getKeyPattern().globalMax()}, version, {"1"});
+        chunk2.setName(OID::gen());
         version.incMinor();
 
         return std::vector<BSONObj>{chunk1.toConfigBSON(), chunk2.toConfigBSON()};
     }());
 
-    return future.timed_get(kFutureTimeout).get();
+    return future.default_timed_get().get();
 }
 
 }  // namespace mongo

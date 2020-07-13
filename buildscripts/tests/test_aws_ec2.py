@@ -1,7 +1,5 @@
 """Unit test for buildscripts/aws_ec2.py."""
 
-from __future__ import absolute_import
-
 import datetime
 import unittest
 
@@ -14,6 +12,7 @@ _INSTANCE_TYPE = "t1.micro"
 
 
 class AwsEc2TestCase(unittest.TestCase):  # pylint: disable=too-many-instance-attributes
+    @unittest.skip("Known broken. SERVER-48969 tracks re-enabling.")
     def setUp(self):
         self.aws_ec2 = aws_ec2.AwsEc2()
         self.launched_instances = []
@@ -23,8 +22,8 @@ class AwsEc2TestCase(unittest.TestCase):  # pylint: disable=too-many-instance-at
         self.security_groups = None
         self.expire_dt = datetime.datetime.utcnow() + datetime.timedelta(hours=1)
         self.tags = [{"Key": "expire-on", "Value": self.expire_dt.strftime("%Y-%m-%d %H:%M:%S")},
-                     {"Key": "Name",
-                      "Value": "Unittest AWS EC2 Launcher"}, {"Key": "owner", "Value": ""}]
+                     {"Key": "Name", "Value": "Unittest AWS EC2 Launcher"},
+                     {"Key": "owner", "Value": ""}]
 
     def tearDown(self):
         for instance in self.launched_instances:
@@ -32,11 +31,13 @@ class AwsEc2TestCase(unittest.TestCase):  # pylint: disable=too-many-instance-at
 
 
 class AwsEc2Connect(AwsEc2TestCase):
+    @unittest.skip("Known broken. SERVER-48969 tracks re-enabling.")
     def runTest(self):
         self.assertIsNotNone(self.aws_ec2)
 
 
 class AwsEc2Launch(AwsEc2TestCase):
+    @unittest.skip("Known broken. SERVER-48969 tracks re-enabling.")
     def runTest(self):
         code, ret = self.aws_ec2.launch_instance(
             ami=self.ami, instance_type=self.instance_type, key_name=self.key_name,
@@ -129,10 +130,11 @@ class AwsEc2ControlStatus(AwsEc2TestCase):
 
         code, ret = self.aws_ec2.control_instance(mode="status", image_id="bad_id")
         self.assertNotEqual(0, code, ret)
-        self.assertRegexpMatches(ret, "Invalid", ret)
+        self.assertRegex(ret, "Invalid", ret)
 
 
 class AwsEc2ControlStart(AwsEc2TestCase):
+    @unittest.skip("Known broken. SERVER-48969 tracks re-enabling.")
     def runTest(self):
         code, ret = self.aws_ec2.launch_instance(
             ami=self.ami, instance_type=self.instance_type, key_name=self.key_name,
@@ -146,6 +148,7 @@ class AwsEc2ControlStart(AwsEc2TestCase):
 
 
 class AwsEc2ControlStartReboot(AwsEc2TestCase):
+    @unittest.skip("Known broken. SERVER-48969 tracks re-enabling.")
     def runTest(self):
         code, ret = self.aws_ec2.launch_instance(
             ami=self.ami, instance_type=self.instance_type, key_name=self.key_name,

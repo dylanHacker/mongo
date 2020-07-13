@@ -1,37 +1,35 @@
 /**
- * Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/connection_string.h"
-#include "mongo/client/remote_command_targeter.h"
-#include "mongo/client/remote_command_targeter_factory_mock.h"
-#include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/s/catalog/type_shard.h"
@@ -41,7 +39,6 @@
 #include "mongo/s/query/establish_cursors.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/s/sharding_router_test_fixture.h"
-#include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
@@ -70,7 +67,7 @@ protected:
             shards.push_back(shardType);
 
             std::unique_ptr<RemoteCommandTargeterMock> targeter(
-                stdx::make_unique<RemoteCommandTargeterMock>());
+                std::make_unique<RemoteCommandTargeterMock>());
             targeter->setConnectionStringReturnValue(ConnectionString(kTestShardHosts[i]));
             targeter->setFindHostReturnValue(kTestShardHosts[i]);
 
@@ -128,7 +125,7 @@ TEST_F(ShardRemoteTest, NetworkReplyWithLastCommittedOpTime) {
         return std::make_tuple(result, metadata);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     // Verify the targeted shard has updated its lastCommittedOpTime.
     ASSERT_EQ(expectedTime,
@@ -155,7 +152,7 @@ TEST_F(ShardRemoteTest, NetworkReplyWithoutLastCommittedOpTime) {
         return std::make_tuple(result, metadata);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     // Verify the targeted shard has not updated its lastCommittedOpTime.
     ASSERT_EQ(LogicalTime::kUninitialized,
@@ -184,20 +181,47 @@ TEST_F(ShardRemoteTest, ScatterGatherRepliesWithLastCommittedOpTime) {
         onCommandWithMetadata([&](const executor::RemoteCommandRequest& request) {
             std::vector<BSONObj> batch = {BSON("_id" << 1)};
             CursorResponse cursorResponse(nss, CursorId(123), batch);
-            auto result = cursorResponse.toBSON(CursorResponse::ResponseType::InitialResponse);
+            auto result = BSONObjBuilder(
+                cursorResponse.toBSON(CursorResponse::ResponseType::InitialResponse));
+            result.appendElements(makeLastCommittedOpTimeMetadata(expectedTime));
 
-            return executor::RemoteCommandResponse(
-                result, makeLastCommittedOpTimeMetadata(expectedTime), Milliseconds(1));
+            return executor::RemoteCommandResponse(result.obj(), Milliseconds(1));
         });
     }
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     // Verify all shards updated their lastCommittedOpTime.
     for (auto shardId : kTestShardIds) {
         ASSERT_EQ(expectedTime,
                   shardRegistry()->getShardNoReload(shardId)->getLastCommittedOpTime());
     }
+}
+
+TEST_F(ShardRemoteTest, TargeterMarksHostAsDownWhenConfigStepdown) {
+    auto targetedNode = ShardId("config");
+
+    ASSERT_EQ(0UL, configTargeter()->getAndClearMarkedDownHosts().size());
+    auto future = launchAsync([&] { runDummyCommandOnShard(targetedNode); });
+
+    auto error = Status(ErrorCodes::PrimarySteppedDown, "Config stepped down");
+    onCommand([&](const executor::RemoteCommandRequest& request) { return error; });
+
+    ASSERT_THROWS_CODE(future.default_timed_get(), DBException, ErrorCodes::PrimarySteppedDown);
+    ASSERT_EQ(1UL, configTargeter()->getAndClearMarkedDownHosts().size());
+}
+
+TEST_F(ShardRemoteTest, TargeterMarksHostAsDownWhenConfigShuttingDown) {
+    auto targetedNode = ShardId("config");
+
+    ASSERT_EQ(0UL, configTargeter()->getAndClearMarkedDownHosts().size());
+    auto future = launchAsync([&] { runDummyCommandOnShard(targetedNode); });
+
+    auto error = Status(ErrorCodes::InterruptedAtShutdown, "Interrupted at shutdown");
+    onCommand([&](const executor::RemoteCommandRequest& request) { return error; });
+
+    ASSERT_THROWS_CODE(future.default_timed_get(), DBException, ErrorCodes::InterruptedAtShutdown);
+    ASSERT_EQ(1UL, configTargeter()->getAndClearMarkedDownHosts().size());
 }
 
 }  // namespace

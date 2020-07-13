@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,6 +29,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
 #include <utility>
 
 #include "mongo/bson/json.h"
@@ -35,7 +37,8 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/query/find_and_modify_request.h"
 #include "mongo/db/repl/read_concern_args.h"
-#include "mongo/executor/network_interface_mock.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
+#include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/executor/network_test_env.h"
 #include "mongo/s/catalog/dist_lock_catalog_impl.h"
 #include "mongo/s/catalog/dist_lock_manager_mock.h"
@@ -45,9 +48,7 @@
 #include "mongo/s/client/shard_factory.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/shard_server_test_fixture.h"
 #include "mongo/s/write_ops/batched_command_request.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -70,17 +71,17 @@ const HostAndPort dummyHost("dummy", 123);
 class DistLockCatalogTest : public ShardServerTestFixture {
 protected:
     std::unique_ptr<DistLockCatalog> makeDistLockCatalog() override {
-        return stdx::make_unique<DistLockCatalogImpl>();
+        return std::make_unique<DistLockCatalogImpl>();
     }
 
     std::unique_ptr<DistLockManager> makeDistLockManager(
         std::unique_ptr<DistLockCatalog> distLockCatalog) override {
-        return stdx::make_unique<DistLockManagerMock>(std::move(distLockCatalog));
+        return std::make_unique<DistLockManagerMock>(std::move(distLockCatalog));
     }
 
     std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient(
         std::unique_ptr<DistLockManager> distLockManager) override {
-        return stdx::make_unique<ShardingCatalogClientMock>(std::move(distLockManager));
+        return std::make_unique<ShardingCatalogClientMock>(std::move(distLockManager));
     }
 
     std::shared_ptr<RemoteCommandTargeterMock> configTargeter() {
@@ -90,8 +91,7 @@ protected:
     auto launchOnSeparateThread(std::function<void(OperationContext*)> func) {
         auto const serviceContext = getServiceContext();
         return launchAsync([serviceContext, func] {
-            ON_BLOCK_EXIT([&] { Client::destroy(); });
-            Client::initThreadIfNotAlready("Test");
+            ThreadClient tc("Test", getGlobalServiceContext());
             auto opCtx = Client::getCurrent()->makeOperationContext();
             func(opCtx.get());
         });
@@ -139,7 +139,7 @@ TEST_F(DistLockCatalogTest, BasicPing) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, PingTargetError) {
@@ -171,7 +171,7 @@ TEST_F(DistLockCatalogTest, PingCommandError) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, PingWriteError) {
@@ -189,7 +189,7 @@ TEST_F(DistLockCatalogTest, PingWriteError) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, PingWriteConcernError) {
@@ -210,7 +210,7 @@ TEST_F(DistLockCatalogTest, PingWriteConcernError) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, PingUnsupportedWriteConcernResponse) {
@@ -232,7 +232,7 @@ TEST_F(DistLockCatalogTest, PingUnsupportedWriteConcernResponse) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, PingUnsupportedResponseFormat) {
@@ -246,7 +246,7 @@ TEST_F(DistLockCatalogTest, PingUnsupportedResponseFormat) {
                          << "NaN");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, GrabLockNoOp) {
@@ -288,7 +288,7 @@ TEST_F(DistLockCatalogTest, GrabLockNoOp) {
         return fromjson("{ ok: 1, value: null }");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, GrabLockWithNewDoc) {
@@ -352,7 +352,7 @@ TEST_F(DistLockCatalogTest, GrabLockWithNewDoc) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, GrabLockWithBadLockDoc) {
@@ -385,7 +385,7 @@ TEST_F(DistLockCatalogTest, GrabLockWithBadLockDoc) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, GrabLockTargetError) {
@@ -423,7 +423,7 @@ TEST_F(DistLockCatalogTest, GrabLockCommandError) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, GrabLockDupKeyError) {
@@ -436,14 +436,11 @@ TEST_F(DistLockCatalogTest, GrabLockDupKeyError) {
     });
 
     onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
-        return fromjson(R"({
-                ok: 0,
-                errmsg: "duplicate key error",
-                code: 11000
-            })");
+        return Status(
+            {DuplicateKeyErrorInfo(BSON("x" << 1), BSON("" << 1)), "Mock duplicate key error"});
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, GrabLockWriteError) {
@@ -463,7 +460,7 @@ TEST_F(DistLockCatalogTest, GrabLockWriteError) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, GrabLockWriteConcernError) {
@@ -486,7 +483,7 @@ TEST_F(DistLockCatalogTest, GrabLockWriteConcernError) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, GrabLockWriteConcernErrorBadType) {
@@ -507,7 +504,7 @@ TEST_F(DistLockCatalogTest, GrabLockWriteConcernErrorBadType) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, GrabLockResponseMissingValueField) {
@@ -525,7 +522,7 @@ TEST_F(DistLockCatalogTest, GrabLockResponseMissingValueField) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, GrabLockUnsupportedWriteConcernResponse) {
@@ -549,7 +546,7 @@ TEST_F(DistLockCatalogTest, GrabLockUnsupportedWriteConcernResponse) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, GrabLockUnsupportedResponseFormat) {
@@ -565,7 +562,7 @@ TEST_F(DistLockCatalogTest, GrabLockUnsupportedResponseFormat) {
                          << "NaN");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, OvertakeLockNoOp) {
@@ -614,7 +611,7 @@ TEST_F(DistLockCatalogTest, OvertakeLockNoOp) {
         return fromjson("{ ok: 1, value: null }");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, OvertakeLockWithNewDoc) {
@@ -683,7 +680,7 @@ TEST_F(DistLockCatalogTest, OvertakeLockWithNewDoc) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, OvertakeLockWithBadLockDoc) {
@@ -718,7 +715,7 @@ TEST_F(DistLockCatalogTest, OvertakeLockWithBadLockDoc) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, OvertakeLockTargetError) {
@@ -759,7 +756,7 @@ TEST_F(DistLockCatalogTest, OvertakeLockCommandError) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, OvertakeLockWriteError) {
@@ -780,7 +777,7 @@ TEST_F(DistLockCatalogTest, OvertakeLockWriteError) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, OvertakeLockWriteConcernError) {
@@ -804,7 +801,7 @@ TEST_F(DistLockCatalogTest, OvertakeLockWriteConcernError) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, OvertakeLockUnsupportedWriteConcernResponse) {
@@ -829,7 +826,7 @@ TEST_F(DistLockCatalogTest, OvertakeLockUnsupportedWriteConcernResponse) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, OvertakeLockUnsupportedResponseFormat) {
@@ -846,7 +843,7 @@ TEST_F(DistLockCatalogTest, OvertakeLockUnsupportedResponseFormat) {
                          << "NaN");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, BasicUnlock) {
@@ -880,7 +877,7 @@ TEST_F(DistLockCatalogTest, BasicUnlock) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, BasicUnlockWithName) {
@@ -914,7 +911,7 @@ TEST_F(DistLockCatalogTest, BasicUnlockWithName) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, UnlockWithNoNewDoc) {
@@ -944,7 +941,7 @@ TEST_F(DistLockCatalogTest, UnlockWithNoNewDoc) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, UnlockWithNameWithNoNewDoc) {
@@ -974,7 +971,7 @@ TEST_F(DistLockCatalogTest, UnlockWithNameWithNoNewDoc) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, UnlockTargetError) {
@@ -1006,7 +1003,7 @@ TEST_F(DistLockCatalogTest, UnlockCommandError) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, UnlockWriteError) {
@@ -1024,7 +1021,7 @@ TEST_F(DistLockCatalogTest, UnlockWriteError) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, UnlockWriteConcernError) {
@@ -1049,15 +1046,7 @@ TEST_F(DistLockCatalogTest, UnlockWriteConcernError) {
         return writeConcernFailedResponse;
     });
 
-    onCommand([&](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
-        return writeConcernFailedResponse;
-    });
-
-    onCommand([&](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
-        return writeConcernFailedResponse;
-    });
-
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, UnlockUnsupportedWriteConcernResponse) {
@@ -1079,7 +1068,7 @@ TEST_F(DistLockCatalogTest, UnlockUnsupportedWriteConcernResponse) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, UnlockUnsupportedResponseFormat) {
@@ -1093,7 +1082,7 @@ TEST_F(DistLockCatalogTest, UnlockUnsupportedResponseFormat) {
                          << "NaN");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, BasicUnlockAll) {
@@ -1122,12 +1111,12 @@ TEST_F(DistLockCatalogTest, BasicUnlockAll) {
         ASSERT(update.getMulti());
         ASSERT_BSONOBJ_EQ(BSON(LocksType::process("processID")), update.getQ());
         ASSERT_BSONOBJ_EQ(BSON("$set" << BSON(LocksType::state(LocksType::UNLOCKED))),
-                          update.getU());
+                          update.getU().getUpdateClassic());
 
         return BSON("ok" << 1);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, UnlockAllWriteFailed) {
@@ -1141,7 +1130,7 @@ TEST_F(DistLockCatalogTest, UnlockAllWriteFailed) {
                          << "something went wrong");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, UnlockAllNetworkError) {
@@ -1156,7 +1145,7 @@ TEST_F(DistLockCatalogTest, UnlockAllNetworkError) {
         });
     }
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, BasicGetServerInfo) {
@@ -1185,7 +1174,7 @@ TEST_F(DistLockCatalogTest, BasicGetServerInfo) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, GetServerTargetError) {
@@ -1217,7 +1206,7 @@ TEST_F(DistLockCatalogTest, GetServerCommandError) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, GetServerBadElectionId) {
@@ -1238,7 +1227,7 @@ TEST_F(DistLockCatalogTest, GetServerBadElectionId) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, GetServerBadLocalTime) {
@@ -1259,7 +1248,7 @@ TEST_F(DistLockCatalogTest, GetServerBadLocalTime) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, GetServerNoGLEStats) {
@@ -1276,7 +1265,7 @@ TEST_F(DistLockCatalogTest, GetServerNoGLEStats) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, GetServerNoElectionId) {
@@ -1297,7 +1286,7 @@ TEST_F(DistLockCatalogTest, GetServerNoElectionId) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, GetServerInvalidReplSubsectionShouldFail) {
@@ -1317,7 +1306,7 @@ TEST_F(DistLockCatalogTest, GetServerInvalidReplSubsectionShouldFail) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, GetServerNoElectionIdButMasterShouldFail) {
@@ -1338,7 +1327,7 @@ TEST_F(DistLockCatalogTest, GetServerNoElectionIdButMasterShouldFail) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, BasicStopPing) {
@@ -1370,7 +1359,7 @@ TEST_F(DistLockCatalogTest, BasicStopPing) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, StopPingTargetError) {
@@ -1402,7 +1391,7 @@ TEST_F(DistLockCatalogTest, StopPingCommandError) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, StopPingWriteError) {
@@ -1420,7 +1409,7 @@ TEST_F(DistLockCatalogTest, StopPingWriteError) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, StopPingWriteConcernError) {
@@ -1441,7 +1430,7 @@ TEST_F(DistLockCatalogTest, StopPingWriteConcernError) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, StopPingUnsupportedWriteConcernResponse) {
@@ -1463,7 +1452,7 @@ TEST_F(DistLockCatalogTest, StopPingUnsupportedWriteConcernResponse) {
             })");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, StopPingUnsupportedResponseFormat) {
@@ -1477,7 +1466,7 @@ TEST_F(DistLockCatalogTest, StopPingUnsupportedResponseFormat) {
                          << "NaN");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, BasicGetPing) {
@@ -1514,7 +1503,7 @@ TEST_F(DistLockCatalogTest, BasicGetPing) {
         return result;
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, GetPingTargetError) {
@@ -1542,7 +1531,7 @@ TEST_F(DistLockCatalogTest, GetPingNotFound) {
         return std::vector<BSONObj>();
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, GetPingUnsupportedFormat) {
@@ -1565,7 +1554,7 @@ TEST_F(DistLockCatalogTest, GetPingUnsupportedFormat) {
         return result;
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, BasicGetLockByTS) {
@@ -1600,7 +1589,7 @@ TEST_F(DistLockCatalogTest, BasicGetLockByTS) {
         return result;
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, GetLockByTSTargetError) {
@@ -1627,7 +1616,7 @@ TEST_F(DistLockCatalogTest, GetLockByTSNotFound) {
         return std::vector<BSONObj>();
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, GetLockByTSUnsupportedFormat) {
@@ -1650,7 +1639,7 @@ TEST_F(DistLockCatalogTest, GetLockByTSUnsupportedFormat) {
         return result;
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, BasicGetLockByName) {
@@ -1687,7 +1676,7 @@ TEST_F(DistLockCatalogTest, BasicGetLockByName) {
         return result;
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, GetLockByNameTargetError) {
@@ -1715,7 +1704,7 @@ TEST_F(DistLockCatalogTest, GetLockByNameNotFound) {
         return std::vector<BSONObj>();
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DistLockCatalogTest, GetLockByNameUnsupportedFormat) {
@@ -1738,7 +1727,7 @@ TEST_F(DistLockCatalogTest, GetLockByNameUnsupportedFormat) {
         return result;
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 }  // namespace

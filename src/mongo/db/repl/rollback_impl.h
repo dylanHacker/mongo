@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,13 +29,14 @@
 
 #pragma once
 
+#include <functional>
+
 #include "mongo/base/status_with.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/roll_back_local_operations.h"
 #include "mongo/db/repl/rollback.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -93,6 +95,16 @@ struct RollbackStats {
      * The directory containing rollback data files, if any were written.
      */
     boost::optional<std::string> rollbackDataFileDirectory;
+
+    /**
+     * The last wall clock time on the branch of history being rolled back, if known.
+     */
+    boost::optional<Date_t> lastLocalWallClockTime;
+
+    /**
+     * The wall clock time of the first operation after the common point, if known.
+     */
+    boost::optional<Date_t> firstOpWallClockTimeAfterCommonPoint;
 };
 
 /**
@@ -176,6 +188,11 @@ public:
         virtual void onCommonPointFound(Timestamp commonPoint) noexcept {}
 
         /**
+         * Function called after we have incremented the rollback ID.
+         */
+        virtual void onRollbackIDIncremented() noexcept {}
+
+        /**
          * Function called after a rollback file has been written for each namespace with inserts or
          * updates that are being rolled back.
          */
@@ -183,8 +200,9 @@ public:
 
         /**
          * Function called after we recover to the stable timestamp.
+         * NOTE: This may throw, for testing purposes.
          */
-        virtual void onRecoverToStableTimestamp(Timestamp stableTimestamp) noexcept {}
+        virtual void onRecoverToStableTimestamp(Timestamp stableTimestamp) {}
 
         /**
          * Function called after we set the oplog truncate after point.
@@ -195,6 +213,11 @@ public:
          * Function called after we recover from the oplog.
          */
         virtual void onRecoverFromOplog() noexcept {}
+
+        /**
+         * Function called after we reconstruct prepared transactions.
+         */
+        virtual void onPreparedTransactionsReconstructed() noexcept {}
 
         /**
          * Function called after we have triggered the 'onRollback' OpObserver method.
@@ -262,7 +285,7 @@ public:
     virtual const std::vector<BSONObj>& docsDeletedForNamespace_forTest(UUID uuid) const& {
         MONGO_UNREACHABLE;
     }
-    void docsDeletedForNamespace_forTest(UUID)&& = delete;
+    void docsDeletedForNamespace_forTest(UUID) && = delete;
 
 protected:
     /**
@@ -313,11 +336,16 @@ private:
         OperationContext* opCtx);
 
     /**
-     * Finds the timestamp of the record after the common point to put into the oplog truncate
-     * after point.
+     * Determines whether or not we are trying to roll back too much data. Returns an
+     * UnrecoverableRollbackError if we have exceeded the limit.
      */
-    Timestamp _findTruncateTimestamp(
-        OperationContext* opCtx, RollBackLocalOperations::RollbackCommonPoint commonPoint) const;
+    Status _checkAgainstTimeLimit(RollBackLocalOperations::RollbackCommonPoint commonPoint);
+
+    /**
+     * Kills all user operations currently being performed. Since this node is a secondary, these
+     * operations are all reads.
+     */
+    void _killAllUserOperations(OperationContext* opCtx);
 
     /**
      * Uses the ReplicationCoordinator to transition the current member state to ROLLBACK.
@@ -329,33 +357,46 @@ private:
     Status _transitionToRollback(OperationContext* opCtx);
 
     /**
-     * Waits for any in-progress background index builds to complete. We do this before beginning
+     * Stops any active index builds and waits for them to complete. We do this before beginning
      * the rollback process to prevent any issues surrounding index builds pausing/resuming around a
      * call to 'recoverToStableTimestamp'. It's not clear that an index build, resumed in this way,
      * that continues until completion, would be consistent with the collection data. Waiting for
      * all background index builds to complete is a conservative approach, to avoid any of these
      * potential issues.
      */
-    Status _awaitBgIndexCompletion(OperationContext* opCtx);
+    void _stopAndWaitForIndexBuilds(OperationContext* opCtx);
 
     /**
      * Recovers to the stable timestamp while holding the global exclusive lock.
      * Returns the stable timestamp that the storage engine recovered to.
      */
-    StatusWith<Timestamp> _recoverToStableTimestamp(OperationContext* opCtx);
+    Timestamp _recoverToStableTimestamp(OperationContext* opCtx);
 
     /**
      * Process a single oplog entry that is getting rolled back and update the necessary rollback
      * info structures. This function assumes that oplog entries are processed in descending
      * timestamp order (that is, starting from the newest oplog entry, going backwards).
      */
-    Status _processRollbackOp(const OplogEntry& oplogEntry);
+    Status _processRollbackOp(OperationContext* opCtx, const OplogEntry& oplogEntry);
+
+    /**
+     * Process a single applyOps oplog entry that is getting rolled back.
+     * This function processes each sub-operation using _processRollbackOp().
+     */
+    Status _processRollbackOpForApplyOps(OperationContext* opCtx, const OplogEntry& oplogEntry);
 
     /**
      * Iterates through the _countDiff map and retrieves the count of the record store pointed to
      * by each UUID. It then saves the post-rollback counts to the _newCounts map.
      */
     Status _findRecordStoreCounts(OperationContext* opCtx);
+
+    /**
+     * Executes the phase of rollback between aborting and reconstructing prepared transactions. We
+     * cannot safely recover if we fail during this phase.
+     */
+    void _runPhaseFromAbortToReconstructPreparedTxns(
+        OperationContext* opCtx, RollBackLocalOperations::RollbackCommonPoint commonPoint) noexcept;
 
     /**
      * Sets the record store counts to be the values stored in _newCounts.
@@ -407,7 +448,7 @@ private:
     void _resetDropPendingState(OperationContext* opCtx);
 
     // Guards access to member variables.
-    mutable stdx::mutex _mutex;  // (S)
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("RollbackImpl::_mutex");  // (S)
 
     // Set to true when RollbackImpl should shut down.
     bool _inShutdown = false;  // (M)
@@ -442,6 +483,13 @@ private:
     // oplog. This only must keep track of inserts and deletes. Rolling back drops is just a rename
     // and rolling back creates means that the UUID does not exist post rollback.
     stdx::unordered_map<UUID, long long, UUID::Hash> _countDiffs;  // (N)
+
+    // Maintains counts and namespaces of drop-pending collections.
+    struct PendingDropInfo {
+        long long count = 0;
+        NamespaceString nss;
+    };
+    stdx::unordered_map<UUID, PendingDropInfo, UUID::Hash> _pendingDrops;  // (N)
 
     // Maintains the count of the record store pointed to by the UUID after we recover from the
     // oplog.

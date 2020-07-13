@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -43,8 +44,8 @@ namespace mongo {
 namespace {
 
 using PushNodeTest = UpdateNodeTest;
-using mongo::mutablebson::Element;
 using mongo::mutablebson::countChildren;
+using mongo::mutablebson::Element;
 
 TEST(PushNodeTest, EachClauseWithNonArrayObjectFails) {
     auto update = fromjson("{$push: {x: {$each: {'0': 1}}}}");
@@ -266,7 +267,7 @@ TEST_F(PushNodeTest, ApplyToNonArrayFails) {
     setPathTaken("a");
     addIndexedPath("a");
     ASSERT_THROWS_CODE_AND_WHAT(
-        node.apply(getApplyParams(doc.root()["a"])),
+        node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams()),
         AssertionException,
         ErrorCodes::BadValue,
         "The field 'a' must be an array but is of type int in document {_id: \"test_object\"}");
@@ -281,12 +282,13 @@ TEST_F(PushNodeTest, ApplyToEmptyArray) {
     mutablebson::Document doc(fromjson("{a: []}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [1]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyToEmptyDocument) {
@@ -298,12 +300,13 @@ TEST_F(PushNodeTest, ApplyToEmptyDocument) {
     mutablebson::Document doc(fromjson("{}"));
     setPathToCreate("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()));
+    auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [1]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyToArrayWithOneElement) {
@@ -315,12 +318,13 @@ TEST_F(PushNodeTest, ApplyToArrayWithOneElement) {
     mutablebson::Document doc(fromjson("{a: [0]}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [0, 1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {'a.1': 1}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyToDottedPathElement) {
@@ -338,7 +342,8 @@ TEST_F(PushNodeTest, ApplyToDottedPathElement) {
     setPathToCreate("votes");
     setPathTaken("choices.first");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["choices"]["first"]));
+    auto result =
+        node.apply(getApplyParams(doc.root()["choices"]["first"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{_id: 1, "
@@ -349,6 +354,7 @@ TEST_F(PushNodeTest, ApplyToDottedPathElement) {
                   doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {'choices.first.votes': [1]}}"), getLogDoc());
+    ASSERT_EQUALS("{choices.first.votes}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplySimpleEachToEmptyArray) {
@@ -360,12 +366,13 @@ TEST_F(PushNodeTest, ApplySimpleEachToEmptyArray) {
     mutablebson::Document doc(fromjson("{a: []}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [1]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplySimpleEachToEmptyDocument) {
@@ -377,12 +384,13 @@ TEST_F(PushNodeTest, ApplySimpleEachToEmptyDocument) {
     mutablebson::Document doc(fromjson("{}"));
     setPathToCreate("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()));
+    auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [1]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyMultipleEachToEmptyDocument) {
@@ -394,12 +402,13 @@ TEST_F(PushNodeTest, ApplyMultipleEachToEmptyDocument) {
     mutablebson::Document doc(fromjson("{}"));
     setPathToCreate("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()));
+    auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [1, 2]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [1, 2]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplySimpleEachToArrayWithOneElement) {
@@ -411,12 +420,13 @@ TEST_F(PushNodeTest, ApplySimpleEachToArrayWithOneElement) {
     mutablebson::Document doc(fromjson("{a: [0]}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [0, 1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {'a.1': 1}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyMultipleEachToArrayWithOneElement) {
@@ -428,12 +438,13 @@ TEST_F(PushNodeTest, ApplyMultipleEachToArrayWithOneElement) {
     mutablebson::Document doc(fromjson("{a: [0]}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [0, 1, 2]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {'a.1': 1, 'a.2': 2}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyEmptyEachToEmptyArray) {
@@ -445,12 +456,13 @@ TEST_F(PushNodeTest, ApplyEmptyEachToEmptyArray) {
     mutablebson::Document doc(fromjson("{a: []}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: []}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyEmptyEachToEmptyDocument) {
@@ -462,12 +474,13 @@ TEST_F(PushNodeTest, ApplyEmptyEachToEmptyDocument) {
     mutablebson::Document doc(fromjson("{}"));
     setPathToCreate("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()));
+    auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: []}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: []}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyEmptyEachToArrayWithOneElement) {
@@ -479,12 +492,13 @@ TEST_F(PushNodeTest, ApplyEmptyEachToArrayWithOneElement) {
     mutablebson::Document doc(fromjson("{a: [0]}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [0]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyToArrayWithSlice) {
@@ -496,12 +510,13 @@ TEST_F(PushNodeTest, ApplyToArrayWithSlice) {
     mutablebson::Document doc(fromjson("{a: [3]}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [3]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [3]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyWithNumericSort) {
@@ -513,12 +528,13 @@ TEST_F(PushNodeTest, ApplyWithNumericSort) {
     mutablebson::Document doc(fromjson("{a: [3]}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [-1, 2, 3]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [-1, 2, 3]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyWithReverseNumericSort) {
@@ -530,12 +546,13 @@ TEST_F(PushNodeTest, ApplyWithReverseNumericSort) {
     mutablebson::Document doc(fromjson("{a: [3]}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [4, 3, -1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [4, 3, -1]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyWithMixedSort) {
@@ -547,12 +564,13 @@ TEST_F(PushNodeTest, ApplyWithMixedSort) {
     mutablebson::Document doc(fromjson("{a: [3, 't', {b: 1}, {a: 1}]}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [-1, 3, 4, 't', {a: 1}, {b: 1}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [-1, 3, 4, 't', {a: 1}, {b: 1}]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyWithReverseMixedSort) {
@@ -564,12 +582,13 @@ TEST_F(PushNodeTest, ApplyWithReverseMixedSort) {
     mutablebson::Document doc(fromjson("{a: [3, 't', {b: 1}, {a: 1}]}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [{b: 1}, {a: 1}, 't', 4, 3, -1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [{b: 1}, {a: 1}, 't', 4, 3, -1]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyWithEmbeddedFieldSort) {
@@ -581,31 +600,34 @@ TEST_F(PushNodeTest, ApplyWithEmbeddedFieldSort) {
     mutablebson::Document doc(fromjson("{a: [3, 't', {b: 1}, {a: 1}]}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [3, 't', {b: 1}, 4, -1, {a: 1}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [3, 't', {b: 1}, 4, -1, {a: 1}]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplySortWithCollator) {
     auto update = fromjson("{$push: {a: {$each: ['ha'], $sort: 1}}}");
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(&collator);
+    expCtx->setCollator(std::move(collator));
     PushNode node;
     ASSERT_OK(node.init(update["$push"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: ['dd', 'fc', 'gb']}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: ['ha', 'gb', 'fc', 'dd']}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: ['ha', 'gb', 'fc', 'dd']}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplySortAfterSetCollator) {
@@ -617,19 +639,24 @@ TEST_F(PushNodeTest, ApplySortAfterSetCollator) {
     mutablebson::Document doc(fromjson("{a: ['dd', 'fc', 'gb']}"));
     setPathTaken("a");
     setLogBuilderToNull();
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(fromjson("{a: ['dd', 'fc', 'gb', 'ha']}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 
     // Now with a collator.
+    resetApplyParams();
+    setPathTaken("a");
+    setLogBuilderToNull();
     CollatorInterfaceMock mockCollator(CollatorInterfaceMock::MockType::kReverseString);
     node.setCollator(&mockCollator);
     mutablebson::Document doc2(fromjson("{a: ['dd', 'fc', 'gb']}"));
-    result = node.apply(getApplyParams(doc2.root()["a"]));
+    result = node.apply(getApplyParams(doc2.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(fromjson("{a: ['ha', 'gb', 'fc', 'dd']}"), doc2);
     ASSERT_FALSE(doc2.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 // Some of the below tests apply multiple different update modifiers. This special check function
@@ -637,34 +664,33 @@ TEST_F(PushNodeTest, ApplySortAfterSetCollator) {
 void checkDocumentAndResult(BSONObj updateModifier,
                             BSONObj expectedDocument,
                             const mutablebson::Document& actualDocument,
-                            UpdateNode::ApplyResult applyResult) {
+                            UpdateExecutor::ApplyResult applyResult) {
     if (expectedDocument == actualDocument && !applyResult.noop && !applyResult.indexesAffected) {
         // Check succeeded.
     } else {
         FAIL(str::stream() << "apply() failure for " << updateModifier << ". Expected "
                            << expectedDocument
                            << " (noop = false, indexesAffected = false) but got "
-                           << actualDocument.toString()
-                           << " (noop = "
-                           << (applyResult.noop ? "true" : "false")
-                           << ", indexesAffected = "
-                           << (applyResult.indexesAffected ? "true" : "false")
-                           << ").");
+                           << actualDocument.toString() << " (noop = "
+                           << (applyResult.noop ? "true" : "false") << ", indexesAffected = "
+                           << (applyResult.indexesAffected ? "true" : "false") << ").");
     }
 }
 
 TEST_F(PushNodeTest, ApplyToEmptyArrayWithSliceValues) {
     struct testData {
-        int sliceValue;
+        long long sliceValue;
         BSONObj resultingDoc;
     };
 
     // We repeat the same test for several different values of $slice.
-    std::vector<testData> testDataList{{-2, fromjson("{a: [1]}")},
+    std::vector<testData> testDataList{{LLONG_MIN, fromjson("{a: [1]}")},
+                                       {-2, fromjson("{a: [1]}")},
                                        {-1, fromjson("{a: [1]}")},
                                        {0, fromjson("{a: []}")},
                                        {1, fromjson("{a: [1]}")},
-                                       {2, fromjson("{a: [1]}")}};
+                                       {2, fromjson("{a: [1]}")},
+                                       {LLONG_MAX, fromjson("{a: [1]}")}};
 
     for (const auto& data : testDataList) {
         auto update = BSON(
@@ -674,9 +700,10 @@ TEST_F(PushNodeTest, ApplyToEmptyArrayWithSliceValues) {
         ASSERT_OK(node.init(update["$push"]["a"], expCtx));
 
         mutablebson::Document doc(fromjson("{a: []}"));
+        resetApplyParams();
         setPathTaken("a");
         setLogBuilderToNull();
-        auto result = node.apply(getApplyParams(doc.root()["a"]));
+        auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
         checkDocumentAndResult(update, data.resultingDoc, doc, result);
     }
 }
@@ -706,9 +733,10 @@ TEST_F(PushNodeTest, ApplyToPopulatedArrayWithSliceValues) {
         ASSERT_OK(node.init(update["$push"]["a"], expCtx));
 
         mutablebson::Document doc(fromjson("{a: [2, 3]}"));
+        resetApplyParams();
         setPathTaken("a");
         setLogBuilderToNull();
-        auto result = node.apply(getApplyParams(doc.root()["a"]));
+        auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
         checkDocumentAndResult(update, data.resultingDoc, doc, result);
     }
 }
@@ -798,18 +826,17 @@ TEST_F(PushNodeTest, ApplyToPopulatedArrayWithSortAndSliceValues) {
         auto update =
             BSON("$push" << BSON("a" << BSON("$each" << BSON_ARRAY(BSON("a" << 2 << "b" << 1)
                                                                    << BSON("a" << 1 << "b" << 1))
-                                                     << "$slice"
-                                                     << data.sliceValue
-                                                     << "$sort"
+                                                     << "$slice" << data.sliceValue << "$sort"
                                                      << data.sortOrder)));
         boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
         PushNode node;
         ASSERT_OK(node.init(update["$push"]["a"], expCtx));
 
         mutablebson::Document doc(fromjson("{a: [{a: 2, b: 3}, {a: 3, b: 1}]}"));
+        resetApplyParams();
         setPathTaken("a");
         setLogBuilderToNull();
-        auto result = node.apply(getApplyParams(doc.root()["a"]));
+        auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
         checkDocumentAndResult(update, data.resultingDoc, doc, result);
     }
 }
@@ -823,12 +850,13 @@ TEST_F(PushNodeTest, ApplyToEmptyArrayWithPositionZero) {
     mutablebson::Document doc(fromjson("{a: []}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [1]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyToEmptyArrayWithPositionOne) {
@@ -840,12 +868,13 @@ TEST_F(PushNodeTest, ApplyToEmptyArrayWithPositionOne) {
     mutablebson::Document doc(fromjson("{a: []}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [1]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyToEmptyArrayWithLargePosition) {
@@ -857,12 +886,13 @@ TEST_F(PushNodeTest, ApplyToEmptyArrayWithLargePosition) {
     mutablebson::Document doc(fromjson("{a: []}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [1]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyToSingletonArrayWithPositionZero) {
@@ -874,12 +904,13 @@ TEST_F(PushNodeTest, ApplyToSingletonArrayWithPositionZero) {
     mutablebson::Document doc(fromjson("{a: [0]}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [1, 0]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [1, 0]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyToSingletonArrayWithLargePosition) {
@@ -891,12 +922,13 @@ TEST_F(PushNodeTest, ApplyToSingletonArrayWithLargePosition) {
     mutablebson::Document doc(fromjson("{a: [0]}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [0, 1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {'a.1': 1}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyToEmptyArrayWithNegativePosition) {
@@ -908,12 +940,13 @@ TEST_F(PushNodeTest, ApplyToEmptyArrayWithNegativePosition) {
     mutablebson::Document doc(fromjson("{a: []}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [1]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyToSingletonArrayWithNegativePosition) {
@@ -925,12 +958,13 @@ TEST_F(PushNodeTest, ApplyToSingletonArrayWithNegativePosition) {
     mutablebson::Document doc(fromjson("{a: [0]}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [1, 0]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [1, 0]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyToPopulatedArrayWithNegativePosition) {
@@ -942,12 +976,13 @@ TEST_F(PushNodeTest, ApplyToPopulatedArrayWithNegativePosition) {
     mutablebson::Document doc(fromjson("{a: [0, 1, 2, 3, 4]}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [0, 1, 2, 5, 3, 4]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [0, 1, 2, 5, 3, 4]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyToPopulatedArrayWithOutOfBoundsNegativePosition) {
@@ -959,12 +994,13 @@ TEST_F(PushNodeTest, ApplyToPopulatedArrayWithOutOfBoundsNegativePosition) {
     mutablebson::Document doc(fromjson("{a: [0, 1, 2, 3, 4]}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [5, 0, 1, 2, 3, 4]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [5, 0, 1, 2, 3, 4]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyMultipleElementsPushWithNegativePosition) {
@@ -976,12 +1012,33 @@ TEST_F(PushNodeTest, ApplyMultipleElementsPushWithNegativePosition) {
     mutablebson::Document doc(fromjson("{a: [0, 1, 2, 3, 4]}"));
     setPathTaken("a");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [0, 1, 2, 5, 6, 7, 3, 4]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [0, 1, 2, 5, 6, 7, 3, 4]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
+}
+
+TEST_F(PushNodeTest, PushWithMinIntAsPosition) {
+    auto update =
+        BSON("$push" << BSON("a" << BSON("$each" << BSON_ARRAY(5) << "$position"
+                                                 << std::numeric_limits<long long>::min())));
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PushNode node;
+    ASSERT_OK(node.init(update["$push"]["a"], expCtx));
+
+    mutablebson::Document doc(fromjson("{a: [0, 1, 2, 3, 4]}"));
+    setPathTaken("a");
+    addIndexedPath("a");
+    auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_EQUALS(fromjson("{a: [5, 0, 1, 2, 3, 4]}"), doc);
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS(fromjson("{$set: {a: [5, 0, 1, 2, 3, 4]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 }  // namespace

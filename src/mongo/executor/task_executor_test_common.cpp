@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kExecutor
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -34,26 +35,24 @@
 
 #include <memory>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/executor/network_interface.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/executor/task_executor_test_fixture.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/logv2/log.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace executor {
 namespace {
 
 using ExecutorFactory =
-    stdx::function<std::unique_ptr<TaskExecutor>(std::unique_ptr<NetworkInterfaceMock>)>;
+    std::function<std::unique_ptr<TaskExecutor>(std::unique_ptr<NetworkInterfaceMock>)>;
 
 class CommonTaskExecutorTestFixture : public TaskExecutorTest {
 public:
@@ -70,7 +69,7 @@ private:
 };
 
 using ExecutorTestCaseFactory =
-    stdx::function<std::unique_ptr<CommonTaskExecutorTestFixture>(ExecutorFactory)>;
+    std::function<std::unique_ptr<CommonTaskExecutorTestFixture>(ExecutorFactory)>;
 using ExecutorTestCaseMap = stdx::unordered_map<std::string, ExecutorTestCaseFactory>;
 
 static ExecutorTestCaseMap& executorTestCaseRegistry() {
@@ -79,33 +78,36 @@ static ExecutorTestCaseMap& executorTestCaseRegistry() {
 }
 
 class CetRegistrationAgent {
-    MONGO_DISALLOW_COPYING(CetRegistrationAgent);
+    CetRegistrationAgent(const CetRegistrationAgent&) = delete;
+    CetRegistrationAgent& operator=(const CetRegistrationAgent&) = delete;
 
 public:
     CetRegistrationAgent(const std::string& name, ExecutorTestCaseFactory makeTest) {
         auto& entry = executorTestCaseRegistry()[name];
         if (entry) {
-            severe() << "Multiple attempts to register ExecutorTest named " << name;
-            fassertFailed(28713);
+            LOGV2_FATAL(28713,
+                        "Multiple attempts to register ExecutorTest named {executor}",
+                        "Multiple attempts to register ExecutorTest",
+                        "executor"_attr = name);
         }
         entry = std::move(makeTest);
     }
 };
 
-#define COMMON_EXECUTOR_TEST(TEST_NAME)                                         \
-    class CET_##TEST_NAME : public CommonTaskExecutorTestFixture {              \
-    public:                                                                     \
-        CET_##TEST_NAME(ExecutorFactory makeExecutor)                           \
-            : CommonTaskExecutorTestFixture(std::move(makeExecutor)) {}         \
-                                                                                \
-    private:                                                                    \
-        void _doTest() override;                                                \
-        static const CetRegistrationAgent _agent;                               \
-    };                                                                          \
-    const CetRegistrationAgent CET_##TEST_NAME::_agent(                         \
-        #TEST_NAME, [](ExecutorFactory makeExecutor) {                          \
-            return stdx::make_unique<CET_##TEST_NAME>(std::move(makeExecutor)); \
-        });                                                                     \
+#define COMMON_EXECUTOR_TEST(TEST_NAME)                                        \
+    class CET_##TEST_NAME : public CommonTaskExecutorTestFixture {             \
+    public:                                                                    \
+        CET_##TEST_NAME(ExecutorFactory makeExecutor)                          \
+            : CommonTaskExecutorTestFixture(std::move(makeExecutor)) {}        \
+                                                                               \
+    private:                                                                   \
+        void _doTest() override;                                               \
+        static const CetRegistrationAgent _agent;                              \
+    };                                                                         \
+    const CetRegistrationAgent CET_##TEST_NAME::_agent(                        \
+        #TEST_NAME, [](ExecutorFactory makeExecutor) {                         \
+            return std::make_unique<CET_##TEST_NAME>(std::move(makeExecutor)); \
+        });                                                                    \
     void CET_##TEST_NAME::_doTest()
 
 auto makeSetStatusClosure(Status* target) {
@@ -146,14 +148,12 @@ auto makeSetStatusOnRemoteCommandCompletionClosure(const RemoteCommandRequest* e
     return [=](const TaskExecutor::RemoteCommandCallbackArgs& cbData) {
         if (cbData.request != *expectedRequest) {
             auto desc = [](const RemoteCommandRequest& request) -> std::string {
-                return mongoutils::str::stream() << "Request(" << request.target.toString() << ", "
-                                                 << request.dbname << ", " << request.cmdObj << ')';
+                return str::stream() << "Request(" << request.target.toString() << ", "
+                                     << request.dbname << ", " << request.cmdObj << ')';
             };
-            *outStatus =
-                Status(ErrorCodes::BadValue,
-                       mongoutils::str::stream() << "Actual request: " << desc(cbData.request)
-                                                 << "; expected: "
-                                                 << desc(*expectedRequest));
+            *outStatus = Status(ErrorCodes::BadValue,
+                                str::stream() << "Actual request: " << desc(cbData.request)
+                                              << "; expected: " << desc(*expectedRequest));
             return;
         }
         *outStatus = cbData.response.status;
@@ -167,16 +167,6 @@ COMMON_EXECUTOR_TEST(RunOne) {
     launchExecutorThread();
     joinExecutorThread();
     ASSERT_OK(status);
-}
-
-COMMON_EXECUTOR_TEST(Schedule1ButShutdown) {
-    TaskExecutor& executor = getExecutor();
-    Status status = getDetectableErrorStatus();
-    ASSERT_OK(executor.scheduleWork(makeSetStatusAndShutdownClosure(&status)).getStatus());
-    executor.shutdown();
-    launchExecutorThread();
-    joinExecutorThread();
-    ASSERT_EQUALS(status, ErrorCodes::CallbackCanceled);
 }
 
 COMMON_EXECUTOR_TEST(Schedule2Cancel1) {
@@ -206,7 +196,8 @@ COMMON_EXECUTOR_TEST(OneSchedulesAnother) {
 }
 
 class EventChainAndWaitingTest {
-    MONGO_DISALLOW_COPYING(EventChainAndWaitingTest);
+    EventChainAndWaitingTest(const EventChainAndWaitingTest&) = delete;
+    EventChainAndWaitingTest& operator=(const EventChainAndWaitingTest&) = delete;
 
 public:
     EventChainAndWaitingTest(TaskExecutor* exec, NetworkInterfaceMock* network);
@@ -305,13 +296,14 @@ void EventChainAndWaitingTest::onGo(const TaskExecutor::CallbackArgs& cbData) {
         return;
     }
     triggerEvent = errorOrTriggerEvent.getValue();
-    StatusWith<TaskExecutor::CallbackHandle> cbHandle = executor->onEvent(triggerEvent, triggered2);
+    StatusWith<TaskExecutor::CallbackHandle> cbHandle =
+        executor->onEvent(triggerEvent, std::move(triggered2));
     if (!cbHandle.isOK()) {
         status1 = cbHandle.getStatus();
         executor->shutdown();
         return;
     }
-    cbHandle = executor->onEvent(triggerEvent, triggered3);
+    cbHandle = executor->onEvent(triggerEvent, std::move(triggered3));
     if (!cbHandle.isOK()) {
         status1 = cbHandle.getStatus();
         executor->shutdown();
@@ -342,9 +334,9 @@ COMMON_EXECUTOR_TEST(EventWaitingWithTimeoutTest) {
 
     auto eventThatWillNeverBeTriggered = unittest::assertGet(executor.makeEvent());
 
-    auto serviceContext = getGlobalServiceContext();
+    auto serviceContext = ServiceContext::make();
 
-    serviceContext->setFastClockSource(stdx::make_unique<ClockSourceMock>());
+    serviceContext->setFastClockSource(std::make_unique<ClockSourceMock>());
     auto mockClock = static_cast<ClockSourceMock*>(serviceContext->getFastClockSource());
 
     auto client = serviceContext->makeClient("for testing");
@@ -364,9 +356,9 @@ COMMON_EXECUTOR_TEST(EventSignalWithTimeoutTest) {
 
     auto eventSignalled = unittest::assertGet(executor.makeEvent());
 
-    auto serviceContext = getGlobalServiceContext();
+    auto serviceContext = ServiceContext::make();
 
-    serviceContext->setFastClockSource(stdx::make_unique<ClockSourceMock>());
+    serviceContext->setFastClockSource(std::make_unique<ClockSourceMock>());
     auto mockClock = static_cast<ClockSourceMock*>(serviceContext->getFastClockSource());
 
     auto client = serviceContext->makeClient("for testing");
@@ -484,7 +476,7 @@ COMMON_EXECUTOR_TEST(RemoteCommandWithTimeout) {
     ASSERT_EQUALS(startTime + Milliseconds(2), net->now());
     net->exitNetwork();
     executor.wait(cbHandle);
-    ASSERT_EQUALS(ErrorCodes::NetworkTimeout, status);
+    ASSERT_EQUALS(ErrorCodes::NetworkInterfaceExceededTimeLimit, status);
 }
 
 COMMON_EXECUTOR_TEST(CallbackHandleComparison) {
@@ -532,10 +524,11 @@ COMMON_EXECUTOR_TEST(CallbackHandleComparison) {
 }  // namespace
 
 void addTestsForExecutor(const std::string& suiteName, ExecutorFactory makeExecutor) {
-    auto suite = unittest::Suite::getSuite(suiteName);
+    auto& suite = unittest::Suite::getSuite(suiteName);
     for (auto testCase : executorTestCaseRegistry()) {
-        suite->add(str::stream() << suiteName << "::" << testCase.first,
-                   [testCase, makeExecutor] { testCase.second(makeExecutor)->run(); });
+        suite.add(str::stream() << suiteName << "::" << testCase.first,
+                  __FILE__,
+                  [testCase, makeExecutor] { testCase.second(makeExecutor)->run(); });
     }
 }
 

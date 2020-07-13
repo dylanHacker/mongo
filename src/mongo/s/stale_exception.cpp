@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,30 +27,61 @@
  *    it in the license file.
  */
 
-#include <mongo/platform/basic.h>
+#include "mongo/platform/basic.h"
 
 #include "mongo/s/stale_exception.h"
 
 #include "mongo/base/init.h"
-
+#include "mongo/util/assert_util.h"
 namespace mongo {
+namespace {
 
 MONGO_INIT_REGISTER_ERROR_EXTRA_INFO(StaleConfigInfo);
 MONGO_INIT_REGISTER_ERROR_EXTRA_INFO(StaleDbRoutingVersion);
 
-void StaleConfigInfo::serialize(BSONObjBuilder* bob) const {
-    bob->append("ns", _ns);
-    _received.addToBSON(*bob, "vReceived");
-    _wanted.addToBSON(*bob, "vWanted");
+boost::optional<ChunkVersion> extractOptionalChunkVersion(const BSONObj& obj, StringData field) {
+    auto swChunkVersion = ChunkVersion::parseLegacyWithField(obj, field);
+    if (swChunkVersion == ErrorCodes::NoSuchKey)
+        return boost::none;
+    return uassertStatusOK(std::move(swChunkVersion));
 }
 
-StaleConfigInfo::StaleConfigInfo(const BSONObj& obj)
-    : StaleConfigInfo(obj["ns"].type() == String ? obj["ns"].String() : "",
-                      ChunkVersion::fromBSON(obj, "vReceived"),
-                      ChunkVersion::fromBSON(obj, "vWanted")) {}
+}  // namespace
+
+StaleConfigInfo::StaleConfigInfo(NamespaceString nss,
+                                 ChunkVersion received,
+                                 boost::optional<ChunkVersion> wanted,
+                                 ShardId shardId,
+                                 std::shared_ptr<Notification<void>> criticalSectionSignal)
+    : _nss(std::move(nss)),
+      _received(received),
+      _wanted(wanted),
+      _shardId(shardId),
+      _criticalSectionSignal(criticalSectionSignal) {}
+
+void StaleConfigInfo::serialize(BSONObjBuilder* bob) const {
+    bob->append("ns", _nss.ns());
+    _received.appendLegacyWithField(bob, "vReceived");
+    if (_wanted) {
+        _wanted->appendLegacyWithField(bob, "vWanted");
+    }
+
+    invariant(_shardId != "");
+    bob->append("shardId", _shardId.toString());
+}
 
 std::shared_ptr<const ErrorExtraInfo> StaleConfigInfo::parse(const BSONObj& obj) {
-    return std::make_shared<StaleConfigInfo>(obj);
+    return std::make_shared<StaleConfigInfo>(parseFromCommandError(obj));
+}
+
+StaleConfigInfo StaleConfigInfo::parseFromCommandError(const BSONObj& obj) {
+    const auto shardId = obj["shardId"].String();
+    invariant(shardId != "");
+
+    return StaleConfigInfo(NamespaceString(obj["ns"].String()),
+                           uassertStatusOK(ChunkVersion::parseLegacyWithField(obj, "vReceived")),
+                           extractOptionalChunkVersion(obj, "vWanted"),
+                           ShardId(shardId));
 }
 
 void StaleDbRoutingVersion::serialize(BSONObjBuilder* bob) const {
@@ -60,18 +92,19 @@ void StaleDbRoutingVersion::serialize(BSONObjBuilder* bob) const {
     }
 }
 
-StaleDbRoutingVersion::StaleDbRoutingVersion(const BSONObj& obj)
-    : StaleDbRoutingVersion(
-          obj["db"].String(),
-          DatabaseVersion::parse(IDLParserErrorContext("StaleDbRoutingVersion-vReceived"),
-                                 obj["vReceived"].Obj()),
-          !obj["vWanted"].eoo()
-              ? DatabaseVersion::parse(IDLParserErrorContext("StaleDbRoutingVersion-vWanted"),
-                                       obj["vWanted"].Obj())
-              : boost::optional<DatabaseVersion>{}) {}
-
 std::shared_ptr<const ErrorExtraInfo> StaleDbRoutingVersion::parse(const BSONObj& obj) {
-    return std::make_shared<StaleDbRoutingVersion>(obj);
+    return std::make_shared<StaleDbRoutingVersion>(parseFromCommandError(obj));
+}
+
+StaleDbRoutingVersion StaleDbRoutingVersion::parseFromCommandError(const BSONObj& obj) {
+    return StaleDbRoutingVersion(
+        obj["db"].String(),
+        DatabaseVersion::parse(IDLParserErrorContext("StaleDbRoutingVersion-vReceived"),
+                               obj["vReceived"].Obj()),
+        !obj["vWanted"].eoo()
+            ? DatabaseVersion::parse(IDLParserErrorContext("StaleDbRoutingVersion-vWanted"),
+                                     obj["vWanted"].Obj())
+            : boost::optional<DatabaseVersion>{});
 }
 
 }  // namespace mongo

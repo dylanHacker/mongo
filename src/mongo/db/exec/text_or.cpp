@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,6 +30,7 @@
 #include "mongo/db/exec/text_or.h"
 
 #include <map>
+#include <memory>
 #include <vector>
 
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -37,36 +39,30 @@
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/record_id.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
+using std::string;
 using std::unique_ptr;
 using std::vector;
-using std::string;
-using stdx::make_unique;
 
 using fts::FTSSpec;
 
 const char* TextOrStage::kStageType = "TEXT_OR";
 
-TextOrStage::TextOrStage(OperationContext* opCtx,
+TextOrStage::TextOrStage(ExpressionContext* expCtx,
                          const FTSSpec& ftsSpec,
                          WorkingSet* ws,
                          const MatchExpression* filter,
-                         IndexDescriptor* index)
-    : PlanStage(kStageType, opCtx),
+                         const Collection* collection)
+    : RequiresCollectionStage(kStageType, expCtx, collection),
       _ftsSpec(ftsSpec),
       _ws(ws),
       _scoreIterator(_scores.end()),
       _filter(filter),
-      _idRetrying(WorkingSet::INVALID_ID),
-      _index(index) {}
-
-TextOrStage::~TextOrStage() {}
+      _idRetrying(WorkingSet::INVALID_ID) {}
 
 void TextOrStage::addChild(unique_ptr<PlanStage> child) {
     _children.push_back(std::move(child));
@@ -82,13 +78,13 @@ bool TextOrStage::isEOF() {
     return _internalState == State::kDone;
 }
 
-void TextOrStage::doSaveState() {
+void TextOrStage::doSaveStateRequiresCollection() {
     if (_recordCursor) {
         _recordCursor->saveUnpositioned();
     }
 }
 
-void TextOrStage::doRestoreState() {
+void TextOrStage::doRestoreStateRequiresCollection() {
     if (_recordCursor) {
         invariant(_recordCursor->restore());
     }
@@ -101,18 +97,7 @@ void TextOrStage::doDetachFromOperationContext() {
 
 void TextOrStage::doReattachToOperationContext() {
     if (_recordCursor)
-        _recordCursor->reattachToOperationContext(getOpCtx());
-}
-
-void TextOrStage::doInvalidate(OperationContext* opCtx, const RecordId& dl, InvalidationType type) {
-    // Remove the RecordID from the ScoreMap.
-    ScoreMap::iterator scoreIt = _scores.find(dl);
-    if (scoreIt != _scores.end()) {
-        if (scoreIt == _scoreIterator) {
-            _scoreIterator++;
-        }
-        _scores.erase(scoreIt);
-    }
+        _recordCursor->reattachToOperationContext(opCtx());
 }
 
 std::unique_ptr<PlanStageStats> TextOrStage::getStats() {
@@ -124,8 +109,8 @@ std::unique_ptr<PlanStageStats> TextOrStage::getStats() {
         _commonStats.filter = bob.obj();
     }
 
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_TEXT_OR);
-    ret->specific = make_unique<TextOrStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_TEXT_OR);
+    ret->specific = std::make_unique<TextOrStats>(_specificStats);
 
     for (auto&& child : _children) {
         ret->children.emplace_back(child->getStats());
@@ -167,7 +152,7 @@ PlanStage::StageState TextOrStage::doWork(WorkingSetID* out) {
 PlanStage::StageState TextOrStage::initStage(WorkingSetID* out) {
     *out = WorkingSet::INVALID_ID;
     try {
-        _recordCursor = _index->getCollection()->getCursor(getOpCtx());
+        _recordCursor = collection()->getCursor(opCtx());
         _internalState = State::kReadingTerms;
         return PlanStage::NEED_TIME;
     } catch (const WriteConflictException&) {
@@ -212,19 +197,6 @@ PlanStage::StageState TextOrStage::readFromChildren(WorkingSetID* out) {
         _internalState = State::kReturningResults;
 
         return PlanStage::NEED_TIME;
-    } else if (PlanStage::FAILURE == childState) {
-        // If a stage fails, it may create a status WSM to indicate why it
-        // failed, in which case 'id' is valid.  If ID is invalid, we
-        // create our own error message.
-        if (WorkingSet::INVALID_ID == id) {
-            mongoutils::str::stream ss;
-            ss << "TEXT_OR stage failed to read in results from child";
-            Status status(ErrorCodes::InternalError, ss);
-            *out = WorkingSetCommon::allocateStatusMember(_ws, status);
-        } else {
-            *out = id;
-        }
-        return PlanStage::FAILURE;
     } else {
         // Propagate WSID from below.
         *out = id;
@@ -250,8 +222,8 @@ PlanStage::StageState TextOrStage::returnResults(WorkingSetID* out) {
 
     WorkingSetMember* wsm = _ws->get(textRecordData.wsid);
 
-    // Populate the working set member with the text score and return it.
-    wsm->addComputed(new TextScoreComputedData(textRecordData.score));
+    // Populate the working set member with the text score metadata and return it.
+    wsm->metadata().setTextScore(textRecordData.score);
     *out = textRecordData.wsid;
     return PlanStage::ADVANCED;
 }
@@ -283,7 +255,7 @@ PlanStage::StageState TextOrStage::addTerm(WorkingSetID wsid, WorkingSetID* out)
         // Our parent expects RID_AND_OBJ members, so we fetch the document here if we haven't
         // already.
         try {
-            if (!WorkingSetCommon::fetch(getOpCtx(), _ws, wsid, _recordCursor)) {
+            if (!WorkingSetCommon::fetch(opCtx(), _ws, wsid, _recordCursor, collection()->ns())) {
                 _ws->free(wsid);
                 textRecordData->score = -1;
                 return NEED_TIME;

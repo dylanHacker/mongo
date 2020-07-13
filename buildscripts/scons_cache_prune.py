@@ -17,7 +17,6 @@ import logging
 import os
 import shutil
 
-logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger("scons.cache.prune.lru")  # type: ignore
 
 GIGBYTES = 1024 * 1024 * 1024
@@ -39,16 +38,20 @@ def collect_cache_contents(cache_path):
             for file_name in os.listdir(path):
                 file_path = os.path.join(path, file_name)
                 if os.path.isdir(file_path):
-                    LOGGER.warning("cache item %s is a directory and not a file. "
-                                   "The cache may be corrupt.", file_path)
+                    LOGGER.warning(
+                        "cache item %s is a directory and not a file. "
+                        "The cache may be corrupt.", file_path)
                     continue
 
-                item = CacheItem(path=file_path, time=os.stat(file_path).st_atime,
-                                 size=os.stat(file_path).st_size)
+                try:
+                    item = CacheItem(path=file_path, time=os.stat(file_path).st_atime,
+                                     size=os.stat(file_path).st_size)
 
-                total += item.size
+                    total += item.size
 
-                contents.append(item)
+                    contents.append(item)
+                except OSError as err:
+                    LOGGER.warning("Ignoring error querying file %s : %s", file_path, err)
 
     return (total, contents)
 
@@ -74,19 +77,17 @@ def prune_cache(cache_path, cache_size_gb, clean_ratio):
         # just delete things until the total_size falls below the target cache size ratio.
         while total_size >= cache_size * clean_ratio:
             if not contents:
-                shutil.rmtree(cache_path)
                 LOGGER.error("cache size is over quota, and there are no files in "
-                             "the queue to delete. Removed the entire cache.")
+                             "the queue to delete.")
                 return False
 
-            # (file_name, _, size) = contents.pop()
             cache_item = contents.pop()
             to_remove = cache_item.path + ".del"
             try:
                 os.rename(cache_item.path, to_remove)
-            except Exception:  # pylint: disable=broad-except
+            except Exception as err:  # pylint: disable=broad-except
                 # another process may have already cleared the file.
-                pass
+                LOGGER.warning("Unable to rename %s : %s", cache_item, err)
             else:
                 try:
                     os.remove(to_remove)
@@ -105,14 +106,18 @@ def prune_cache(cache_path, cache_size_gb, clean_ratio):
 
 def main():
     """Execute Main entry."""
+
+    logging.basicConfig(level=logging.INFO)
+
     parser = argparse.ArgumentParser(description="SCons cache pruning tool")
 
     parser.add_argument("--cache-dir", "-d", default=None, help="path to the cache directory.")
     parser.add_argument("--cache-size", "-s", default=200, type=int,
                         help="maximum size of cache in GB.")
-    parser.add_argument("--prune-ratio", "-p", default=0.8, type=float,
-                        help=("ratio (as 1.0 > x > 0) of total cache size to prune "
-                              "to when cache exceeds quota."))
+    parser.add_argument(
+        "--prune-ratio", "-p", default=0.8, type=float,
+        help=("ratio (as 1.0 > x > 0) of total cache size to prune "
+              "to when cache exceeds quota."))
     parser.add_argument("--print-cache-dir", default=False, action="store_true")
 
     args = parser.parse_args()

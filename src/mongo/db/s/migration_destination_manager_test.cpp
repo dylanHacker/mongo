@@ -1,36 +1,36 @@
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/migration_destination_manager.h"
-#include "mongo/s/shard_server_test_fixture.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 
 namespace mongo {
 namespace {
@@ -84,9 +84,9 @@ TEST_F(MigrationDestinationManagerTest, CloneDocumentsFromDonorWorksCorrectly) {
 
     std::vector<BSONObj> resultDocs;
 
-    auto insertBatchFn = [&](OperationContext* opCtx, BSONObjIterator docs) {
-        while (docs.more()) {
-            resultDocs.push_back(docs.next().Obj().getOwned());
+    auto insertBatchFn = [&](OperationContext* opCtx, BSONObj docs) {
+        for (auto&& docToClone : docs) {
+            resultDocs.push_back(docToClone.Obj().getOwned());
         }
     };
 
@@ -122,7 +122,7 @@ TEST_F(MigrationDestinationManagerTest, CloneDocumentsThrowsFetchErrors) {
         return fetchBatchResultBuilder.obj();
     };
 
-    auto insertBatchFn = [&](OperationContext* opCtx, BSONObjIterator docs) {};
+    auto insertBatchFn = [&](OperationContext* opCtx, BSONObj docs) {};
 
     ASSERT_THROWS_CODE_AND_WHAT(MigrationDestinationManager::cloneDocumentsFromDonor(
                                     operationContext(), insertBatchFn, fetchBatchFn),
@@ -140,7 +140,7 @@ TEST_F(MigrationDestinationManagerTest, CloneDocumentsCatchesInsertErrors) {
         return fetchBatchResultBuilder.obj();
     };
 
-    auto insertBatchFn = [&](OperationContext* opCtx, BSONObjIterator docs) {
+    auto insertBatchFn = [&](OperationContext* opCtx, BSONObj docs) {
         uasserted(ErrorCodes::FailedToParse, "insertion error");
     };
 
@@ -150,10 +150,10 @@ TEST_F(MigrationDestinationManagerTest, CloneDocumentsCatchesInsertErrors) {
     ASSERT_THROWS_CODE_AND_WHAT(MigrationDestinationManager::cloneDocumentsFromDonor(
                                     operationContext(), insertBatchFn, fetchBatchFn),
                                 DBException,
-                                ErrorCodes::FailedToParse,
+                                51008,
                                 "operation was interrupted");
 
-    ASSERT_EQ(operationContext()->getKillStatus(), ErrorCodes::FailedToParse);
+    ASSERT_EQ(operationContext()->getKillStatus(), 51008);
 }
 
 }  // namespace

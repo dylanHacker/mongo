@@ -14,13 +14,7 @@ ToolTest = function(name, extraOptions) {
 ToolTest.prototype.startDB = function(coll) {
     assert(!this.m, "db already running");
 
-    var options = {
-        port: this.port,
-        dbpath: this.dbpath,
-        noprealloc: "",
-        smallfiles: "",
-        bind_ip: "127.0.0.1"
-    };
+    var options = {port: this.port, dbpath: this.dbpath, bind_ip: "127.0.0.1"};
 
     Object.extend(options, this.options);
 
@@ -71,24 +65,41 @@ ToolTest.prototype.runTool = function() {
 /**
  * Returns a port number that has not been given out to any other caller from the same mongo shell.
  */
-allocatePort = (function() {
-    // Defer initializing these variables until the first call, as TestData attributes may be
-    // initialized as part of the --eval argument (e.g. by resmoke.py), which will not be evaluated
-    // until after this has loaded.
-    var maxPort;
-    var nextPort;
+var allocatePort;
 
-    return function() {
-        // The default port was chosen in an attempt to have a large number of unassigned ports that
-        // are also outside the ephemeral port range.
-        nextPort = nextPort || jsTestOptions().minPort || 20000;
-        maxPort = maxPort || jsTestOptions().maxPort || Math.pow(2, 16) - 1;
+/**
+ * Resets the range of ports which have already been given out to callers of allocatePort().
+ *
+ * This function can be used to allow a test to allocate a large number of ports as part of starting
+ * many MongoDB deployments without worrying about hitting the configured maximum. Callers of this
+ * function should take care to ensure MongoDB deployments started earlier have been terminated and
+ * won't be reused.
+ */
+var resetAllocatedPorts;
 
-        if (nextPort === maxPort) {
-            throw new Error("Exceeded maximum port range in allocatePort()");
-        }
-        return nextPort++;
-    };
+(function() {
+// Defer initializing these variables until the first call, as TestData attributes may be
+// initialized as part of the --eval argument (e.g. by resmoke.py), which will not be evaluated
+// until after this has loaded.
+var maxPort;
+var nextPort;
+
+allocatePort = function() {
+    // The default port was chosen in an attempt to have a large number of unassigned ports that
+    // are also outside the ephemeral port range.
+    nextPort = nextPort || jsTestOptions().minPort || 20000;
+    maxPort = maxPort || jsTestOptions().maxPort || Math.pow(2, 16) - 1;
+
+    if (nextPort === maxPort) {
+        throw new Error("Exceeded maximum port range in allocatePort()");
+    }
+    return nextPort++;
+};
+
+resetAllocatedPorts = function() {
+    jsTest.log("Resetting the range of allocated ports");
+    maxPort = nextPort = undefined;
+};
 })();
 
 /**
@@ -104,7 +115,7 @@ allocatePorts = function(numPorts) {
     return ports;
 };
 
-function startParallelShell(jsCode, port, noConnect) {
+function startParallelShell(jsCode, port, noConnect, ...optionArgs) {
     var shellPath = MongoRunner.mongoShellPath;
     var args = [shellPath];
 
@@ -131,9 +142,9 @@ function startParallelShell(jsCode, port, noConnect) {
     }
 
     // Convert function into call-string
-    if (typeof(jsCode) == "function") {
+    if (typeof (jsCode) == "function") {
         jsCode = "(" + jsCode.toString() + ")();";
-    } else if (typeof(jsCode) == "string") {
+    } else if (typeof (jsCode) == "string") {
     }
     // do nothing
     else {
@@ -142,7 +153,7 @@ function startParallelShell(jsCode, port, noConnect) {
 
     if (noConnect) {
         args.push("--nodb");
-    } else if (typeof(db) == "object") {
+    } else if (typeof (db) == "object") {
         jsCode = "db = db.getSiblingDB('" + db.getName() + "');" + jsCode;
     }
 
@@ -150,6 +161,7 @@ function startParallelShell(jsCode, port, noConnect) {
         jsCode = "TestData = " + tojson(TestData) + ";" + jsCode;
     }
 
+    args.push(...optionArgs);
     args.push("--eval", jsCode);
 
     var pid = startMongoProgramNoConnect.apply(null, args);

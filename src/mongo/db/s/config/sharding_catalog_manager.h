@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,18 +29,18 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/repl/optime_with.h"
+#include "mongo/db/s/config/namespace_serializer.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/shard_key_pattern.h"
-#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
@@ -49,14 +50,30 @@ class RemoteCommandTargeter;
 class ServiceContext;
 class UUID;
 
-/**
- * Used to indicate to the caller of the removeShard method whether draining of chunks for
- * a particular shard has started, is ongoing, or has been completed.
- */
-enum ShardDrainingStatus {
-    STARTED,
-    ONGOING,
-    COMPLETED,
+struct RemoveShardProgress {
+
+    /**
+     * Used to indicate to the caller of the removeShard method whether draining of chunks for
+     * a particular shard has started, is ongoing, or has been completed.
+     */
+    enum DrainingShardStatus {
+        STARTED,
+        ONGOING,
+        COMPLETED,
+    };
+
+    /**
+     * Used to indicate to the caller of the removeShard method the remaining amount of chunks,
+     * jumbo chunks and databases within the shard
+     */
+    struct DrainingShardUsage {
+        const long long totalChunks;
+        const long long databases;
+        const long long jumboChunks;
+    };
+
+    DrainingShardStatus status;
+    boost::optional<DrainingShardUsage> remainingCounts;
 };
 
 /**
@@ -67,7 +84,9 @@ enum ShardDrainingStatus {
  * moved out of ShardingCatalogClient and into this class.
  */
 class ShardingCatalogManager {
-    MONGO_DISALLOW_COPYING(ShardingCatalogManager);
+    ShardingCatalogManager(const ShardingCatalogManager&) = delete;
+    ShardingCatalogManager& operator=(const ShardingCatalogManager&) = delete;
+    friend class ConfigSvrShardCollectionCommand;
 
 public:
     ShardingCatalogManager(ServiceContext* serviceContext,
@@ -99,6 +118,10 @@ public:
      * Performs necessary cleanup when shutting down cleanly.
      */
     void shutDown();
+
+    //
+    // Sharded cluster initialization logic
+    //
 
     /**
      * Checks if this is the first start of a newly instantiated config server and if so pre-creates
@@ -153,6 +176,12 @@ public:
                                   const NamespaceString& nss,
                                   const ChunkRange& range);
 
+    /**
+     * Exposes the zone operations mutex to external callers in order to allow them to synchronize
+     * with any changes to the zones.
+     */
+    Lock::ExclusiveLock lockZoneMutex(OperationContext* opCtx);
+
     //
     // Chunk Operations
     //
@@ -185,15 +214,36 @@ public:
      * Updates metadata in config.chunks collection to show the given chunk in its new shard.
      * If 'validAfter' is not set, this means the commit request came from an older server version,
      * which is not history-aware.
+     *
+     * Returns a BSON object with the newly produced chunk versions after the migration:
+     *  - migratedChunkVersion - the version of the chunk, which was migrated
+     *  - controlChunkVersion (optional) - the version of the "control" chunk, which was changed in
+     *      order to reflect the change on the donor. This value will be missing if the last chunk
+     *      on the donor shard was migrated out.
      */
     StatusWith<BSONObj> commitChunkMigration(OperationContext* opCtx,
                                              const NamespaceString& nss,
                                              const ChunkType& migratedChunk,
-                                             const boost::optional<ChunkType>& controlChunk,
                                              const OID& collectionEpoch,
                                              const ShardId& fromShard,
                                              const ShardId& toShard,
                                              const boost::optional<Timestamp>& validAfter);
+
+    /**
+     * Removes the jumbo flag from the specified chunk.
+     */
+    void clearJumboFlag(OperationContext* opCtx,
+                        const NamespaceString& nss,
+                        const OID& collectionEpoch,
+                        const ChunkRange& chunk);
+    /**
+     * If a chunk matching 'requestedChunk' exists, bumps the chunk's version to one greater than
+     * the current collection version.
+     */
+    void ensureChunkVersionIsGreaterThan(OperationContext* opCtx,
+                                         const BSONObj& minKey,
+                                         const BSONObj& maxKey,
+                                         const ChunkVersion& version);
 
     //
     // Database Operations
@@ -207,7 +257,16 @@ public:
      *
      * Throws DatabaseDifferCase if the database already exists with a different case.
      */
-    DatabaseType createDatabase(OperationContext* opCtx, const std::string& dbName);
+    DatabaseType createDatabase(OperationContext* opCtx,
+                                StringData dbName,
+                                const ShardId& primaryShard);
+
+    /**
+     * Creates a ScopedLock on the database name in _namespaceSerializer. This is to prevent
+     * timeouts waiting on the dist lock if multiple threads attempt to create or drop the same db.
+     */
+    NamespaceSerializer::ScopedLock serializeCreateOrDropDatabase(OperationContext* opCtx,
+                                                                  StringData dbName);
 
     /**
      * Creates the database if it does not exist, then marks its entry in config.databases as
@@ -215,7 +274,7 @@ public:
      *
      * Throws DatabaseDifferCase if the database already exists with a different case.
      */
-    void enableSharding(OperationContext* opCtx, const std::string& dbName);
+    void enableSharding(OperationContext* opCtx, StringData dbName, const ShardId& primaryShard);
 
     /**
      * Retrieves all databases for a shard.
@@ -238,38 +297,23 @@ public:
     /**
      * Drops the specified collection from the collection metadata store.
      *
-     * Returns Status::OK if successful or any error code indicating the failure. These are
-     * some of the known failures:
-     *  - NamespaceNotFound - collection does not exist
+     * Throws a DBException for any failures. These are some of the known failures:
+     *  - NamespaceNotFound - Collection does not exist
      */
-    Status dropCollection(OperationContext* opCtx, const NamespaceString& nss);
-
+    void dropCollection(OperationContext* opCtx, const NamespaceString& nss);
 
     /**
-     * Shards a collection. Assumes that the database is enabled for sharding.
+     * Ensures that a namespace that has received a dropCollection, but no longer has an entry in
+     * config.collections, has cleared all relevant metadata entries for the corresponding
+     * collection. As part of this, sends dropCollection and setShardVersion to all shards -- in
+     * case shards didn't receive these commands as part of the original dropCollection.
      *
-     * @param ns: namespace of collection to shard
-     * @param uuid: the collection's UUID. Optional because new in 3.6.
-     * @param fieldsAndOrder: shardKey pattern
-     * @param defaultCollation: the default collation for the collection, to be written to
-     *     config.collections. If empty, the collection default collation is simple binary
-     *     comparison. Note the the shard key collation will always be simple binary comparison,
-     *     even if the collection default collation is non-simple.
-     * @param unique: if true, ensure underlying index enforces a unique constraint.
-     * @param initPoints: create chunks based on a set of specified split points.
-     * @param initShardIds: If non-empty, specifies the set of shards to assign chunks between.
-     *     Otherwise all chunks will be assigned to the primary shard for the database.
+     * This function does not guarantee that all shards will eventually receive setShardVersion,
+     * unless the client infinitely retries until hearing back success. This function does, however,
+     * increase the likelihood of shards having received setShardVersion.
      */
-    void shardCollection(OperationContext* opCtx,
-                         const NamespaceString& nss,
-                         const boost::optional<UUID> uuid,
-                         const ShardKeyPattern& fieldsAndOrder,
-                         const BSONObj& defaultCollation,
-                         bool unique,
-                         const std::vector<BSONObj>& initPoints,
-                         const bool distributeInitialChunks,
-                         const ShardId& dbPrimaryShardId);
 
+    void ensureDropCollectionCompleted(OperationContext* opCtx, const NamespaceString& nss);
 
     /**
      * Iterates through each entry in config.collections that does not have a UUID, generates a UUID
@@ -280,13 +324,22 @@ public:
     void generateUUIDsForExistingShardedCollections(OperationContext* opCtx);
 
     /**
-     * Creates a new unsharded collection with the given options.
+     * Refines the shard key of an existing collection with namespace 'nss'. Here, 'shardKey'
+     * denotes the new shard key, which must contain the old shard key as a prefix.
      *
      * Throws exception on errors.
      */
-    void createCollection(OperationContext* opCtx,
-                          const NamespaceString& ns,
-                          const CollectionOptions& options);
+    void refineCollectionShardKey(OperationContext* opCtx,
+                                  const NamespaceString& nss,
+                                  const ShardKeyPattern& newShardKey);
+
+    /**
+     * Creates a ScopedLock on the collection name in _namespaceSerializer. This is to prevent
+     * timeouts waiting on the dist lock if multiple threads attempt to create or drop the same
+     * collection.
+     */
+    NamespaceSerializer::ScopedLock serializeCreateOrDropCollection(OperationContext* opCtx,
+                                                                    const NamespaceString& nss);
 
     //
     // Shard Operations
@@ -319,19 +372,11 @@ public:
      * Because of the asynchronous nature of the draining mechanism, this method returns
      * the current draining status. See ShardDrainingStatus enum definition for more details.
      */
-    StatusWith<ShardDrainingStatus> removeShard(OperationContext* opCtx, const ShardId& shardId);
+    RemoveShardProgress removeShard(OperationContext* opCtx, const ShardId& shardId);
 
     //
     // Cluster Upgrade Operations
     //
-
-    /**
-     * Returns a BSON representation of an update request that can be used to insert a shardIdentity
-     * doc into the shard for the given shardType (or update the shard's existing shardIdentity
-     * doc's configsvrConnString if the _id, shardName, and clusterId do not conflict).
-     */
-    BSONObj createShardIdentityUpsertForAddShard(OperationContext* opCtx,
-                                                 const std::string& shardName);
 
     /**
      * Runs the setFeatureCompatibilityVersion command on all shards.
@@ -422,15 +467,8 @@ private:
      */
     StatusWith<Shard::CommandResponse> _runCommandForAddShard(OperationContext* opCtx,
                                                               RemoteCommandTargeter* targeter,
-                                                              const std::string& dbName,
+                                                              StringData dbName,
                                                               const BSONObj& cmdObj);
-
-    /**
-     * Selects an optimal shard on which to place a newly created database from the set of
-     * available shards. Will return ShardNotFound if shard could not be found.
-     */
-    static StatusWith<ShardId> _selectShardForNewDatabase(OperationContext* opCtx,
-                                                          ShardRegistry* shardRegistry);
 
     /**
      * Helper method for running a count command against the config server with appropriate error
@@ -446,14 +484,20 @@ private:
     void _appendReadConcern(BSONObjBuilder* builder);
 
     /**
-     * Creates the first chunks of a new sharded collection.
+     * Retrieve the full chunk description from the config.
      */
-    ChunkVersion _createFirstChunks(OperationContext* opCtx,
-                                    const NamespaceString& nss,
-                                    const ShardKeyPattern& shardKeyPattern,
-                                    const ShardId& primaryShardId,
-                                    const std::vector<BSONObj>& initPoints,
-                                    const bool distributeInitialChunks);
+    StatusWith<ChunkType> _findChunkOnConfig(OperationContext* opCtx,
+                                             const NamespaceString& nss,
+                                             const BSONObj& key);
+
+    /**
+     * Returns true if the zone with the given name has chunk ranges associated with it and the
+     * shard with the given name is the only shard that it belongs to.
+     */
+    StatusWith<bool> _isShardRequiredByZoneStillInUse(OperationContext* opCtx,
+                                                      const ReadPreferenceSetting& readPref,
+                                                      const std::string& shardName,
+                                                      const std::string& zoneName);
 
     // The owning service context
     ServiceContext* const _serviceContext;
@@ -472,7 +516,7 @@ private:
     // (S) Self-synchronizing; access in any way from any context.
     //
 
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("ShardingCatalogManager::_mutex");
 
     // True if shutDown() has been called. False, otherwise.
     bool _inShutdown{false};  // (M)
@@ -482,6 +526,10 @@ private:
 
     // True if initializeConfigDatabaseIfNeeded() has been called and returned successfully.
     bool _configInitialized{false};  // (M)
+
+    // Resource lock order:
+    // _kShardMembershipLock -> _kChunkOpLock
+    // _kZoneOpLock
 
     /**
      * Lock for shard zoning operations. This should be acquired when doing any operations that
@@ -504,12 +552,14 @@ private:
     /**
      * Lock that guards changes to the set of shards in the cluster (ie addShard and removeShard
      * requests).
-     * TODO: Currently only taken during addShard requests, this should also be taken in X mode
-     * during removeShard, once removeShard is moved to run on the config server primary instead of
-     * on mongos.  At that point we should also change any operations that expect the shard not to
-     * be removed while they are running (such as removeShardFromZone) to take this in shared mode.
      */
     Lock::ResourceMutex _kShardMembershipLock;
+
+    /**
+     * Optimization for DDL operations, which might be tried concurrently by multiple threads.
+     * Avoids convoying and timeouts on the database/collection distributed lock.
+     */
+    NamespaceSerializer _namespaceSerializer;
 };
 
 }  // namespace mongo

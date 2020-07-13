@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 
@@ -37,44 +38,78 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/server_options.h"
-#include "mongo/s/catalog/sharding_catalog_client_impl.h"
+#include "mongo/db/write_concern.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard.h"
+#include "mongo/s/database_version_helpers.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/versioning.h"
-#include "mongo/util/log.h"
+#include "mongo/s/shard_id.h"
+#include "mongo/s/shard_util.h"
 
 namespace mongo {
-
-using std::string;
-using std::vector;
-
 namespace {
 
 const ReadPreferenceSetting kConfigReadSelector(ReadPreference::Nearest, TagSet{});
 
+/**
+ * Selects an optimal shard on which to place a newly created database from the set of available
+ * shards. Will return ShardNotFound if shard could not be found.
+ */
+ShardId selectShardForNewDatabase(OperationContext* opCtx, ShardRegistry* shardRegistry) {
+    std::vector<ShardId> allShardIds;
+
+    // Ensure the shard registry contains the most up-to-date list of available shards
+    shardRegistry->reload(opCtx);
+    shardRegistry->getAllShardIds(opCtx, &allShardIds);
+    uassert(ErrorCodes::ShardNotFound, "No shards found", !allShardIds.empty());
+
+    ShardId candidateShardId = allShardIds[0];
+
+    auto candidateSize =
+        uassertStatusOK(shardutil::retrieveTotalShardSize(opCtx, candidateShardId));
+
+    for (size_t i = 1; i < allShardIds.size(); i++) {
+        const ShardId shardId = allShardIds[i];
+
+        const auto currentSize = uassertStatusOK(shardutil::retrieveTotalShardSize(opCtx, shardId));
+
+        if (currentSize < candidateSize) {
+            candidateSize = currentSize;
+            candidateShardId = shardId;
+        }
+    }
+
+    return candidateShardId;
+}
+
 }  // namespace
 
 DatabaseType ShardingCatalogManager::createDatabase(OperationContext* opCtx,
-                                                    const std::string& dbName) {
+                                                    StringData dbName,
+                                                    const ShardId& primaryShard) {
     invariant(nsIsDbOnly(dbName));
 
     // The admin and config databases should never be explicitly created. They "just exist",
     // i.e. getDatabase will always return an entry for them.
-    if (dbName == "admin" || dbName == "config") {
+    if (dbName == NamespaceString::kAdminDb || dbName == NamespaceString::kConfigDb) {
         uasserted(ErrorCodes::InvalidOptions,
                   str::stream() << "cannot manually create database '" << dbName << "'");
     }
+
+    const auto catalogClient = Grid::get(opCtx)->catalogClient();
+    const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
 
     // Check if a database already exists with the same name (case sensitive), and if so, return the
     // existing entry.
 
     BSONObjBuilder queryBuilder;
-    queryBuilder.appendRegex(
-        DatabaseType::name(), (string) "^" + pcrecpp::RE::QuoteMeta(dbName) + "$", "i");
+    queryBuilder.appendRegex(DatabaseType::name(),
+                             (std::string) "^" + pcrecpp::RE::QuoteMeta(dbName.toString()) + "$",
+                             "i");
 
-    auto docs = uassertStatusOK(Grid::get(opCtx)->catalogClient()->_exhaustiveFindOnConfig(
+    auto docs = uassertStatusOK(catalogClient->_exhaustiveFindOnConfig(
                                     opCtx,
                                     ReadPreferenceSetting{ReadPreference::PrimaryOnly},
                                     repl::ReadConcernLevel::kLocalReadConcern,
@@ -84,66 +119,93 @@ DatabaseType ShardingCatalogManager::createDatabase(OperationContext* opCtx,
                                     1))
                     .value;
 
-    if (!docs.empty()) {
-        BSONObj dbObj = docs.front();
-        std::string actualDbName = dbObj[DatabaseType::name()].String();
+    auto const [primaryShardPtr, database] = [&] {
+        if (!docs.empty()) {
+            auto actualDb = uassertStatusOK(DatabaseType::fromBSON(docs.front()));
 
-        uassert(ErrorCodes::DatabaseDifferCase,
-                str::stream() << "can't have 2 databases that just differ on case "
-                              << " have: "
-                              << actualDbName
-                              << " want to add: "
-                              << dbName,
-                actualDbName == dbName);
+            uassert(ErrorCodes::DatabaseDifferCase,
+                    str::stream() << "can't have 2 databases that just differ on case "
+                                  << " have: " << actualDb.getName()
+                                  << " want to add: " << dbName.toString(),
+                    actualDb.getName() == dbName.toString());
 
-        // We did a local read of the database entry above and found that the database already
-        // exists. However, the data may not be majority committed (a previous createDatabase
-        // attempt may have failed with a writeConcern error).
-        // Since the current Client doesn't know the opTime of the last write to the database entry,
-        // make it wait for the last opTime in the system when we wait for writeConcern.
-        repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
-        return uassertStatusOK(DatabaseType::fromBSON(dbObj));
-    }
+            uassert(
+                ErrorCodes::NamespaceExists,
+                str::stream() << "database already created on a primary which is different from: "
+                              << primaryShard,
+                !primaryShard.isValid() || actualDb.getPrimary() == primaryShard);
 
-    // The database does not exist. Insert an entry for the new database into the sharding catalog.
+            // We did a local read of the database entry above and found that the database already
+            // exists. However, the data may not be majority committed (a previous createDatabase
+            // attempt may have failed with a writeConcern error).
+            // Since the current Client doesn't know the opTime of the last write to the database
+            // entry, make it wait for the last opTime in the system when we wait for writeConcern.
+            auto& replClient = repl::ReplClientInfo::forClient(opCtx->getClient());
+            replClient.setLastOpToSystemLastOpTime(opCtx);
 
-    // Pick a primary shard for the new database.
-    const auto primaryShardId =
-        uassertStatusOK(_selectShardForNewDatabase(opCtx, Grid::get(opCtx)->shardRegistry()));
+            WriteConcernResult unusedResult;
+            uassertStatusOK(waitForWriteConcern(opCtx,
+                                                replClient.getLastOp(),
+                                                ShardingCatalogClient::kMajorityWriteConcern,
+                                                &unusedResult));
+            return std::make_pair(
+                uassertStatusOK(shardRegistry->getShard(opCtx, actualDb.getPrimary())), actualDb);
+        } else {
+            // The database does not exist. Insert an entry for the new database into the sharding
+            // catalog.
+            auto const shardPtr = uassertStatusOK(shardRegistry->getShard(
+                opCtx,
+                primaryShard.isValid() ? primaryShard
+                                       : selectShardForNewDatabase(opCtx, shardRegistry)));
 
-    // Take the fcvLock to prevent the fcv from changing from the point we decide whether to include
-    // a databaseVersion until after we finish writing the database entry. Otherwise, we may end up
-    // in fcv>3.6, but without a databaseVersion.
-    invariant(!opCtx->lockState()->isLocked());
-    Lock::SharedLock lk(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
+            // Pick a primary shard for the new database.
+            DatabaseType db(
+                dbName.toString(), shardPtr->getId(), false, databaseVersion::makeNew());
 
-    // If in FCV>3.6, generate a databaseVersion, including a UUID, for the new database.
-    boost::optional<DatabaseVersion> dbVersion = boost::none;
-    if (serverGlobalParams.featureCompatibility.getVersion() ==
-            ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo40 ||
-        serverGlobalParams.featureCompatibility.getVersion() ==
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40) {
-        dbVersion = Versioning::newDatabaseVersion();
-    }
+            LOGV2(21938,
+                  "Registering new database {db} in sharding catalog",
+                  "Registering new database in sharding catalog",
+                  "db"_attr = db);
 
-    // Insert an entry for the new database into the sharding catalog.
-    DatabaseType db(dbName, std::move(primaryShardId), false, std::move(dbVersion));
+            // Do this write with majority writeConcern to guarantee that the shard sees the write
+            // when it receives the _flushDatabaseCacheUpdates.
+            uassertStatusOK(
+                catalogClient->insertConfigDocument(opCtx,
+                                                    DatabaseType::ConfigNS,
+                                                    db.toBSON(),
+                                                    ShardingCatalogClient::kMajorityWriteConcern));
 
-    log() << "Registering new database " << db << " in sharding catalog";
+            return std::make_pair(shardPtr, db);
+        }
+    }();
 
-    uassertStatusOK(Grid::get(opCtx)->catalogClient()->insertConfigDocument(
-        opCtx, DatabaseType::ConfigNS, db.toBSON(), ShardingCatalogClient::kMajorityWriteConcern));
+    // Note, making the primary shard refresh its databaseVersion here is not required for
+    // correctness, since either:
+    // 1) This is the first time this database is being created. The primary shard will not have a
+    //    databaseVersion already cached.
+    // 2) The database was dropped and is being re-created. Since dropping a database also sends
+    //    _flushDatabaseCacheUpdates to all shards, the primary shard should not have a database
+    //    version cached. (Note, it is possible that dropping a database will skip sending
+    //    _flushDatabaseCacheUpdates if the config server fails over while dropping the database.)
+    // However, routers don't support retrying internally on StaleDbVersion in transactions
+    // (SERVER-39704), so if the first operation run against the database is in a transaction, it
+    // would fail with StaleDbVersion. Making the primary shard refresh here allows that first
+    // transaction to succeed. This allows our transaction passthrough suites and transaction demos
+    // to succeed without additional special logic.
+    auto cmdResponse = uassertStatusOK(primaryShardPtr->runCommandWithFixedRetryAttempts(
+        opCtx,
+        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+        "admin",
+        BSON("_flushDatabaseCacheUpdates" << dbName),
+        Shard::RetryPolicy::kIdempotent));
+    uassertStatusOK(cmdResponse.commandStatus);
 
-    return db;
+    return database;
 }
 
-void ShardingCatalogManager::enableSharding(OperationContext* opCtx, const std::string& dbName) {
-    invariant(nsIsDbOnly(dbName));
-
-    uassert(ErrorCodes::IllegalOperation,
-            str::stream() << "Enabling sharding on the admin database is not allowed",
-            dbName != NamespaceString::kAdminDb);
-
+void ShardingCatalogManager::enableSharding(OperationContext* opCtx,
+                                            StringData dbName,
+                                            const ShardId& primaryShard) {
     // Sharding is enabled automatically on the config db.
     if (dbName == NamespaceString::kConfigDb) {
         return;
@@ -151,11 +213,33 @@ void ShardingCatalogManager::enableSharding(OperationContext* opCtx, const std::
 
     // Creates the database if it doesn't exist and returns the new database entry, else returns the
     // existing database entry.
-    auto dbType = createDatabase(opCtx, dbName);
+    auto dbType = createDatabase(opCtx, dbName, primaryShard);
     dbType.setSharded(true);
 
-    log() << "Enabling sharding for database [" << dbName << "] in config db";
-    uassertStatusOK(Grid::get(opCtx)->catalogClient()->updateDatabase(opCtx, dbName, dbType));
+    // We must wait for the database entry to be majority committed, because it's possible that
+    // reading from the majority snapshot has been set on the RecoveryUnit due to an earlier read,
+    // such as overtaking a distlock or loading the ShardRegistry.
+    WriteConcernResult unusedResult;
+    uassertStatusOK(
+        waitForWriteConcern(opCtx,
+                            repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp(),
+                            WriteConcernOptions(WriteConcernOptions::kMajority,
+                                                WriteConcernOptions::SyncMode::UNSET,
+                                                Milliseconds{30000}),
+                            &unusedResult));
+
+    LOGV2(21939,
+          "Persisted sharding enabled for database {db}",
+          "Persisted sharding enabled for database",
+          "db"_attr = dbName);
+
+    uassertStatusOK(Grid::get(opCtx)->catalogClient()->updateConfigDocument(
+        opCtx,
+        DatabaseType::ConfigNS,
+        BSON(DatabaseType::name(dbName.toString())),
+        BSON("$set" << BSON(DatabaseType::sharded(true))),
+        false,
+        ShardingCatalogClient::kLocalWriteConcern));
 }
 
 StatusWith<std::vector<std::string>> ShardingCatalogManager::getDatabasesForShard(
@@ -192,18 +276,6 @@ Status ShardingCatalogManager::commitMovePrimary(OperationContext* opCtx,
 
     auto const configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
 
-    // Check if the FCV has been changed under us.
-    invariant(!opCtx->lockState()->isLocked());
-    Lock::SharedLock lk(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
-
-    auto currentFCV = serverGlobalParams.featureCompatibility.getVersion();
-
-    // If we're not in 4.0, then fail. We want to have assurance that the schema will accept a
-    // version field in config.databases.
-    uassert(ErrorCodes::ConflictingOperationInProgress,
-            "committing movePrimary failed due to version mismatch",
-            currentFCV == ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
-
     // Must use local read concern because we will perform subsequent writes.
     auto findResponse = uassertStatusOK(
         configShard->exhaustiveFindOnConfig(opCtx,
@@ -234,28 +306,25 @@ Status ShardingCatalogManager::commitMovePrimary(OperationContext* opCtx,
 
     auto const currentDatabaseVersion = dbType.getVersion();
 
-    uassert(ErrorCodes::InternalError,
-            str::stream() << "DatabaseVersion doesn't exist in database entry despite the config "
-                          << "server being in FCV 4.0"
-                          << dbType.toBSON(),
-            currentDatabaseVersion != boost::none);
-
-    newDbType.setVersion(Versioning::incrementDatabaseVersion(*currentDatabaseVersion));
+    newDbType.setVersion(databaseVersion::makeIncremented(currentDatabaseVersion));
 
     auto updateQueryBuilder = BSONObjBuilder(BSON(DatabaseType::name << dbname));
-    updateQueryBuilder.append(DatabaseType::version.name(), currentDatabaseVersion->toBSON());
+    updateQueryBuilder.append(DatabaseType::version.name(), currentDatabaseVersion.toBSON());
 
     auto updateStatus = Grid::get(opCtx)->catalogClient()->updateConfigDocument(
         opCtx,
         DatabaseType::ConfigNS,
         updateQueryBuilder.obj(),
         newDbType.toBSON(),
-        true,
-        ShardingCatalogClient::kMajorityWriteConcern);
+        false,
+        ShardingCatalogClient::kLocalWriteConcern);
 
     if (!updateStatus.isOK()) {
-        log() << "error committing movePrimary: " << dbname
-              << causedBy(redact(updateStatus.getStatus()));
+        LOGV2(21940,
+              "Error committing movePrimary for {db}: {error}",
+              "Error committing movePrimary",
+              "db"_attr = dbname,
+              "error"_attr = redact(updateStatus.getStatus()));
         return updateStatus.getStatus();
     }
 
@@ -265,8 +334,7 @@ Status ShardingCatalogManager::commitMovePrimary(OperationContext* opCtx,
     // are holding the dist lock during the movePrimary operation.
     uassert(ErrorCodes::IncompatibleShardingMetadata,
             str::stream() << "Tried to update primary shard for database '" << dbname
-                          << " with version "
-                          << currentDatabaseVersion->getLastMod(),
+                          << " with version " << currentDatabaseVersion.getLastMod(),
             updateStatus.getValue());
 
     // Ensure the next attempt to retrieve the database or any of its collections will do a full

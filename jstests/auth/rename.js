@@ -1,5 +1,8 @@
 // test renameCollection with auth
 
+// Multiple users cannot be authenticated on one connection within a session.
+TestData.disableImplicitSessions = true;
+
 var m = MongoRunner.runMongod({auth: ""});
 
 var db1 = m.getDB("foo");

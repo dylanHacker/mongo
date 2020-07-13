@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -37,8 +38,9 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/simple_bsonelement_comparator.h"
-#include "mongo/client/dbclientinterface.h"  // For QueryOption_foobar
 #include "mongo/db/bson/dotted_path_support.h"
+#include "mongo/db/index/wildcard_key_generator.h"
+#include "mongo/db/index_names.h"
 #include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/matcher/expression_geo.h"
 #include "mongo/db/matcher/expression_text.h"
@@ -52,12 +54,53 @@
 #include "mongo/db/query/planner_ixselect.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/query/query_solution.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
+namespace {
+/**
+ * On success, applies the index tags from 'branchCacheData' (which represent the winning
+ * plan for 'orChild') to 'compositeCacheData'.
+ */
+Status tagOrChildAccordingToCache(PlanCacheIndexTree* compositeCacheData,
+                                  SolutionCacheData* branchCacheData,
+                                  MatchExpression* orChild,
+                                  const std::map<IndexEntry::Identifier, size_t>& indexMap) {
+    invariant(compositeCacheData);
 
-using std::unique_ptr;
+    // We want a well-formed *indexed* solution.
+    if (nullptr == branchCacheData) {
+        // For example, we don't cache things for 2d indices.
+        str::stream ss;
+        ss << "No cache data for subchild " << orChild->debugString();
+        return Status(ErrorCodes::NoQueryExecutionPlans, ss);
+    }
+
+    if (SolutionCacheData::USE_INDEX_TAGS_SOLN != branchCacheData->solnType) {
+        str::stream ss;
+        ss << "No indexed cache data for subchild " << orChild->debugString();
+        return Status(ErrorCodes::NoQueryExecutionPlans, ss);
+    }
+
+    // Add the index assignments to our original query.
+    Status tagStatus =
+        QueryPlanner::tagAccordingToCache(orChild, branchCacheData->tree.get(), indexMap);
+
+    if (!tagStatus.isOK()) {
+        str::stream ss;
+        ss << "Failed to extract indices from subchild " << orChild->debugString();
+        return tagStatus.withContext(ss);
+    }
+
+    // Add the child's cache data to the cache data we're creating for the main query.
+    compositeCacheData->children.push_back(branchCacheData->tree->clone());
+
+    return Status::OK();
+}
+}  // namespace
+
 using std::numeric_limits;
+using std::unique_ptr;
 
 namespace dps = ::mongo::dotted_path_support;
 
@@ -77,7 +120,7 @@ static bool is2DIndex(const BSONObj& pattern) {
     BSONObjIterator it(pattern);
     while (it.more()) {
         BSONElement e = it.next();
-        if (String == e.type() && str::equals("2d", e.valuestr())) {
+        if (String == e.type() && (e.valueStringData() == "2d")) {
             return true;
         }
     }
@@ -85,7 +128,7 @@ static bool is2DIndex(const BSONObj& pattern) {
 }
 
 string optionString(size_t options) {
-    mongoutils::str::stream ss;
+    str::stream ss;
 
     if (QueryPlannerParams::DEFAULT == options) {
         ss << "DEFAULT ";
@@ -106,14 +149,8 @@ string optionString(size_t options) {
             case QueryPlannerParams::INCLUDE_SHARD_FILTER:
                 ss << "INCLUDE_SHARD_FILTER ";
                 break;
-            case QueryPlannerParams::NO_BLOCKING_SORT:
-                ss << "NO_BLOCKING_SORT ";
-                break;
             case QueryPlannerParams::INDEX_INTERSECTION:
                 ss << "INDEX_INTERSECTION ";
-                break;
-            case QueryPlannerParams::KEEP_MUTATIONS:
-                ss << "KEEP_MUTATIONS ";
                 break;
             case QueryPlannerParams::IS_COUNT:
                 ss << "IS_COUNT ";
@@ -121,17 +158,21 @@ string optionString(size_t options) {
             case QueryPlannerParams::SPLIT_LIMITED_SORT:
                 ss << "SPLIT_LIMITED_SORT ";
                 break;
-            case QueryPlannerParams::CANNOT_TRIM_IXISECT:
-                ss << "CANNOT_TRIM_IXISECT ";
-                break;
-            case QueryPlannerParams::NO_UNCOVERED_PROJECTIONS:
-                ss << "NO_UNCOVERED_PROJECTIONS ";
-                break;
             case QueryPlannerParams::GENERATE_COVERED_IXSCANS:
                 ss << "GENERATE_COVERED_IXSCANS ";
                 break;
             case QueryPlannerParams::TRACK_LATEST_OPLOG_TS:
                 ss << "TRACK_LATEST_OPLOG_TS ";
+                break;
+            case QueryPlannerParams::OPLOG_SCAN_WAIT_FOR_VISIBLE:
+                ss << "OPLOG_SCAN_WAIT_FOR_VISIBLE ";
+                break;
+            case QueryPlannerParams::STRICT_DISTINCT_ONLY:
+                ss << "STRICT_DISTINCT_ONLY ";
+                break;
+            case QueryPlannerParams::PRESERVE_RECORD_ID:
+                ss << "PRESERVE_RECORD_ID ";
+                break;
             case QueryPlannerParams::DEFAULT:
                 MONGO_UNREACHABLE;
                 break;
@@ -142,12 +183,17 @@ string optionString(size_t options) {
 }
 
 static BSONObj getKeyFromQuery(const BSONObj& keyPattern, const BSONObj& query) {
-    return query.extractFieldsUnDotted(keyPattern);
+    return query.extractFieldsUndotted(keyPattern);
 }
 
 static bool indexCompatibleMaxMin(const BSONObj& obj,
                                   const CollatorInterface* queryCollator,
                                   const IndexEntry& indexEntry) {
+    // Wildcard indexes should have been filtered out by the time this is called.
+    if (indexEntry.type == IndexType::INDEX_WILDCARD) {
+        return false;
+    }
+
     BSONObjIterator kpIt(indexEntry.keyPattern);
     BSONObjIterator objIt(obj);
 
@@ -168,7 +214,7 @@ static bool indexCompatibleMaxMin(const BSONObj& obj,
         // Field names must match and be in the same order.
         BSONElement kpElt = kpIt.next();
         BSONElement objElt = objIt.next();
-        if (!mongoutils::str::equals(kpElt.fieldName(), objElt.fieldName())) {
+        if (kpElt.fieldNameStringData() != objElt.fieldNameStringData()) {
             return false;
         }
 
@@ -295,13 +341,13 @@ StatusWith<std::unique_ptr<PlanCacheIndexTree>> QueryPlanner::cacheDataFromTagge
         return Status(ErrorCodes::BadValue, "Cannot produce cache data: tree is NULL.");
     }
 
-    auto indexTree = stdx::make_unique<PlanCacheIndexTree>();
+    auto indexTree = std::make_unique<PlanCacheIndexTree>();
 
     if (taggedTree->getTag() &&
         taggedTree->getTag()->getType() == MatchExpression::TagData::Type::IndexTag) {
         IndexTag* itag = static_cast<IndexTag*>(taggedTree->getTag());
         if (itag->index >= relevantIndices.size()) {
-            mongoutils::str::stream ss;
+            str::stream ss;
             ss << "Index number is " << itag->index << " but there are only "
                << relevantIndices.size() << " relevant indices.";
             return Status(ErrorCodes::BadValue, ss);
@@ -333,19 +379,18 @@ StatusWith<std::unique_ptr<PlanCacheIndexTree>> QueryPlanner::cacheDataFromTagge
             }
 
             std::unique_ptr<IndexEntry> indexEntry =
-                stdx::make_unique<IndexEntry>(relevantIndices[itag->index]);
+                std::make_unique<IndexEntry>(relevantIndices[itag->index]);
             indexTree->entry.reset(indexEntry.release());
             indexTree->index_pos = itag->pos;
             indexTree->canCombineBounds = itag->canCombineBounds;
         }
 
         for (const auto& dest : orPushdownTag->getDestinations()) {
-            PlanCacheIndexTree::OrPushdown orPushdown;
-            orPushdown.route = dest.route;
             IndexTag* indexTag = static_cast<IndexTag*>(dest.tagData.get());
-            orPushdown.indexName = relevantIndices[indexTag->index].name;
-            orPushdown.position = indexTag->pos;
-            orPushdown.canCombineBounds = indexTag->canCombineBounds;
+            PlanCacheIndexTree::OrPushdown orPushdown{relevantIndices[indexTag->index].identifier,
+                                                      indexTag->pos,
+                                                      indexTag->canCombineBounds,
+                                                      dest.route};
             indexTree->orPushdowns.push_back(std::move(orPushdown));
         }
     }
@@ -365,24 +410,24 @@ StatusWith<std::unique_ptr<PlanCacheIndexTree>> QueryPlanner::cacheDataFromTagge
 // static
 Status QueryPlanner::tagAccordingToCache(MatchExpression* filter,
                                          const PlanCacheIndexTree* const indexTree,
-                                         const map<StringData, size_t>& indexMap) {
-    if (NULL == filter) {
-        return Status(ErrorCodes::BadValue, "Cannot tag tree: filter is NULL.");
+                                         const map<IndexEntry::Identifier, size_t>& indexMap) {
+    if (nullptr == filter) {
+        return Status(ErrorCodes::NoQueryExecutionPlans, "Cannot tag tree: filter is NULL.");
     }
-    if (NULL == indexTree) {
-        return Status(ErrorCodes::BadValue, "Cannot tag tree: indexTree is NULL.");
+    if (nullptr == indexTree) {
+        return Status(ErrorCodes::NoQueryExecutionPlans, "Cannot tag tree: indexTree is NULL.");
     }
 
     // We're tagging the tree here, so it shouldn't have
     // any tags hanging off yet.
-    verify(NULL == filter->getTag());
+    verify(nullptr == filter->getTag());
 
     if (filter->numChildren() != indexTree->children.size()) {
-        mongoutils::str::stream ss;
+        str::stream ss;
         ss << "Cache topology and query did not match: "
            << "query has " << filter->numChildren() << " children "
            << "and cache has " << indexTree->children.size() << " children.";
-        return Status(ErrorCodes::BadValue, ss);
+        return Status(ErrorCodes::NoQueryExecutionPlans, ss);
     }
 
     // Continue the depth-first tree traversal.
@@ -397,26 +442,25 @@ Status QueryPlanner::tagAccordingToCache(MatchExpression* filter,
         filter->setTag(new OrPushdownTag());
         OrPushdownTag* orPushdownTag = static_cast<OrPushdownTag*>(filter->getTag());
         for (const auto& orPushdown : indexTree->orPushdowns) {
-            auto index = indexMap.find(orPushdown.indexName);
+            auto index = indexMap.find(orPushdown.indexEntryId);
             if (index == indexMap.end()) {
-                return Status(ErrorCodes::BadValue,
-                              str::stream() << "Did not find index with name: "
-                                            << orPushdown.indexName);
+                return Status(ErrorCodes::NoQueryExecutionPlans,
+                              str::stream() << "Did not find index: " << orPushdown.indexEntryId);
             }
             OrPushdownTag::Destination dest;
             dest.route = orPushdown.route;
-            dest.tagData = stdx::make_unique<IndexTag>(
+            dest.tagData = std::make_unique<IndexTag>(
                 index->second, orPushdown.position, orPushdown.canCombineBounds);
             orPushdownTag->addDestination(std::move(dest));
         }
     }
 
     if (indexTree->entry.get()) {
-        map<StringData, size_t>::const_iterator got = indexMap.find(indexTree->entry->name);
+        const auto got = indexMap.find(indexTree->entry->identifier);
         if (got == indexMap.end()) {
-            mongoutils::str::stream ss;
-            ss << "Did not find index with name: " << indexTree->entry->name;
-            return Status(ErrorCodes::BadValue, ss);
+            str::stream ss;
+            ss << "Did not find index with name: " << indexTree->entry->identifier.catalogName;
+            return Status(ErrorCodes::NoQueryExecutionPlans, ss);
         }
         if (filter->getTag()) {
             OrPushdownTag* orPushdownTag = static_cast<OrPushdownTag*>(filter->getTag());
@@ -448,7 +492,7 @@ StatusWith<std::unique_ptr<QuerySolution>> QueryPlanner::planFromCache(
         auto soln = buildWholeIXSoln(
             *winnerCacheData.tree->entry, query, params, winnerCacheData.wholeIXSolnDir);
         if (!soln) {
-            return Status(ErrorCodes::BadValue,
+            return Status(ErrorCodes::NoQueryExecutionPlans,
                           "plan cache error: soln that uses index to provide sort");
         } else {
             return {std::move(soln)};
@@ -458,7 +502,8 @@ StatusWith<std::unique_ptr<QuerySolution>> QueryPlanner::planFromCache(
         // with tailable==true, hence the false below.
         auto soln = buildCollscanSoln(query, false, params);
         if (!soln) {
-            return Status(ErrorCodes::BadValue, "plan cache error: collection scan soln");
+            return Status(ErrorCodes::NoQueryExecutionPlans,
+                          "plan cache error: collection scan soln");
         } else {
             return {std::move(soln)};
         }
@@ -471,19 +516,32 @@ StatusWith<std::unique_ptr<QuerySolution>> QueryPlanner::planFromCache(
     // Create a copy of the expression tree.  We use cachedSoln to annotate this with indices.
     unique_ptr<MatchExpression> clone = query.root()->shallowClone();
 
-    LOG(5) << "Tagging the match expression according to cache data: " << endl
-           << "Filter:" << endl
-           << redact(clone->toString()) << "Cache data:" << endl
-           << redact(winnerCacheData.toString());
+    LOGV2_DEBUG(20963,
+                5,
+                "Tagging the match expression according to cache data: \nFilter:\n{filter}Cache "
+                "data:\n{cacheData}",
+                "Tagging the match expression according to cache data",
+                "filter"_attr = redact(clone->debugString()),
+                "cacheData"_attr = redact(winnerCacheData.toString()));
+
+    stdx::unordered_set<string> fields;
+    QueryPlannerIXSelect::getFields(query.root(), &fields);
+    std::vector<IndexEntry> expandedIndexes =
+        QueryPlannerIXSelect::expandIndexes(fields, params.indices);
 
     // Map from index name to index number.
-    // TODO: can we assume that the index numbering has the same lifetime
-    // as the cache state?
-    map<StringData, size_t> indexMap;
-    for (size_t i = 0; i < params.indices.size(); ++i) {
-        const IndexEntry& ie = params.indices[i];
-        indexMap[ie.name] = i;
-        LOG(5) << "Index " << i << ": " << ie.name;
+    map<IndexEntry::Identifier, size_t> indexMap;
+    for (size_t i = 0; i < expandedIndexes.size(); ++i) {
+        const IndexEntry& ie = expandedIndexes[i];
+        const auto insertionRes = indexMap.insert(std::make_pair(ie.identifier, i));
+        // Be sure the key was not already in the map.
+        invariant(insertionRes.second);
+        LOGV2_DEBUG(20964,
+                    5,
+                    "Index {indexNumber}: {id}",
+                    "Index mapping: number and identifier",
+                    "indexNumber"_attr = i,
+                    "id"_attr = ie.identifier);
     }
 
     Status s = tagAccordingToCache(clone.get(), winnerCacheData.tree.get(), indexMap);
@@ -494,42 +552,55 @@ StatusWith<std::unique_ptr<QuerySolution>> QueryPlanner::planFromCache(
     // The MatchExpression tree is in canonical order. We must order the nodes for access planning.
     prepareForAccessPlanning(clone.get());
 
-    LOG(5) << "Tagged tree:" << endl << redact(clone->toString());
+    LOGV2_DEBUG(20965,
+                5,
+                "Tagged tree:\n{tree}",
+                "Tagged tree",
+                "tree"_attr = redact(clone->debugString()));
 
     // Use the cached index assignments to build solnRoot.
     std::unique_ptr<QuerySolutionNode> solnRoot(QueryPlannerAccess::buildIndexedDataAccess(
-        query, clone.release(), false, params.indices, params));
+        query, std::move(clone), expandedIndexes, params));
 
     if (!solnRoot) {
-        return Status(ErrorCodes::BadValue,
+        return Status(ErrorCodes::NoQueryExecutionPlans,
                       str::stream() << "Failed to create data access plan from cache. Query: "
                                     << query.toStringShort());
     }
 
     auto soln = QueryPlannerAnalysis::analyzeDataAccess(query, params, std::move(solnRoot));
     if (!soln) {
-        return Status(ErrorCodes::BadValue,
-                      str::stream() << "Failed to analyze plan from cache. Query: "
-                                    << query.toStringShort());
+        return Status(ErrorCodes::NoQueryExecutionPlans,
+                      str::stream()
+                          << "Failed to analyze plan from cache. Query: " << query.toStringShort());
     }
 
-    LOG(5) << "Planner: solution constructed from the cache:\n" << redact(soln->toString());
+    LOGV2_DEBUG(20966,
+                5,
+                "Planner: solution constructed from the cache:\n{solution}",
+                "Planner: solution constructed from the cache",
+                "solution"_attr = redact(soln->toString()));
     return {std::move(soln)};
 }
 
 // static
 StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
     const CanonicalQuery& query, const QueryPlannerParams& params) {
-    LOG(5) << "Beginning planning..." << endl
-           << "=============================" << endl
-           << "Options = " << optionString(params.options) << endl
-           << "Canonical query:" << endl
-           << redact(query.toString()) << "=============================";
-
-    std::vector<std::unique_ptr<QuerySolution>> out;
+    LOGV2_DEBUG(20967,
+                5,
+                "Beginning planning...\n=============================\nOptions = "
+                "{options}\nCanonical query:\n{query}=============================",
+                "Beginning planning",
+                "options"_attr = optionString(params.options),
+                "query"_attr = redact(query.toString()));
 
     for (size_t i = 0; i < params.indices.size(); ++i) {
-        LOG(5) << "Index " << i << " is " << params.indices[i].toString();
+        LOGV2_DEBUG(20968,
+                    5,
+                    "Index {indexNumber} is {value}",
+                    "Index number and details",
+                    "indexNumber"_attr = i,
+                    "index"_attr = params.indices[i].toString());
     }
 
     const bool canTableScan = !(params.options & QueryPlannerParams::NO_TABLE_SCAN);
@@ -538,103 +609,108 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
     // If the query requests a tailable cursor, the only solution is a collscan + filter with
     // tailable set on the collscan.
     if (isTailable) {
-        if (!QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR) && canTableScan) {
-            auto soln = buildCollscanSoln(query, isTailable, params);
-            if (soln) {
-                out.push_back(std::move(soln));
-            }
+        if (!canTableScan) {
+            return Status(
+                ErrorCodes::NoQueryExecutionPlans,
+                "Running with 'notablescan', so tailable cursors (which always do a table "
+                "scan) are not allowed");
         }
+        auto soln = buildCollscanSoln(query, isTailable, params);
+        if (!soln) {
+            return Status(ErrorCodes::NoQueryExecutionPlans,
+                          "Failed to build collection scan soln");
+        }
+        std::vector<std::unique_ptr<QuerySolution>> out;
+        out.push_back(std::move(soln));
         return {std::move(out)};
     }
 
-    // The hint or sort can be $natural: 1.  If this happens, output a collscan. If both
-    // a $natural hint and a $natural sort are specified, then the direction of the collscan
-    // is determined by the sign of the sort (not the sign of the hint).
-    if (!query.getQueryRequest().getHint().isEmpty() ||
-        !query.getQueryRequest().getSort().isEmpty()) {
-        BSONObj hintObj = query.getQueryRequest().getHint();
-        BSONObj sortObj = query.getQueryRequest().getSort();
-        BSONElement naturalHint = dps::extractElementAtPath(hintObj, "$natural");
-        BSONElement naturalSort = dps::extractElementAtPath(sortObj, "$natural");
-
-        // A hint overrides a $natural sort. This means that we don't force a table
-        // scan if there is a $natural sort with a non-$natural hint.
-        if (!naturalHint.eoo() || (!naturalSort.eoo() && hintObj.isEmpty())) {
-            LOG(5) << "Forcing a table scan due to hinted $natural";
-            // min/max are incompatible with $natural.
-            if (canTableScan && query.getQueryRequest().getMin().isEmpty() &&
-                query.getQueryRequest().getMax().isEmpty()) {
-                auto soln = buildCollscanSoln(query, isTailable, params);
-                if (soln) {
-                    out.push_back(std::move(soln));
-                }
+    // The hint can be {$natural: +/-1}. If this happens, output a collscan. We expect any $natural
+    // sort to have been normalized to a $natural hint upstream.
+    if (!query.getQueryRequest().getHint().isEmpty()) {
+        const BSONObj& hintObj = query.getQueryRequest().getHint();
+        if (hintObj[QueryRequest::kNaturalSortField]) {
+            LOGV2_DEBUG(20969, 5, "Forcing a table scan due to hinted $natural");
+            if (!canTableScan) {
+                return Status(ErrorCodes::NoQueryExecutionPlans,
+                              "hint $natural is not allowed, because 'notablescan' is enabled");
             }
+            if (!query.getQueryRequest().getMin().isEmpty() ||
+                !query.getQueryRequest().getMax().isEmpty()) {
+                return Status(ErrorCodes::NoQueryExecutionPlans,
+                              "min and max are incompatible with $natural");
+            }
+            auto soln = buildCollscanSoln(query, isTailable, params);
+            if (!soln) {
+                return Status(ErrorCodes::NoQueryExecutionPlans,
+                              "Failed to build collection scan soln");
+            }
+            std::vector<std::unique_ptr<QuerySolution>> out;
+            out.push_back(std::move(soln));
             return {std::move(out)};
         }
     }
 
-    // Figure out what fields we care about.
-    stdx::unordered_set<string> fields;
-    QueryPlannerIXSelect::getFields(query.root(), "", &fields);
-
-    for (stdx::unordered_set<string>::const_iterator it = fields.begin(); it != fields.end();
-         ++it) {
-        LOG(5) << "Predicate over field '" << *it << "'";
-    }
-
-    // Filter our indices so we only look at indices that are over our predicates.
-    vector<IndexEntry> relevantIndices;
-
-    // Hints require us to only consider the hinted index.
-    // If index filters in the query settings were used to override
-    // the allowed indices for planning, we should not use the hinted index
+    // Hints require us to only consider the hinted index. If index filters in the query settings
+    // were used to override the allowed indices for planning, we should not use the hinted index
     // requested in the query.
-    BSONObj hintIndex;
+    BSONObj hintedIndex;
     if (!params.indexFiltersApplied) {
-        hintIndex = query.getQueryRequest().getHint();
+        hintedIndex = query.getQueryRequest().getHint();
     }
 
-    boost::optional<size_t> hintIndexNumber;
+    // Either the list of indices passed in by the caller, or the list of indices filtered according
+    // to the hint. This list is later expanded in order to allow the planner to handle wildcard
+    // indexes.
+    std::vector<IndexEntry> fullIndexList;
 
-    if (hintIndex.isEmpty()) {
-        QueryPlannerIXSelect::findRelevantIndices(fields, params.indices, &relevantIndices);
+    // Will hold a copy of the index entry chosen by the hint.
+    boost::optional<IndexEntry> hintedIndexEntry;
+    if (hintedIndex.isEmpty()) {
+        fullIndexList = params.indices;
     } else {
-        // Sigh.  If the hint is specified it might be using the index name.
-        BSONElement firstHintElt = hintIndex.firstElement();
-        if (str::equals("$hint", firstHintElt.fieldName()) && String == firstHintElt.type()) {
-            string hintName = firstHintElt.String();
-            for (size_t i = 0; i < params.indices.size(); ++i) {
-                if (params.indices[i].name == hintName) {
-                    LOG(5) << "Hint by name specified, restricting indices to "
-                           << params.indices[i].keyPattern.toString();
-                    relevantIndices.clear();
-                    relevantIndices.push_back(params.indices[i]);
-                    hintIndexNumber = i;
-                    hintIndex = params.indices[i].keyPattern;
-                    break;
-                }
-            }
-        } else {
-            for (size_t i = 0; i < params.indices.size(); ++i) {
-                if (0 == params.indices[i].keyPattern.woCompare(hintIndex)) {
-                    relevantIndices.clear();
-                    relevantIndices.push_back(params.indices[i]);
-                    LOG(5) << "Hint specified, restricting indices to " << hintIndex.toString();
-                    if (hintIndexNumber) {
-                        return Status(ErrorCodes::IndexNotFound,
-                                      str::stream() << "Hint matched multiple indexes, "
-                                                    << "must hint by index name. Matched: "
-                                                    << params.indices[i].toString()
-                                                    << " and "
-                                                    << params.indices[*hintIndexNumber].toString());
-                    }
-                    hintIndexNumber = i;
-                }
-            }
+        fullIndexList = QueryPlannerIXSelect::findIndexesByHint(hintedIndex, params.indices);
+
+        if (fullIndexList.empty()) {
+            return Status(ErrorCodes::BadValue,
+                          "hint provided does not correspond to an existing index");
+        }
+        if (fullIndexList.size() > 1) {
+            return Status(ErrorCodes::IndexNotFound,
+                          str::stream()
+                              << "Hint matched multiple indexes, "
+                              << "must hint by index name. Matched: " << fullIndexList[0].toString()
+                              << " and " << fullIndexList[1].toString());
         }
 
-        if (!hintIndexNumber) {
-            return Status(ErrorCodes::BadValue, "bad hint");
+        hintedIndexEntry.emplace(fullIndexList.front());
+    }
+
+    // Figure out what fields we care about.
+    stdx::unordered_set<string> fields;
+    QueryPlannerIXSelect::getFields(query.root(), &fields);
+    for (auto&& field : fields) {
+        LOGV2_DEBUG(20970,
+                    5,
+                    "Predicate over field '{field}'",
+                    "Predicate over field",
+                    "field"_attr = field);
+    }
+
+    fullIndexList = QueryPlannerIXSelect::expandIndexes(fields, std::move(fullIndexList));
+    std::vector<IndexEntry> relevantIndices;
+
+    if (!hintedIndexEntry) {
+        relevantIndices = QueryPlannerIXSelect::findRelevantIndices(fields, fullIndexList);
+    } else {
+        relevantIndices = fullIndexList;
+
+        // Relevant indices should only ever exceed a size of 1 when there is a hint in the case of
+        // $** index.
+        if (relevantIndices.size() > 1) {
+            for (auto&& entry : relevantIndices) {
+                invariant(entry.type == IndexType::INDEX_WILDCARD);
+            }
         }
     }
 
@@ -642,99 +718,62 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
     // that matches the object inside.
     if (!query.getQueryRequest().getMin().isEmpty() ||
         !query.getQueryRequest().getMax().isEmpty()) {
+
+        if (!hintedIndexEntry) {
+            return Status(ErrorCodes::Error(51173),
+                          "When using min()/max() a hint of which index to use must be provided");
+        }
+
         BSONObj minObj = query.getQueryRequest().getMin();
         BSONObj maxObj = query.getQueryRequest().getMax();
 
-        // The unfinished siblings of these objects may not be proper index keys because they
-        // may be empty objects or have field names. When an index is picked to use for the
-        // min/max query, these "finished" objects will always be valid index keys for the
-        // index's key pattern.
-        BSONObj finishedMinObj;
-        BSONObj finishedMaxObj;
+        if ((!minObj.isEmpty() &&
+             !indexCompatibleMaxMin(minObj, query.getCollator(), *hintedIndexEntry)) ||
+            (!maxObj.isEmpty() &&
+             !indexCompatibleMaxMin(maxObj, query.getCollator(), *hintedIndexEntry))) {
+            return Status(ErrorCodes::Error(51174),
+                          "The index chosen is not compatible with min/max");
+        }
+        // Be sure that index expansion didn't do anything. As wildcard indexes are banned for
+        // min/max, we expect to find a single hinted index entry.
+        invariant(fullIndexList.size() == 1);
+        invariant(*hintedIndexEntry == fullIndexList.front());
 
-        // This is the index into params.indices[...] that we use.
-        size_t idxNo = numeric_limits<size_t>::max();
+        // In order to be fully compatible, the min has to be less than the max according to the
+        // index key pattern ordering. The first step in verifying this is "finish" the min and max
+        // by replacing empty objects and stripping field names.
+        BSONObj finishedMinObj = finishMinObj(*hintedIndexEntry, minObj, maxObj);
+        BSONObj finishedMaxObj = finishMaxObj(*hintedIndexEntry, minObj, maxObj);
 
-        // If there's an index hinted we need to be able to use it.
-        if (!hintIndex.isEmpty()) {
-            invariant(hintIndexNumber);
-            const auto& hintedIndexEntry = params.indices[*hintIndexNumber];
-
-            if (!minObj.isEmpty() &&
-                !indexCompatibleMaxMin(minObj, query.getCollator(), hintedIndexEntry)) {
-                LOG(5) << "Minobj doesn't work with hint";
-                return Status(ErrorCodes::BadValue, "hint provided does not work with min query");
-            }
-
-            if (!maxObj.isEmpty() &&
-                !indexCompatibleMaxMin(maxObj, query.getCollator(), hintedIndexEntry)) {
-                LOG(5) << "Maxobj doesn't work with hint";
-                return Status(ErrorCodes::BadValue, "hint provided does not work with max query");
-            }
-
-            finishedMinObj = finishMinObj(hintedIndexEntry, minObj, maxObj);
-            finishedMaxObj = finishMaxObj(hintedIndexEntry, minObj, maxObj);
-
-            // The min must be less than the max for the hinted index ordering.
-            if (0 <= finishedMinObj.woCompare(finishedMaxObj, hintedIndexEntry.keyPattern, false)) {
-                LOG(5) << "Minobj/Maxobj don't work with hint";
-                return Status(ErrorCodes::BadValue,
-                              "hint provided does not work with min/max query");
-            }
-
-            idxNo = *hintIndexNumber;
-        } else {
-            // No hinted index, look for one that is compatible (has same field names and
-            // ordering thereof).
-            for (size_t i = 0; i < params.indices.size(); ++i) {
-                const auto& indexEntry = params.indices[i];
-
-                BSONObj toUse = minObj.isEmpty() ? maxObj : minObj;
-                if (indexCompatibleMaxMin(toUse, query.getCollator(), indexEntry)) {
-                    // In order to be fully compatible, the min has to be less than the max
-                    // according to the index key pattern ordering. The first step in verifying
-                    // this is "finish" the min and max by replacing empty objects and stripping
-                    // field names.
-                    finishedMinObj = finishMinObj(indexEntry, minObj, maxObj);
-                    finishedMaxObj = finishMaxObj(indexEntry, minObj, maxObj);
-
-                    // Now we have the final min and max. This index is only relevant for
-                    // the min/max query if min < max.
-                    if (0 >=
-                        finishedMinObj.woCompare(finishedMaxObj, indexEntry.keyPattern, false)) {
-                        // Found a relevant index.
-                        idxNo = i;
-                        break;
-                    }
-
-                    // This index is not relevant; move on to the next.
-                }
-            }
+        // Now we have the final min and max. This index is only relevant for the min/max query if
+        // min < max.
+        if (finishedMinObj.woCompare(finishedMaxObj, hintedIndexEntry->keyPattern, false) >= 0) {
+            return Status(ErrorCodes::Error(51175),
+                          "The value provided for min() does not come before the value provided "
+                          "for max() in the hinted index");
         }
 
-        if (idxNo == numeric_limits<size_t>::max()) {
-            LOG(5) << "Can't find relevant index to use for max/min query";
-            // Can't find an index to use, bail out.
-            return Status(ErrorCodes::BadValue, "unable to find relevant index for max/min query");
-        }
-
-        LOG(5) << "Max/min query using index " << params.indices[idxNo].toString();
-
-        // Make our scan and output.
         std::unique_ptr<QuerySolutionNode> solnRoot(QueryPlannerAccess::makeIndexScan(
-            params.indices[idxNo], query, params, finishedMinObj, finishedMaxObj));
+            *hintedIndexEntry, query, params, finishedMinObj, finishedMaxObj));
         invariant(solnRoot);
 
         auto soln = QueryPlannerAnalysis::analyzeDataAccess(query, params, std::move(solnRoot));
-        if (soln) {
-            out.push_back(std::move(soln));
+        if (!soln) {
+            return Status(ErrorCodes::NoQueryExecutionPlans,
+                          "Sort and covering analysis failed while planning hint/min/max query");
         }
-
+        std::vector<std::unique_ptr<QuerySolution>> out;
+        out.push_back(std::move(soln));
         return {std::move(out)};
     }
 
     for (size_t i = 0; i < relevantIndices.size(); ++i) {
-        LOG(2) << "Relevant index " << i << " is " << relevantIndices[i].toString();
+        LOGV2_DEBUG(20971,
+                    2,
+                    "Relevant index {indexNumber} is {value}",
+                    "Relevant index",
+                    "indexNumber"_attr = i,
+                    "index"_attr = relevantIndices[i].toString());
     }
 
     // Figure out how useful each index is to each predicate.
@@ -756,25 +795,34 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
     }
 
     // query.root() is now annotated with RelevantTag(s).
-    LOG(5) << "Rated tree:" << endl << redact(query.root()->toString());
+    LOGV2_DEBUG(20972,
+                5,
+                "Rated tree:\n{tree}",
+                "Rated tree",
+                "tree"_attr = redact(query.root()->debugString()));
 
     // If there is a GEO_NEAR it must have an index it can use directly.
-    const MatchExpression* gnNode = NULL;
+    const MatchExpression* gnNode = nullptr;
     if (QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR, &gnNode)) {
         // No index for GEO_NEAR?  No query.
         RelevantTag* tag = static_cast<RelevantTag*>(gnNode->getTag());
         if (!tag || (0 == tag->first.size() && 0 == tag->notFirst.size())) {
-            LOG(5) << "Unable to find index for $geoNear query.";
+            LOGV2_DEBUG(20973, 5, "Unable to find index for $geoNear query");
             // Don't leave tags on query tree.
             query.root()->resetTag();
-            return Status(ErrorCodes::BadValue, "unable to find index for $geoNear query");
+            return Status(ErrorCodes::NoQueryExecutionPlans,
+                          "unable to find index for $geoNear query");
         }
 
-        LOG(5) << "Rated tree after geonear processing:" << redact(query.root()->toString());
+        LOGV2_DEBUG(20974,
+                    5,
+                    "Rated tree after geonear processing:{tree}",
+                    "Rated tree after geonear processing",
+                    "tree"_attr = redact(query.root()->debugString()));
     }
 
     // Likewise, if there is a TEXT it must have an index it can use directly.
-    const MatchExpression* textNode = NULL;
+    const MatchExpression* textNode = nullptr;
     if (QueryPlannerCommon::hasNode(query.root(), MatchExpression::TEXT, &textNode)) {
         RelevantTag* tag = static_cast<RelevantTag*>(textNode->getTag());
 
@@ -782,22 +830,23 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
         // the text stage can't be built if no text index exists or there is an ambiguity as to
         // which one to use.
         size_t textIndexCount = 0;
-        for (size_t i = 0; i < params.indices.size(); i++) {
-            if (INDEX_TEXT == params.indices[i].type) {
+        for (size_t i = 0; i < fullIndexList.size(); i++) {
+            if (INDEX_TEXT == fullIndexList[i].type) {
                 textIndexCount++;
             }
         }
         if (textIndexCount != 1) {
             // Don't leave tags on query tree.
             query.root()->resetTag();
-            return Status(ErrorCodes::BadValue, "need exactly one text index for $text query");
+            return Status(ErrorCodes::NoQueryExecutionPlans,
+                          "need exactly one text index for $text query");
         }
 
         // Error if the text node is tagged with zero indices.
         if (0 == tag->first.size() && 0 == tag->notFirst.size()) {
             // Don't leave tags on query tree.
             query.root()->resetTag();
-            return Status(ErrorCodes::BadValue,
+            return Status(ErrorCodes::NoQueryExecutionPlans,
                           "failed to use text index to satisfy $text query (if text index is "
                           "compound, are equality predicates given for all prefix fields?)");
         }
@@ -806,8 +855,14 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
         // assigned to it.
         invariant(1 == tag->first.size() + tag->notFirst.size());
 
-        LOG(5) << "Rated tree after text processing:" << redact(query.root()->toString());
+        LOGV2_DEBUG(20975,
+                    5,
+                    "Rated tree after text processing:{tree}",
+                    "Rated tree after text processing",
+                    "tree"_attr = redact(query.root()->debugString()));
     }
+
+    std::vector<std::unique_ptr<QuerySolution>> out;
 
     // If we have any relevant indices, we try to create indexed plans.
     if (0 < relevantIndices.size()) {
@@ -820,31 +875,37 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
         PlanEnumerator isp(enumParams);
         isp.init().transitional_ignore();
 
-        unique_ptr<MatchExpression> rawTree;
-        while ((rawTree = isp.getNext()) && (out.size() < params.maxIndexedSolutions)) {
-            LOG(5) << "About to build solntree from tagged tree:" << endl
-                   << redact(rawTree.get()->toString());
+        unique_ptr<MatchExpression> nextTaggedTree;
+        while ((nextTaggedTree = isp.getNext()) && (out.size() < params.maxIndexedSolutions)) {
+            LOGV2_DEBUG(20976,
+                        5,
+                        "About to build solntree from tagged tree:\n{tree}",
+                        "About to build solntree from tagged tree",
+                        "tree"_attr = redact(nextTaggedTree->debugString()));
 
             // Store the plan cache index tree before calling prepareForAccessingPlanning(), so that
             // the PlanCacheIndexTree has the same sort as the MatchExpression used to generate the
             // plan cache key.
-            std::unique_ptr<MatchExpression> clone(rawTree.get()->shallowClone());
+            std::unique_ptr<MatchExpression> clone(nextTaggedTree->shallowClone());
             std::unique_ptr<PlanCacheIndexTree> cacheData;
             auto statusWithCacheData = cacheDataFromTaggedTree(clone.get(), relevantIndices);
             if (!statusWithCacheData.isOK()) {
-                LOG(5) << "Query is not cachable: "
-                       << redact(statusWithCacheData.getStatus().reason());
+                LOGV2_DEBUG(20977,
+                            5,
+                            "Query is not cachable: {reason}",
+                            "Query is not cachable",
+                            "reason"_attr = redact(statusWithCacheData.getStatus().reason()));
             } else {
                 cacheData = std::move(statusWithCacheData.getValue());
             }
 
             // We have already cached the tree in canonical order, so now we can order the nodes for
             // access planning.
-            prepareForAccessPlanning(rawTree.get());
+            prepareForAccessPlanning(nextTaggedTree.get());
 
             // This can fail if enumeration makes a mistake.
             std::unique_ptr<QuerySolutionNode> solnRoot(QueryPlannerAccess::buildIndexedDataAccess(
-                query, rawTree.release(), false, relevantIndices, params));
+                query, std::move(nextTaggedTree), relevantIndices, params));
 
             if (!solnRoot) {
                 continue;
@@ -852,7 +913,11 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
 
             auto soln = QueryPlannerAnalysis::analyzeDataAccess(query, params, std::move(solnRoot));
             if (soln) {
-                LOG(5) << "Planner: adding solution:" << endl << redact(soln->toString());
+                LOGV2_DEBUG(20978,
+                            5,
+                            "Planner: adding solution:\n{solution}",
+                            "Planner: adding solution",
+                            "solution"_attr = redact(soln->toString()));
                 if (statusWithCacheData.isOK()) {
                     SolutionCacheData* scd = new SolutionCacheData();
                     scd->tree = std::move(cacheData);
@@ -866,42 +931,55 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
     // Don't leave tags on query tree.
     query.root()->resetTag();
 
-    LOG(5) << "Planner: outputted " << out.size() << " indexed solutions.";
+    LOGV2_DEBUG(20979,
+                5,
+                "Planner: outputted {numSolutions} indexed solutions",
+                "Planner: outputted indexed solutions",
+                "numSolutions"_attr = out.size());
 
     // Produce legible error message for failed OR planning with a TEXT child.
     // TODO: support collection scan for non-TEXT children of OR.
-    if (out.size() == 0 && textNode != NULL && MatchExpression::OR == query.root()->matchType()) {
+    if (out.size() == 0 && textNode != nullptr &&
+        MatchExpression::OR == query.root()->matchType()) {
         MatchExpression* root = query.root();
         for (size_t i = 0; i < root->numChildren(); ++i) {
             if (textNode == root->getChild(i)) {
-                return Status(ErrorCodes::BadValue,
+                return Status(ErrorCodes::NoQueryExecutionPlans,
                               "Failed to produce a solution for TEXT under OR - "
                               "other non-TEXT clauses under OR have to be indexed as well.");
             }
         }
     }
 
-    // An index was hinted.  If there are any solutions, they use the hinted index.  If not, we
+    // An index was hinted. If there are any solutions, they use the hinted index.  If not, we
     // scan the entire index to provide results and output that as our plan.  This is the
-    // desired behavior when an index is hinted that is not relevant to the query.
-    if (!hintIndex.isEmpty()) {
-        if (0 == out.size()) {
-            // Push hinted index solution to output list if found. It is possible to end up without
-            // a solution in the case where a filtering QueryPlannerParams argument, such as
-            // NO_BLOCKING_SORT, leads to its exclusion.
-            auto soln = buildWholeIXSoln(params.indices[*hintIndexNumber], query, params);
-            if (soln) {
-                LOG(5) << "Planner: outputting soln that uses hinted index as scan.";
-                out.push_back(std::move(soln));
-            }
+    // desired behavior when an index is hinted that is not relevant to the query. In the case that
+    // $** index is hinted, we do not want this behavior.
+    if (!hintedIndex.isEmpty() && relevantIndices.size() == 1) {
+        if (out.size() > 0) {
+            return {std::move(out)};
         }
+        if (relevantIndices.front().type == IndexType::INDEX_WILDCARD) {
+            return Status(
+                ErrorCodes::NoQueryExecutionPlans,
+                "$hint: refusing to build whole-index solution, because it's a wildcard index");
+        }
+        // Return hinted index solution if found.
+        auto soln = buildWholeIXSoln(relevantIndices.front(), query, params);
+        if (!soln) {
+            return Status(ErrorCodes::NoQueryExecutionPlans,
+                          "Failed to build whole-index solution for $hint");
+        }
+        LOGV2_DEBUG(20980, 5, "Planner: outputting soln that uses hinted index as scan");
+        std::vector<std::unique_ptr<QuerySolution>> out;
+        out.push_back(std::move(soln));
         return {std::move(out)};
     }
 
     // If a sort order is requested, there may be an index that provides it, even if that
     // index is not over any predicates in the query.
     //
-    if (!query.getQueryRequest().getSort().isEmpty() &&
+    if (query.getSortPattern() &&
         !QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR) &&
         !QueryPlannerCommon::hasNode(query.root(), MatchExpression::TEXT)) {
         // See if we have a sort provided from an index already.
@@ -916,10 +994,10 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
         }
 
         if (!usingIndexToSort) {
-            for (size_t i = 0; i < params.indices.size(); ++i) {
-                const IndexEntry& index = params.indices[i];
-                // Only regular (non-plugin) indexes can be used to provide a sort, and only
-                // non-sparse indexes can be used to provide a sort.
+            for (size_t i = 0; i < fullIndexList.size(); ++i) {
+                const IndexEntry& index = fullIndexList[i];
+                // Only a regular index or the non-hashed prefix of a compound hashed index can be
+                // used to provide a sort. In addition, the index needs to be a non-sparse index.
                 //
                 // TODO: Sparse indexes can't normally provide a sort, because non-indexed
                 // documents could potentially be missing from the result set.  However, if the
@@ -932,7 +1010,7 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
                 // - Index {a: 1, b: "2dsphere"} (which is "geo-sparse", if
                 //   2dsphereIndexVersion=2) should be able to provide a sort for
                 //   find({b: GEO}).sort({a:1}).  SERVER-10801.
-                if (index.type != INDEX_BTREE) {
+                if (index.type != INDEX_BTREE && index.type != INDEX_HASHED) {
                     continue;
                 }
                 if (index.sparse) {
@@ -953,11 +1031,12 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
 
                 const BSONObj kp = QueryPlannerAnalysis::getSortPattern(index.keyPattern);
                 if (providesSort(query, kp)) {
-                    LOG(5) << "Planner: outputting soln that uses index to provide sort.";
-                    auto soln = buildWholeIXSoln(params.indices[i], query, params);
+                    LOGV2_DEBUG(
+                        20981, 5, "Planner: outputting soln that uses index to provide sort");
+                    auto soln = buildWholeIXSoln(fullIndexList[i], query, params);
                     if (soln) {
                         PlanCacheIndexTree* indexTree = new PlanCacheIndexTree();
-                        indexTree->setIndexEntry(params.indices[i]);
+                        indexTree->setIndexEntry(fullIndexList[i]);
                         SolutionCacheData* scd = new SolutionCacheData();
                         scd->tree.reset(indexTree);
                         scd->solnType = SolutionCacheData::WHOLE_IXSCAN_SOLN;
@@ -965,16 +1044,17 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
 
                         soln->cacheData.reset(scd);
                         out.push_back(std::move(soln));
-                        break;
                     }
                 }
                 if (providesSort(query, QueryPlannerCommon::reverseSortObj(kp))) {
-                    LOG(5) << "Planner: outputting soln that uses (reverse) index "
-                           << "to provide sort.";
-                    auto soln = buildWholeIXSoln(params.indices[i], query, params, -1);
+                    LOGV2_DEBUG(
+                        20982,
+                        5,
+                        "Planner: outputting soln that uses (reverse) index to provide sort");
+                    auto soln = buildWholeIXSoln(fullIndexList[i], query, params, -1);
                     if (soln) {
                         PlanCacheIndexTree* indexTree = new PlanCacheIndexTree();
-                        indexTree->setIndexEntry(params.indices[i]);
+                        indexTree->setIndexEntry(fullIndexList[i]);
                         SolutionCacheData* scd = new SolutionCacheData();
                         scd->tree.reset(indexTree);
                         scd->solnType = SolutionCacheData::WHOLE_IXSCAN_SOLN;
@@ -982,7 +1062,6 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
 
                         soln->cacheData.reset(scd);
                         out.push_back(std::move(soln));
-                        break;
                     }
                 }
             }
@@ -995,7 +1074,7 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
     if (params.options & QueryPlannerParams::GENERATE_COVERED_IXSCANS && out.size() == 0 &&
         query.getQueryObj().isEmpty() && projection && !projection->requiresDocument()) {
 
-        const auto* indicesToConsider = hintIndex.isEmpty() ? &params.indices : &relevantIndices;
+        const auto* indicesToConsider = hintedIndex.isEmpty() ? &fullIndexList : &relevantIndices;
         for (auto&& index : *indicesToConsider) {
             if (index.type != INDEX_BTREE || index.multikey || index.sparse || index.filterExpr ||
                 !CollatorInterface::collatorsMatch(index.collator, query.getCollator())) {
@@ -1003,11 +1082,10 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
             }
 
             QueryPlannerParams paramsForCoveredIxScan;
-            paramsForCoveredIxScan.options =
-                params.options | QueryPlannerParams::NO_UNCOVERED_PROJECTIONS;
             auto soln = buildWholeIXSoln(index, query, paramsForCoveredIxScan);
-            if (soln) {
-                LOG(5) << "Planner: outputting soln that uses index to provide projection.";
+            if (soln && !soln->root->fetched()) {
+                LOGV2_DEBUG(
+                    20983, 5, "Planner: outputting soln that uses index to provide projection");
                 PlanCacheIndexTree* indexTree = new PlanCacheIndexTree();
                 indexTree->setIndexEntry(index);
 
@@ -1023,22 +1101,37 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
         }
     }
 
-    // geoNear and text queries *require* an index.
-    // Also, if a hint is specified it indicates that we MUST use it.
-    bool possibleToCollscan =
-        !QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR) &&
-        !QueryPlannerCommon::hasNode(query.root(), MatchExpression::TEXT) && hintIndex.isEmpty();
-
     // The caller can explicitly ask for a collscan.
     bool collscanRequested = (params.options & QueryPlannerParams::INCLUDE_COLLSCAN);
 
     // No indexed plans?  We must provide a collscan if possible or else we can't run the query.
-    bool collscanNeeded = (0 == out.size() && canTableScan);
+    bool collScanRequired = 0 == out.size();
+    if (collScanRequired && !canTableScan) {
+        return Status(ErrorCodes::NoQueryExecutionPlans,
+                      "No indexed plans available, and running with 'notablescan'");
+    }
 
-    if (possibleToCollscan && (collscanRequested || collscanNeeded)) {
+    // geoNear and text queries *require* an index.
+    // Also, if a hint is specified it indicates that we MUST use it.
+    bool possibleToCollscan =
+        !QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR) &&
+        !QueryPlannerCommon::hasNode(query.root(), MatchExpression::TEXT) && hintedIndex.isEmpty();
+    if (collScanRequired && !possibleToCollscan) {
+        return Status(ErrorCodes::NoQueryExecutionPlans, "No query solutions");
+    }
+
+    if (possibleToCollscan && (collscanRequested || collScanRequired)) {
         auto collscan = buildCollscanSoln(query, isTailable, params);
+        if (!collscan && collScanRequired) {
+            return Status(ErrorCodes::NoQueryExecutionPlans,
+                          "Failed to build collection scan soln");
+        }
         if (collscan) {
-            LOG(5) << "Planner: outputting a collscan:" << endl << redact(collscan->toString());
+            LOGV2_DEBUG(20984,
+                        5,
+                        "Planner: outputting a collection scan:\n{collectionScan}",
+                        "Planner: outputting a collection scan",
+                        "collectionScan"_attr = redact(collscan->toString()));
             SolutionCacheData* scd = new SolutionCacheData();
             scd->solnType = SolutionCacheData::COLLSCAN_SOLN;
             collscan->cacheData.reset(scd);
@@ -1046,7 +1139,199 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
         }
     }
 
+    invariant(out.size() > 0);
     return {std::move(out)};
 }
 
+StatusWith<QueryPlanner::SubqueriesPlanningResult> QueryPlanner::planSubqueries(
+    OperationContext* opCtx,
+    const Collection* collection,
+    const PlanCache* planCache,
+    const CanonicalQuery& query,
+    const QueryPlannerParams& params) {
+    invariant(query.root()->matchType() == MatchExpression::OR);
+    invariant(query.root()->numChildren(), "Cannot plan subqueries for an $or with no children");
+
+    SubqueriesPlanningResult planningResult{query.root()->shallowClone()};
+    for (size_t i = 0; i < params.indices.size(); ++i) {
+        const IndexEntry& ie = params.indices[i];
+        const auto insertionRes = planningResult.indexMap.insert(std::make_pair(ie.identifier, i));
+        // Be sure the key was not already in the map.
+        invariant(insertionRes.second);
+        LOGV2_DEBUG(20598, 5, "Subplanner: index {i} is {ie}", "i"_attr = i, "ie"_attr = ie);
+    }
+
+    for (size_t i = 0; i < planningResult.orExpression->numChildren(); ++i) {
+        // We need a place to shove the results from planning this branch.
+        planningResult.branches.push_back(
+            std::make_unique<SubqueriesPlanningResult::BranchPlanningResult>());
+        auto branchResult = planningResult.branches.back().get();
+        auto orChild = planningResult.orExpression->getChild(i);
+
+        // Turn the i-th child into its own query.
+        auto statusWithCQ = CanonicalQuery::canonicalize(opCtx, query, orChild);
+        if (!statusWithCQ.isOK()) {
+            str::stream ss;
+            ss << "Can't canonicalize subchild " << orChild->debugString() << " "
+               << statusWithCQ.getStatus().reason();
+            return Status(ErrorCodes::BadValue, ss);
+        }
+
+        branchResult->canonicalQuery = std::move(statusWithCQ.getValue());
+
+        // Plan the i-th child. We might be able to find a plan for the i-th child in the plan
+        // cache. If there's no cached plan, then we generate and rank plans using the MPS.
+
+        // Populate branchResult->cachedSolution if an active cachedSolution entry exists.
+        if (planCache && planCache->shouldCacheQuery(*branchResult->canonicalQuery)) {
+            auto planCacheKey = planCache->computeKey(*branchResult->canonicalQuery);
+            if (auto cachedSol = planCache->getCacheEntryIfActive(planCacheKey)) {
+                // We have a CachedSolution. Store it for later.
+                LOGV2_DEBUG(
+                    20599,
+                    5,
+                    "Subplanner: cached plan found for child {i} of {orExpression_numChildren}",
+                    "i"_attr = i,
+                    "orExpression_numChildren"_attr = planningResult.orExpression->numChildren());
+
+                branchResult->cachedSolution = std::move(cachedSol);
+            }
+        }
+
+        if (!branchResult->cachedSolution) {
+            // No CachedSolution found. We'll have to plan from scratch.
+            LOGV2_DEBUG(20600,
+                        5,
+                        "Subplanner: planning child {i} of {orExpression_numChildren}",
+                        "i"_attr = i,
+                        "orExpression_numChildren"_attr =
+                            planningResult.orExpression->numChildren());
+
+            // We don't set NO_TABLE_SCAN because peeking at the cache data will keep us from
+            // considering any plan that's a collscan.
+            invariant(branchResult->solutions.empty());
+            auto solutions = QueryPlanner::plan(*branchResult->canonicalQuery, params);
+            if (!solutions.isOK()) {
+                str::stream ss;
+                ss << "Can't plan for subchild " << branchResult->canonicalQuery->toString() << " "
+                   << solutions.getStatus().reason();
+                return Status(ErrorCodes::BadValue, ss);
+            }
+            branchResult->solutions = std::move(solutions.getValue());
+
+            LOGV2_DEBUG(20601,
+                        5,
+                        "Subplanner: got {branchResult_solutions_size} solutions",
+                        "branchResult_solutions_size"_attr = branchResult->solutions.size());
+        }
+    }
+
+    return std::move(planningResult);
+}
+
+StatusWith<std::unique_ptr<QuerySolution>> QueryPlanner::choosePlanForSubqueries(
+    const CanonicalQuery& query,
+    const QueryPlannerParams& params,
+    QueryPlanner::SubqueriesPlanningResult planningResult,
+    std::function<StatusWith<std::unique_ptr<QuerySolution>>(
+        CanonicalQuery* cq, std::vector<unique_ptr<QuerySolution>>)> multiplanCallback) {
+    // This is the skeleton of index selections that is inserted into the cache.
+    std::unique_ptr<PlanCacheIndexTree> cacheData(new PlanCacheIndexTree());
+
+    for (size_t i = 0; i < planningResult.orExpression->numChildren(); ++i) {
+        auto orChild = planningResult.orExpression->getChild(i);
+        auto branchResult = planningResult.branches[i].get();
+
+        if (branchResult->cachedSolution.get()) {
+            // We can get the index tags we need out of the cache.
+            Status tagStatus =
+                tagOrChildAccordingToCache(cacheData.get(),
+                                           branchResult->cachedSolution->plannerData[0],
+                                           orChild,
+                                           planningResult.indexMap);
+            if (!tagStatus.isOK()) {
+                return tagStatus;
+            }
+        } else if (1 == branchResult->solutions.size()) {
+            QuerySolution* soln = branchResult->solutions.front().get();
+            Status tagStatus = tagOrChildAccordingToCache(
+                cacheData.get(), soln->cacheData.get(), orChild, planningResult.indexMap);
+            if (!tagStatus.isOK()) {
+                return tagStatus;
+            }
+        } else {
+            // N solutions, rank them.
+
+            invariant(!branchResult->solutions.empty());
+
+            auto multiPlanStatus = multiplanCallback(branchResult->canonicalQuery.get(),
+                                                     std::move(branchResult->solutions));
+            if (!multiPlanStatus.isOK()) {
+                return multiPlanStatus;
+            }
+
+            auto bestSoln = std::move(multiPlanStatus.getValue());
+
+            // Check that we have good cache data. For example, we don't cache things
+            // for 2d indices.
+
+            if (nullptr == bestSoln->cacheData.get()) {
+                str::stream ss;
+                ss << "No cache data for subchild " << orChild->debugString();
+                return Status(ErrorCodes::NoQueryExecutionPlans, ss);
+            }
+
+            if (SolutionCacheData::USE_INDEX_TAGS_SOLN != bestSoln->cacheData->solnType) {
+                str::stream ss;
+                ss << "No indexed cache data for subchild " << orChild->debugString();
+                return Status(ErrorCodes::NoQueryExecutionPlans, ss);
+            }
+
+            // Add the index assignments to our original query.
+            Status tagStatus = QueryPlanner::tagAccordingToCache(
+                orChild, bestSoln->cacheData->tree.get(), planningResult.indexMap);
+            if (!tagStatus.isOK()) {
+                str::stream ss;
+                ss << "Failed to extract indices from subchild " << orChild->debugString();
+                return tagStatus.withContext(ss);
+            }
+
+            cacheData->children.push_back(bestSoln->cacheData->tree->clone());
+        }
+    }
+
+    // Must do this before using the planner functionality.
+    prepareForAccessPlanning(planningResult.orExpression.get());
+
+    // Use the cached index assignments to build solnRoot. Takes ownership of '_orExpression'.
+    std::unique_ptr<QuerySolutionNode> solnRoot(QueryPlannerAccess::buildIndexedDataAccess(
+        query, std::move(planningResult.orExpression), params.indices, params));
+
+    if (!solnRoot) {
+        str::stream ss;
+        ss << "Failed to build indexed data path for subplanned query\n";
+        return Status(ErrorCodes::NoQueryExecutionPlans, ss);
+    }
+
+    LOGV2_DEBUG(20602,
+                5,
+                "Subplanner: fully tagged tree is {solnRoot}",
+                "solnRoot"_attr = redact(solnRoot->toString()));
+
+    auto compositeSolution =
+        QueryPlannerAnalysis::analyzeDataAccess(query, params, std::move(solnRoot));
+
+    if (nullptr == compositeSolution.get()) {
+        str::stream ss;
+        ss << "Failed to analyze subplanned query";
+        return Status(ErrorCodes::NoQueryExecutionPlans, ss);
+    }
+
+    LOGV2_DEBUG(20603,
+                5,
+                "Subplanner: Composite solution is {compositeSolution}",
+                "compositeSolution"_attr = redact(compositeSolution->toString()));
+
+    return std::move(compositeSolution);
+}
 }  // namespace mongo

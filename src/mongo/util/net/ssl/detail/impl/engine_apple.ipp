@@ -1,34 +1,36 @@
+
 /**
- * Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "asio/detail/config.hpp"
 
@@ -36,37 +38,22 @@
 #include "asio/detail/throw_error.hpp"
 #include "asio/error.hpp"
 
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include <arpa/inet.h>
+
+#include "mongo/logv2/log.h"
 #include "mongo/util/net/ssl/apple.hpp"
 #include "mongo/util/net/ssl/detail/engine.hpp"
+#include "mongo/util/net/ssl/detail/stream_core.hpp"
 #include "mongo/util/net/ssl/error.hpp"
+#include "mongo/util/str.h"
 
 namespace asio {
 namespace ssl {
 namespace detail {
 
 namespace {
-
-std::ostringstream& operator<<(std::ostringstream& ss, ::OSStatus status) {
-    apple::CFUniquePtr<::CFStringRef> errstr(::SecCopyErrorMessageString(status, nullptr));
-    if (!errstr) {
-        ss << "Unknown Error: " << static_cast<int>(status);
-        return ss;
-    }
-    const auto len = ::CFStringGetMaximumSizeForEncoding(::CFStringGetLength(errstr.get()),
-                                                         ::kCFStringEncodingUTF8);
-    std::string ret;
-    ret.resize(len + 1);
-    if (!::CFStringGetCString(errstr.get(), &ret[0], len, ::kCFStringEncodingUTF8)) {
-        ss << "Unknown Error: " << static_cast<int>(status);
-        return ss;
-    }
-
-    ret.resize(strlen(ret.c_str()));
-    ss << ret;
-    return ss;
-}
+// Limit size of output buffer to avoid growing indefinitely.
+constexpr auto max_outbuf_size = stream_core::max_tls_record_size;
 
 const class osstatus_category : public error_category {
 public:
@@ -76,7 +63,22 @@ public:
 
     std::string message(int value) const noexcept final {
         const auto status = static_cast<::OSStatus>(value);
-        return mongo::str::stream() << "Secure.Transport: " << status;
+        apple::CFUniquePtr<::CFStringRef> errstr(::SecCopyErrorMessageString(status, nullptr));
+        if (!errstr) {
+            return mongo::str::stream()
+                << "Secure.Transport unknown error: " << static_cast<int>(status);
+        }
+        const auto len = ::CFStringGetMaximumSizeForEncoding(::CFStringGetLength(errstr.get()),
+                                                             ::kCFStringEncodingUTF8);
+        std::string ret;
+        ret.resize(len + 1);
+        if (!::CFStringGetCString(errstr.get(), &ret[0], len, ::kCFStringEncodingUTF8)) {
+            return mongo::str::stream()
+                << "Secure.Transport unknown error: " << static_cast<int>(status);
+        }
+
+        ret.resize(strlen(ret.c_str()));
+        return mongo::str::stream() << "Secure.Transport: " << ret;
     }
 } OSStatus_category;
 
@@ -144,14 +146,12 @@ bool engine::_initSSL(stream_base::handshake_type type, asio::error_code& ec) {
     const auto side = (type == stream_base::client) ? ::kSSLClientSide : ::kSSLServerSide;
     _ssl.reset(::SSLCreateContext(nullptr, side, ::kSSLStreamType));
     if (!_ssl) {
-        mongo::error() << "Failed allocating SSLContext";
+        LOGV2_ERROR(24140, "Failed allocating SSLContext");
         ec = errorCode(::errSSLInternal);
         return false;
     }
 
     auto status = ::SSLSetConnection(_ssl.get(), static_cast<void*>(this));
-
-    // TODO: ::SSLSetPeerDomainName()
 
     if (_certs && (status == ::errSecSuccess)) {
         status = ::SSLSetCertificate(_ssl.get(), _certs.get());
@@ -200,6 +200,7 @@ bool engine::_initSSL(stream_base::handshake_type type, asio::error_code& ec) {
 }
 
 engine::want engine::handshake(stream_base::handshake_type type, asio::error_code& ec) {
+    ec = asio::error_code();
     if (!_initSSL(type, ec)) {
         // Error happened, ec has been set.
         return want::want_nothing;
@@ -229,6 +230,7 @@ engine::want engine::handshake(stream_base::handshake_type type, asio::error_cod
 }
 
 engine::want engine::shutdown(asio::error_code& ec) {
+    ec = asio::error_code();
     if (_ssl) {
         const auto status = ::SSLClose(_ssl.get());
         if (status == ::errSSLWouldBlock) {
@@ -240,7 +242,7 @@ engine::want engine::shutdown(asio::error_code& ec) {
             ec = errorCode(status);
         }
     } else {
-        mongo::error() << "SSL connection already shut down";
+        LOGV2_ERROR(24141, "SSL connection already shut down");
         ec = errorCode(::errSSLInternal);
     }
     return want::want_nothing;
@@ -275,6 +277,7 @@ const asio::error_code& engine::map_error_code(asio::error_code& ec) const {
 engine::want engine::write(const asio::const_buffer& data,
                            asio::error_code& ec,
                            std::size_t& bytes_transferred) {
+    ec = asio::error_code();
     if (!verifyConnected(_ssl.get(), &ec)) {
         return want::want_nothing;
     }
@@ -302,13 +305,49 @@ asio::mutable_buffer engine::get_output(const asio::mutable_buffer& data) {
 ::OSStatus engine::write_func(::SSLConnectionRef ctx, const void* data, size_t* data_len) {
     auto* this_ = const_cast<engine*>(static_cast<const engine*>(ctx));
     const auto* p = static_cast<const char*>(data);
+
+    const auto requested = *data_len;
+    *data_len = std::min<size_t>(requested, max_outbuf_size - this_->_outbuf.size());
     this_->_outbuf.insert(this_->_outbuf.end(), p, p + *data_len);
-    return ::errSecSuccess;
+    return (requested == *data_len) ? ::errSecSuccess : ::errSSLWouldBlock;
+}
+
+boost::optional<std::string> engine::get_sni() {
+    if (_sni) {
+        return _sni;
+    }
+
+    size_t len = 0;
+    auto status = ::SSLCopyRequestedPeerNameLength(_ssl.get(), &len);
+    if (status != ::errSecSuccess) {
+        _sni = boost::none;
+        return _sni;
+    }
+
+    std::string sni;
+    sni.resize(len + 1);
+    status = ::SSLCopyRequestedPeerName(_ssl.get(), sni.data(), &len);
+    if (status != ::errSecSuccess) {
+        _sni = boost::none;
+        return _sni;
+    }
+
+    sni.resize(len);
+
+    // ::SSLCopyRequestedPeerName includes space for a null byte at the end of the string it writes.
+    // We do not want to include this null byte in the advertised SNI name
+    while (!sni.empty() && sni.back() == '\0') {
+        sni.pop_back();
+    }
+
+    _sni = sni;
+    return _sni;
 }
 
 engine::want engine::read(const asio::mutable_buffer& data,
                           asio::error_code& ec,
                           std::size_t& bytes_transferred) {
+    ec = asio::error_code();
     if (!verifyConnected(_ssl.get(), &ec)) {
         return want::want_nothing;
     }

@@ -1,61 +1,73 @@
-// Test that causally consistent majority-committed reads will wait for the majority commit point to
-// move past 'afterClusterTime'.
-// @tags: [requires_replication]
+// Test that causally consistent majority-committed read-only transactions will wait for the
+// majority commit point to move past 'afterClusterTime' before they can commit.
+// @tags: [uses_transactions, requires_majority_read_concern]
 (function() {
-    "use strict";
+"use strict";
 
-    load("jstests/libs/write_concern_util.js");  // For stopReplicationOnSecondaries.
+load("jstests/libs/write_concern_util.js");  // For stopReplicationOnSecondaries.
 
-    const dbName = "test";
-    const collName = "coll";
+const dbName = "test";
+const collName = "coll";
 
-    const rst = new ReplSetTest({nodes: 2});
-    rst.startSet();
-    rst.initiate();
+const rst = new ReplSetTest({nodes: 2});
+rst.startSet();
+rst.initiate();
 
-    const session =
-        rst.getPrimary().getDB(dbName).getMongo().startSession({causalConsistency: false});
-    const primaryDB = session.getDatabase(dbName);
-    let txnNumber = 0;
+const session = rst.getPrimary().getDB(dbName).getMongo().startSession({causalConsistency: false});
+const primaryDB = session.getDatabase(dbName);
 
-    function testReadConcernLevel(level) {
-        // Stop replication.
-        stopReplicationOnSecondaries(rst);
+let txnNumber = 0;
 
-        // Perform a write and get its op time.
-        const res = assert.commandWorked(primaryDB.runCommand({insert: collName, documents: [{}]}));
-        assert(res.hasOwnProperty("opTime"), tojson(res));
-        assert(res.opTime.hasOwnProperty("ts"), tojson(res));
-        const clusterTime = res.opTime.ts;
+function testReadConcernLevel(level) {
+    // Stop replication.
+    stopReplicationOnSecondaries(rst);
 
-        // A committed read on the primary after the new cluster time should time out waiting for
-        // the cluster time to be majority committed.
-        assert.commandFailedWithCode(primaryDB.runCommand({
-            find: collName,
-            readConcern: {level: level, afterClusterTime: clusterTime},
-            maxTimeMS: 1000,
-            txnNumber: NumberLong(txnNumber++)
-        }),
-                                     ErrorCodes.ExceededTimeLimit);
+    // Perform a write and get its op time.
+    const res = assert.commandWorked(primaryDB.runCommand({insert: collName, documents: [{}]}));
+    assert(res.hasOwnProperty("opTime"), tojson(res));
+    assert(res.opTime.hasOwnProperty("ts"), tojson(res));
+    const clusterTime = res.opTime.ts;
 
-        // Restart replication.
-        restartReplicationOnSecondaries(rst);
+    // A majority-committed read-only transaction on the primary after the new cluster time
+    // should time out at commit time waiting for the cluster time to be majority committed.
+    assert.commandWorked(primaryDB.runCommand({
+        find: collName,
+        txnNumber: NumberLong(++txnNumber),
+        startTransaction: true,
+        autocommit: false,
+        readConcern: {level: level, afterClusterTime: clusterTime}
+    }));
+    assert.commandFailedWithCode(primaryDB.adminCommand({
+        commitTransaction: 1,
+        txnNumber: NumberLong(txnNumber),
+        autocommit: false,
+        writeConcern: {w: "majority"},
+        maxTimeMS: 1000
+    }),
+                                 ErrorCodes.MaxTimeMSExpired);
 
-        // A committed read on the primary after the new cluster time now succeeds.
-        assert.commandWorked(primaryDB.runCommand({
-            find: collName,
-            readConcern: {level: level, afterClusterTime: clusterTime},
-            txnNumber: NumberLong(txnNumber++)
-        }));
-    }
+    // Restart replication.
+    restartReplicationOnSecondaries(rst);
 
-    if (assert.commandWorked(primaryDB.serverStatus()).storageEngine.supportsCommittedReads) {
-        testReadConcernLevel("majority");
-    }
+    // A majority-committed read-only transaction on the primary after the new cluster time now
+    // succeeds.
+    assert.commandWorked(primaryDB.runCommand({
+        find: collName,
+        txnNumber: NumberLong(++txnNumber),
+        startTransaction: true,
+        autocommit: false,
+        readConcern: {level: level, afterClusterTime: clusterTime}
+    }));
+    assert.commandWorked(primaryDB.adminCommand({
+        commitTransaction: 1,
+        txnNumber: NumberLong(txnNumber),
+        autocommit: false,
+        writeConcern: {w: "majority"}
+    }));
+}
 
-    if (assert.commandWorked(primaryDB.serverStatus()).storageEngine.supportsSnapshotReadConcern) {
-        testReadConcernLevel("snapshot");
-    }
+testReadConcernLevel("majority");
+testReadConcernLevel("snapshot");
 
-    rst.stopSet();
+rst.stopSet();
 }());

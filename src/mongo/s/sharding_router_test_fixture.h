@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,8 +38,6 @@ class ShardingCatalogClient;
 struct ChunkVersion;
 class CollectionType;
 class DistLockManagerMock;
-class RemoteCommandTargeterFactoryMock;
-class RemoteCommandTargeterMock;
 class ShardRegistry;
 class ShardType;
 
@@ -50,33 +49,27 @@ class TransportLayerMock;
  * Sets up the mocked out objects for testing the replica-set backed catalog manager and catalog
  * client.
  */
-class ShardingTestFixture : public unittest::Test, public ShardingTestFixtureCommon {
-public:
+class ShardingTestFixture : public ShardingTestFixtureCommon {
+protected:
     ShardingTestFixture();
     ~ShardingTestFixture();
+
+    /**
+     * Returns the mock targeter for the config server. Useful to use like so,
+     *
+     *     configTargeterMock()->setFindHostReturnValue(HostAndPort);
+     *     configTargeterMock()->setFindHostReturnValue({ErrorCodes::InternalError, "can't target"})
+     *
+     * Remote calls always need to resolve a host with RemoteCommandTargeterMock::findHost, so it
+     * must be set.
+     */
+    std::shared_ptr<RemoteCommandTargeterMock> configTargeter();
 
     // Syntactic sugar for getting sharding components off the Grid, if they have been initialized.
 
     ShardingCatalogClient* catalogClient() const;
     ShardRegistry* shardRegistry() const;
-    RemoteCommandTargeterFactoryMock* targeterFactory() const;
-    executor::TaskExecutor* executor() const;
-    DistLockManagerMock* distLock() const;
-    RemoteCommandTargeterMock* configTargeter() const;
-
-    ServiceContext* serviceContext() const;
-    OperationContext* operationContext() const;
-
-    /**
-     * Blocking methods, which receive one message from the network and respond using the
-     * responses returned from the input function. This is a syntactic sugar for simple,
-     * single request + response or find tests.
-     */
-    void onCommand(executor::NetworkTestEnv::OnCommandFunction func);
-    void onCommandWithMetadata(executor::NetworkTestEnv::OnCommandWithMetadataFunction func);
-    void onFindCommand(executor::NetworkTestEnv::OnFindCommandFunction func);
-    void onFindWithMetadataCommand(
-        executor::NetworkTestEnv::OnFindCommandWithMetadataFunction func);
+    std::shared_ptr<executor::TaskExecutor> executor() const;
 
     /**
      * Same as the onCommand* variants, but expects the request to be placed on the arbitrary
@@ -120,59 +113,12 @@ public:
     void expectFindSendBSONObjVector(const HostAndPort& configHost, std::vector<BSONObj> obj);
 
     /**
-     * Waits for an operation which creates a capped config collection with the specified name and
-     * capped size.
-     */
-    void expectConfigCollectionCreate(const HostAndPort& configHost,
-                                      StringData collName,
-                                      int cappedSize,
-                                      const BSONObj& response);
-
-    /**
-     * Wait for a single insert in one of the change or action log collections with the specified
-     * contents and return a successful response.
-     */
-    void expectConfigCollectionInsert(const HostAndPort& configHost,
-                                      StringData collName,
-                                      Date_t timestamp,
-                                      const std::string& what,
-                                      const std::string& ns,
-                                      const BSONObj& detail);
-
-    /**
-     * Wait for the config.changelog collection to be created on the specified host.
-     */
-    void expectChangeLogCreate(const HostAndPort& configHost, const BSONObj& response);
-
-    /**
-     * Expect a log message with the specified contents to be written to the config.changelog
-     * collection.
-     */
-    void expectChangeLogInsert(const HostAndPort& configHost,
-                               Date_t timestamp,
-                               const std::string& what,
-                               const std::string& ns,
-                               const BSONObj& detail);
-
-    /**
      * Expects an update call, which changes the specified collection's namespace contents to match
      * those of the input argument.
      */
     void expectUpdateCollection(const HostAndPort& expectedHost,
                                 const CollectionType& coll,
                                 bool expectUpsert = true);
-
-    /**
-     * Expects a setShardVersion command to be executed on the specified shard.
-     */
-    void expectSetShardVersion(const HostAndPort& expectedHost,
-                               const ShardType& expectedShard,
-                               const NamespaceString& expectedNs,
-                               const ChunkVersion& expectedChunkVersion);
-
-    void setUp() override;
-
-    void tearDown() override;
 
     void shutdownExecutor();
 
@@ -185,22 +131,28 @@ public:
                           const Timestamp& expectedTS,
                           long long expectedTerm) const;
 
+    /**
+     * Mocks an error cursor response from a remote with the given 'status'.
+     */
+    BSONObj createErrorCursorResponse(Status status) {
+        invariant(!status.isOK());
+        BSONObjBuilder result;
+        status.serializeErrorToBSON(&result);
+        result.appendBool("ok", false);
+        return result.obj();
+    }
+
 private:
-    ServiceContext::UniqueClient _client;
-    ServiceContext::UniqueOperationContext _opCtx;
-    transport::TransportLayerMock* _transportLayer;
+    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient(
+        std::unique_ptr<DistLockManager> distLockManager) override;
+
     transport::SessionHandle _transportSession;
 
-    RemoteCommandTargeterFactoryMock* _targeterFactory;
-    RemoteCommandTargeterMock* _configTargeter;
-
     // For the Grid's fixed executor.
-    executor::TaskExecutor* _executor;
+    std::shared_ptr<executor::TaskExecutor> _fixedExecutor;
 
     // For the Grid's arbitrary executor in its executorPool.
     std::unique_ptr<executor::NetworkTestEnv> _networkTestEnvForPool;
-
-    DistLockManagerMock* _distLockManager = nullptr;
 };
 
 }  // namespace mongo

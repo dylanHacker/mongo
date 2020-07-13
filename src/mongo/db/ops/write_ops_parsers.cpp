@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,19 +31,21 @@
 
 #include "mongo/db/ops/write_ops_parsers.h"
 
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/ops/write_ops.h"
+#include "mongo/db/pipeline/aggregation_request.h"
+#include "mongo/db/update/update_oplog_entry_version.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
+#include "mongo/util/visit_helper.h"
 
 namespace mongo {
 
+using write_ops::Delete;
+using write_ops::DeleteOpEntry;
 using write_ops::Insert;
 using write_ops::Update;
-using write_ops::Delete;
 using write_ops::UpdateOpEntry;
-using write_ops::DeleteOpEntry;
 
 namespace {
 
@@ -50,10 +53,7 @@ template <class T>
 void checkOpCountForCommand(const T& op, size_t numOps) {
     uassert(ErrorCodes::InvalidLength,
             str::stream() << "Write batch sizes must be between 1 and "
-                          << write_ops::kMaxWriteBatchSize
-                          << ". Got "
-                          << numOps
-                          << " operations.",
+                          << write_ops::kMaxWriteBatchSize << ". Got " << numOps << " operations.",
             numOps != 0 && numOps <= write_ops::kMaxWriteBatchSize);
 
     const auto& stmtIds = op.getWriteCommandBase().getStmtIds();
@@ -66,26 +66,7 @@ void checkOpCountForCommand(const T& op, size_t numOps) {
 }
 
 void validateInsertOp(const write_ops::Insert& insertOp) {
-    const auto& nss = insertOp.getNamespace();
     const auto& docs = insertOp.getDocuments();
-
-    if (nss.isSystemDotIndexes()) {
-        // This is only for consistency with sharding.
-        uassert(ErrorCodes::InvalidLength,
-                "Insert commands to system.indexes are limited to a single insert",
-                docs.size() == 1);
-
-        const auto indexedNss(extractIndexedNamespace(insertOp));
-
-        uassert(ErrorCodes::InvalidNamespace,
-                str::stream() << indexedNss.ns() << " is not a valid namespace to index",
-                indexedNss.isValid());
-
-        uassert(ErrorCodes::IllegalOperation,
-                str::stream() << indexedNss.ns() << " is not in the target database " << nss.db(),
-                nss.db().compare(indexedNss.db()) == 0);
-    }
-
     checkOpCountForCommand(insertOp, docs.size());
 }
 
@@ -118,15 +99,6 @@ int32_t getStmtIdForWriteAt(const WriteCommandBase& writeCommandBase, size_t wri
     const auto& stmtId = writeCommandBase.getStmtId();
     const int32_t kFirstStmtId = stmtId ? *stmtId : 0;
     return kFirstStmtId + writePos;
-}
-
-NamespaceString extractIndexedNamespace(const Insert& insertOp) {
-    invariant(insertOp.getNamespace().isSystemDotIndexes());
-
-    const auto& documents = insertOp.getDocuments();
-    invariant(documents.size() == 1);
-
-    return NamespaceString(documents.at(0)["ns"].str());
 }
 
 }  // namespace write_ops
@@ -194,7 +166,8 @@ write_ops::Update UpdateOp::parseLegacy(const Message& msgRaw) {
         singleUpdate.setUpsert(flags & UpdateOption_Upsert);
         singleUpdate.setMulti(flags & UpdateOption_Multi);
         singleUpdate.setQ(msg.nextJsObj());
-        singleUpdate.setU(msg.nextJsObj());
+        singleUpdate.setU(
+            write_ops::UpdateModification::parseLegacyOpUpdateFromBSON(msg.nextJsObj()));
 
         return updates;
     }());
@@ -235,6 +208,128 @@ write_ops::Delete DeleteOp::parseLegacy(const Message& msgRaw) {
     }());
 
     return op;
+}
+
+write_ops::UpdateModification write_ops::UpdateModification::parseFromOplogEntry(
+    const BSONObj& oField) {
+    BSONElement vField = oField[kUpdateOplogEntryVersionFieldName];
+
+    // If this field appears it should be an integer.
+    uassert(4772600,
+            str::stream() << "Expected $v field to be missing or an integer, but got type: "
+                          << vField.type(),
+            !vField.ok() ||
+                (vField.type() == BSONType::NumberInt || vField.type() == BSONType::NumberLong));
+
+    if (vField.ok() && vField.numberInt() == static_cast<int>(UpdateOplogEntryVersion::kDeltaV2)) {
+        // Make sure there's a diff field.
+        BSONElement diff = oField["diff"];
+        uassert(4772601,
+                str::stream() << "Expected 'diff' field to be an object, instead got type: "
+                              << diff.type(),
+                diff.type() == BSONType::Object);
+
+        return UpdateModification(doc_diff::Diff{diff.embeddedObject()}, DiffTag{});
+    } else if (!vField.ok() ||
+               vField.numberInt() == static_cast<int>(UpdateOplogEntryVersion::kUpdateNodeV1)) {
+        // Treat it as a "classic" update which can either be a full replacement or a
+        // modifier-style update. Which variant it is will be determined when the update driver is
+        // constructed.
+        return UpdateModification(oField);
+    }
+
+    // The $v field must be present, but have some unsupported value.
+    uasserted(4772604,
+              str::stream() << "Unrecognized value for '$v' (Version) field: "
+                            << vField.numberInt());
+}
+
+write_ops::UpdateModification::UpdateModification(doc_diff::Diff diff, DiffTag)
+    : _update(std::move(diff)) {}
+
+write_ops::UpdateModification::UpdateModification(BSONElement update) {
+    const auto type = update.type();
+    if (type == BSONType::Object) {
+        _update = ClassicUpdate{update.Obj()};
+        return;
+    }
+
+    uassert(ErrorCodes::FailedToParse,
+            "Update argument must be either an object or an array",
+            type == BSONType::Array);
+
+    _update = PipelineUpdate{uassertStatusOK(AggregationRequest::parsePipelineFromBSON(update))};
+}
+
+write_ops::UpdateModification::UpdateModification(const BSONObj& update) {
+    // Do a sanity check that the $v field is either not provided or has value of 1.
+    const auto versionElem = update["$v"];
+    uassert(4772602,
+            str::stream() << "Expected classic update either contain no '$v' field, or "
+                          << "'$v' field with value 1, but found: " << versionElem,
+            !versionElem.ok() ||
+                versionElem.numberInt() ==
+                    static_cast<int>(UpdateOplogEntryVersion::kUpdateNodeV1));
+
+    _update = ClassicUpdate{update};
+}
+
+write_ops::UpdateModification::UpdateModification(std::vector<BSONObj> pipeline)
+    : _update{PipelineUpdate{std::move(pipeline)}} {}
+
+write_ops::UpdateModification write_ops::UpdateModification::parseFromBSON(BSONElement elem) {
+    return UpdateModification(elem);
+}
+
+write_ops::UpdateModification write_ops::UpdateModification::parseLegacyOpUpdateFromBSON(
+    const BSONObj& obj) {
+    return UpdateModification(obj);
+}
+
+int write_ops::UpdateModification::objsize() const {
+    return stdx::visit(
+        visit_helper::Overloaded{
+            [](const ClassicUpdate& classic) -> int { return classic.bson.objsize(); },
+            [](const PipelineUpdate& pipeline) -> int {
+                int size = 0;
+                std::for_each(pipeline.begin(), pipeline.end(), [&size](const BSONObj& obj) {
+                    size += obj.objsize() + kWriteCommandBSONArrayPerElementOverheadBytes;
+                });
+
+                return size + kWriteCommandBSONArrayPerElementOverheadBytes;
+            },
+            [](const doc_diff::Diff& diff) -> int { return diff.objsize(); }},
+        _update);
+}
+
+
+write_ops::UpdateModification::Type write_ops::UpdateModification::type() const {
+    return stdx::visit(
+        visit_helper::Overloaded{
+            [](const ClassicUpdate& classic) { return Type::kClassic; },
+            [](const PipelineUpdate& pipelineUpdate) { return Type::kPipeline; },
+            [](const doc_diff::Diff& diff) { return Type::kDelta; }},
+        _update);
+}
+
+void write_ops::UpdateModification::serializeToBSON(StringData fieldName,
+                                                    BSONObjBuilder* bob) const {
+
+    stdx::visit(
+        visit_helper::Overloaded{
+            [fieldName, bob](const ClassicUpdate& classic) { *bob << fieldName << classic.bson; },
+            [fieldName, bob](const PipelineUpdate& pipeline) {
+                BSONArrayBuilder arrayBuilder(bob->subarrayStart(fieldName));
+                for (auto&& stage : pipeline) {
+                    arrayBuilder << stage;
+                }
+                arrayBuilder.doneFast();
+            },
+            [](const doc_diff::Diff& diff) {
+                // We never serialize delta style updates.
+                MONGO_UNREACHABLE;
+            }},
+        _update);
 }
 
 }  // namespace mongo

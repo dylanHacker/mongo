@@ -4,65 +4,56 @@
 // @tags: [requires_replication, requires_sharding]
 
 (function() {
-    "use strict";
-    function movePrimaryReplset() {
-        var replSet1 = shardingTest.rs0;
-        var replSet2 = shardingTest.rs1;
+"use strict";
 
-        var repset1DB = replSet1.getPrimary().getDB(testDBName);
-        for (var i = 1; i <= numDocs; i++) {
-            repset1DB[testCollName].insert({x: i});
-        }
-        replSet1.awaitReplication();
+var numDocs = 10000;
+var baseName = "moveprimary-replset";
+var testDBName = baseName;
+var testCollName = 'coll';
 
-        var mongosConn = shardingTest.s;
-        var testDB = mongosConn.getDB(testDBName);
+var shardingTestConfig = {
+    name: baseName,
+    mongos: 1,
+    shards: 2,
+    config: 3,
+    rs: {nodes: 3},
+    other: {manualAddShard: true}
+};
 
-        mongosConn.adminCommand({addshard: replSet1.getURL()});
+var shardingTest = new ShardingTest(shardingTestConfig);
 
-        testDB[testCollName].update({}, {$set: {y: 'hello'}}, false /*upsert*/, true /*multi*/);
-        assert.eq(testDB[testCollName].count({y: 'hello'}),
-                  numDocs,
-                  'updating and counting docs via mongos failed');
+var replSet1 = shardingTest.rs0;
+var replSet2 = shardingTest.rs1;
 
-        mongosConn.adminCommand({addshard: replSet2.getURL()});
+var repset1DB = replSet1.getPrimary().getDB(testDBName);
+for (var i = 1; i <= numDocs; i++) {
+    repset1DB[testCollName].insert({x: i});
+}
+replSet1.awaitReplication();
 
-        assert.commandWorked(
-            mongosConn.getDB('admin').runCommand({moveprimary: testDBName, to: replSet2.getURL()}));
-        mongosConn.getDB('admin').printShardingStatus();
-        assert.eq(testDB.getSiblingDB("config").databases.findOne({"_id": testDBName}).primary,
-                  replSet2.name,
-                  "Failed to change primary shard for unsharded database.");
+var mongosConn = shardingTest.s;
+var testDB = mongosConn.getDB(testDBName);
 
-        testDB[testCollName].update({}, {$set: {z: 'world'}}, false /*upsert*/, true /*multi*/);
-        assert.eq(testDB[testCollName].count({z: 'world'}),
-                  numDocs,
-                  'updating and counting docs via mongos failed');
-    }
+mongosConn.adminCommand({addshard: replSet1.getURL()});
 
-    var numDocs = 10000;
-    var baseName = "moveprimary-replset";
-    var testDBName = baseName;
-    var testCollName = 'coll';
+testDB[testCollName].update({}, {$set: {y: 'hello'}}, false /*upsert*/, true /*multi*/);
+assert.eq(testDB[testCollName].count({y: 'hello'}),
+          numDocs,
+          'updating and counting docs via mongos failed');
 
-    var shardingTestConfig = {
-        name: baseName,
-        mongos: 1,
-        shards: 2,
-        config: 3,
-        rs: {nodes: 3},
-        other: {manualAddShard: true}
-    };
+mongosConn.adminCommand({addshard: replSet2.getURL()});
 
-    var shardingTest = new ShardingTest(shardingTestConfig);
+assert.commandWorked(
+    mongosConn.getDB('admin').runCommand({moveprimary: testDBName, to: replSet2.getURL()}));
+mongosConn.getDB('admin').printShardingStatus();
+assert.eq(testDB.getSiblingDB("config").databases.findOne({"_id": testDBName}).primary,
+          replSet2.name,
+          "Failed to change primary shard for unsharded database.");
 
-    // Set FCV to 3.6
-    assert.commandWorked(shardingTest.s.adminCommand({setFeatureCompatibilityVersion: "3.6"}));
-    movePrimaryReplset();
+testDB[testCollName].update({}, {$set: {z: 'world'}}, false /*upsert*/, true /*multi*/);
+assert.eq(testDB[testCollName].count({z: 'world'}),
+          numDocs,
+          'updating and counting docs via mongos failed');
 
-    // Set FCV to 4.0
-    assert.commandWorked(shardingTest.s.adminCommand({setFeatureCompatibilityVersion: "4.0"}));
-    movePrimaryReplset();
-
-    shardingTest.stop();
+shardingTest.stop();
 })();

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -56,7 +57,7 @@ MatchExpression* parseMatchExpression(const BSONObj& obj) {
                                      ExtensionsCallbackNoop(),
                                      MatchExpressionParser::kAllowAllSpecialFeatures);
     if (!status.isOK()) {
-        mongoutils::str::stream ss;
+        str::stream ss;
         ss << "failed to parse query: " << obj.toString()
            << ". Reason: " << status.getStatus().toString();
         FAIL(ss);
@@ -71,10 +72,10 @@ void assertEquivalent(const char* queryStr,
     if (actual->equivalent(expected)) {
         return;
     }
-    mongoutils::str::stream ss;
+    str::stream ss;
     ss << "Match expressions are not equivalent."
-       << "\nOriginal query: " << queryStr << "\nExpected: " << expected->toString()
-       << "\nActual: " << actual->toString();
+       << "\nOriginal query: " << queryStr << "\nExpected: " << expected->debugString()
+       << "\nActual: " << actual->debugString();
     FAIL(ss);
 }
 
@@ -84,10 +85,10 @@ void assertNotEquivalent(const char* queryStr,
     if (!actual->equivalent(expected)) {
         return;
     }
-    mongoutils::str::stream ss;
+    str::stream ss;
     ss << "Match expressions are equivalent."
-       << "\nOriginal query: " << queryStr << "\nExpected: " << expected->toString()
-       << "\nActual: " << actual->toString();
+       << "\nOriginal query: " << queryStr << "\nExpected: " << expected->debugString()
+       << "\nActual: " << actual->debugString();
     FAIL(ss);
 }
 
@@ -117,11 +118,11 @@ TEST(CanonicalQueryTest, IsValidSortKeyMetaProjection) {
 }
 
 //
-// Tests for CanonicalQuery::sortTree
+// Tests for MatchExpression::sortTree
 //
 
 /**
- * Helper function for testing CanonicalQuery::sortTree().
+ * Helper function for testing MatchExpression::sortTree().
  *
  * Verifies that sorting the expression 'unsortedQueryStr' yields an expression equivalent to
  * the expression 'sortedQueryStr'.
@@ -139,12 +140,12 @@ void testSortTree(const char* unsortedQueryStr, const char* sortedQueryStr) {
     // Sanity check that sorting the sorted expression is a no-op.
     {
         unique_ptr<MatchExpression> sortedQueryExprClone(parseMatchExpression(sortedQueryObj));
-        CanonicalQuery::sortTree(sortedQueryExprClone.get());
+        MatchExpression::sortTree(sortedQueryExprClone.get());
         assertEquivalent(unsortedQueryStr, sortedQueryExpr.get(), sortedQueryExprClone.get());
     }
 
     // Test that sorting the unsorted expression yields the sorted expression.
-    CanonicalQuery::sortTree(unsortedQueryExpr.get());
+    MatchExpression::sortTree(unsortedQueryExpr.get());
     assertEquivalent(unsortedQueryStr, unsortedQueryExpr.get(), sortedQueryExpr.get());
 }
 
@@ -181,7 +182,7 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson(queryStr));
 
     auto statusWithCQ = CanonicalQuery::canonicalize(
@@ -197,7 +198,7 @@ std::unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson(queryStr));
     qr->setSort(fromjson(sortStr));
     qr->setProj(fromjson(projStr));
@@ -289,7 +290,7 @@ TEST(CanonicalQueryTest, CanonicalQueryFromQRWithNoCollation) {
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     auto cq = assertGet(CanonicalQuery::canonicalize(opCtx.get(), std::move(qr)));
     ASSERT_TRUE(cq->getCollator() == nullptr);
 }
@@ -298,7 +299,7 @@ TEST(CanonicalQueryTest, CanonicalQueryFromQRWithCollation) {
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setCollation(BSON("locale"
                           << "reverse"));
     auto cq = assertGet(CanonicalQuery::canonicalize(opCtx.get(), std::move(qr)));
@@ -310,7 +311,7 @@ TEST(CanonicalQueryTest, CanonicalQueryFromBaseQueryWithNoCollation) {
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson("{$or:[{a:1,b:1},{a:1,c:1}]}"));
     auto baseCq = assertGet(CanonicalQuery::canonicalize(opCtx.get(), std::move(qr)));
     MatchExpression* firstClauseExpr = baseCq->root()->getChild(0);
@@ -323,7 +324,7 @@ TEST(CanonicalQueryTest, CanonicalQueryFromBaseQueryWithCollation) {
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson("{$or:[{a:1,b:1},{a:1,c:1}]}"));
     qr->setCollation(BSON("locale"
                           << "reverse"));
@@ -339,7 +340,7 @@ TEST(CanonicalQueryTest, SettingCollatorUpdatesCollatorAndMatchExpression) {
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson("{a: 'foo', b: {$in: ['bar', 'baz']}}"));
     auto cq = assertGet(CanonicalQuery::canonicalize(opCtx.get(), std::move(qr)));
     ASSERT_EQUALS(2U, cq->root()->numChildren());
@@ -387,6 +388,64 @@ TEST(CanonicalQueryTest, NorWithOneChildNormalizedAfterNormalizingChild) {
     ASSERT_EQ(MatchExpression::NOT, root->matchType());
     ASSERT_EQ(1U, root->numChildren());
     ASSERT_EQ(MatchExpression::EQ, root->getChild(0)->matchType());
+}
+
+void assertValidSortOrder(BSONObj sort, BSONObj filter = BSONObj{}) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+
+    auto qr = std::make_unique<QueryRequest>(nss);
+    qr->setFilter(filter);
+    qr->setSort(sort);
+    auto statusWithCQ =
+        CanonicalQuery::canonicalize(opCtx.get(),
+                                     std::move(qr),
+                                     nullptr,
+                                     ExtensionsCallbackNoop(),
+                                     MatchExpressionParser::kAllowAllSpecialFeatures);
+    ASSERT_OK(statusWithCQ.getStatus());
+}
+
+TEST(CanonicalQueryTest, ValidSortOrdersCanonicalizeSuccessfully) {
+    assertValidSortOrder(fromjson("{}"));
+    assertValidSortOrder(fromjson("{a: 1}"));
+    assertValidSortOrder(fromjson("{a: -1}"));
+    assertValidSortOrder(fromjson("{a: {$meta: \"textScore\"}}"),
+                         fromjson("{$text: {$search: 'keyword'}}"));
+    assertValidSortOrder(fromjson("{a: {$meta: \"randVal\"}}"));
+}
+
+void assertInvalidSortOrder(BSONObj sort) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+
+    auto qr = std::make_unique<QueryRequest>(nss);
+    qr->setSort(sort);
+    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx.get(), std::move(qr));
+    ASSERT_NOT_OK(statusWithCQ.getStatus());
+}
+
+TEST(CanonicalQueryTest, InvalidSortOrdersFailToCanonicalize) {
+    assertInvalidSortOrder(fromjson("{a: 100}"));
+    assertInvalidSortOrder(fromjson("{a: 0}"));
+    assertInvalidSortOrder(fromjson("{a: -100}"));
+    assertInvalidSortOrder(fromjson("{a: Infinity}"));
+    assertInvalidSortOrder(fromjson("{a: -Infinity}"));
+    assertInvalidSortOrder(fromjson("{a: true}"));
+    assertInvalidSortOrder(fromjson("{a: false}"));
+    assertInvalidSortOrder(fromjson("{a: null}"));
+    assertInvalidSortOrder(fromjson("{a: {}}"));
+    assertInvalidSortOrder(fromjson("{a: {b: 1}}"));
+    assertInvalidSortOrder(fromjson("{a: []}"));
+    assertInvalidSortOrder(fromjson("{a: [1, 2, 3]}"));
+    assertInvalidSortOrder(fromjson("{a: \"\"}"));
+    assertInvalidSortOrder(fromjson("{a: \"bb\"}"));
+    assertInvalidSortOrder(fromjson("{a: {$meta: 1}}"));
+    assertInvalidSortOrder(fromjson("{a: {$meta: \"image\"}}"));
+    assertInvalidSortOrder(fromjson("{a: {$world: \"textScore\"}}"));
+    assertInvalidSortOrder(fromjson("{a: {$meta: \"textScore\", b: 1}}"));
+    assertInvalidSortOrder(fromjson("{'': 1}"));
+    assertInvalidSortOrder(fromjson("{'': -1}"));
 }
 
 }  // namespace

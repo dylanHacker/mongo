@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -1534,9 +1535,9 @@ TEST(UpdateObjectNodeTest, MergeWithConflictingPositionalFails) {
         "Update created a conflict at 'root.a.$'");
 }
 
-DEATH_TEST(UpdateObjectNodeTest,
-           MergingArrayNodesWithDifferentArrayFiltersFails,
-           "Invariant failure &leftNode._arrayFilters == &rightNode._arrayFilters") {
+DEATH_TEST_REGEX(UpdateObjectNodeTest,
+                 MergingArrayNodesWithDifferentArrayFiltersFails,
+                 "Invariant failure.*leftNode._arrayFilters == &rightNode._arrayFilters") {
     auto setUpdate1 = fromjson("{$set: {'a.$[i]': 5}}");
     auto setUpdate2 = fromjson("{$set: {'a.$[j]': 6}}");
     FieldRef fakeFieldRef("root");
@@ -1768,12 +1769,13 @@ TEST_F(UpdateObjectNodeTest, ApplyCreateField) {
 
     mutablebson::Document doc(fromjson("{a: 5}"));
     addIndexedPath("b");
-    auto result = root.apply(getApplyParams(doc.root()));
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(fromjson("{a: 5, b: 6}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {b: 6}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{b}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyExistingField) {
@@ -1791,12 +1793,13 @@ TEST_F(UpdateObjectNodeTest, ApplyExistingField) {
 
     mutablebson::Document doc(fromjson("{a: 5}"));
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(fromjson("{a: 6}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: 6}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyExistingAndNonexistingFields) {
@@ -1832,12 +1835,13 @@ TEST_F(UpdateObjectNodeTest, ApplyExistingAndNonexistingFields) {
 
     mutablebson::Document doc(fromjson("{a: 0, c: 0}"));
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: 5, c: 7, b: 6, d: 8}"), doc.getObject());
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_EQ(fromjson("{$set: {a: 5, b: 6, c: 7, d: 8}}"), getLogDoc().getObject());
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b, c, d}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyExistingNestedPaths) {
@@ -1873,13 +1877,14 @@ TEST_F(UpdateObjectNodeTest, ApplyExistingNestedPaths) {
 
     mutablebson::Document doc(fromjson("{a: {b: 5, c: 5}, b: {d: 5, e: 5}}"));
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: {b: 6, c: 7}, b: {d: 8, e: 9}}"), doc.getObject());
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.b': 6, 'a.c': 7, 'b.d': 8, 'b.e': 9}}"),
                       getLogDoc().getObject());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.b, a.c, b.d, b.e}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyCreateNestedPaths) {
@@ -1915,13 +1920,14 @@ TEST_F(UpdateObjectNodeTest, ApplyCreateNestedPaths) {
 
     mutablebson::Document doc(fromjson("{z: 0}"));
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
     ASSERT_BSONOBJ_EQ(fromjson("{z: 0, a: {b: 6, c: 7}, b: {d: 8, e: 9}}"), doc.getObject());
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.b': 6, 'a.c': 7, 'b.d': 8, 'b.e': 9}}"),
                       getLogDoc().getObject());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.b, a.c, b.d, b.e}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyCreateDeeplyNestedPaths) {
@@ -1951,13 +1957,14 @@ TEST_F(UpdateObjectNodeTest, ApplyCreateDeeplyNestedPaths) {
 
     mutablebson::Document doc(fromjson("{z: 0}"));
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
     ASSERT_BSONOBJ_EQ(fromjson("{z: 0, a: {b: {c: {d: 6, e: 7}}, f: 8}}"), doc.getObject());
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.b.c.d': 6, 'a.b.c.e': 7, 'a.f': 8}}"),
                       getLogDoc().getObject());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.b.c.d, a.b.c.e, a.f}");
 }
 
 TEST_F(UpdateObjectNodeTest, ChildrenShouldBeAppliedInAlphabeticalOrder) {
@@ -1999,19 +2006,21 @@ TEST_F(UpdateObjectNodeTest, ChildrenShouldBeAppliedInAlphabeticalOrder) {
 
     mutablebson::Document doc(fromjson("{z: 0, a: 0}"));
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
     ASSERT_BSONOBJ_EQ(fromjson("{z: 9, a: 5, b: 8, c: 7, d: 6}"), doc.getObject());
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_EQ(fromjson("{$set: {a: 5, b: 8, c: 7, d: 6, z: 9}}"), getLogDoc().getObject());
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b, c, d, z}");
 }
 
 TEST_F(UpdateObjectNodeTest, CollatorShouldNotAffectUpdateOrder) {
     auto setUpdate = fromjson("{$set: {abc: 5, cba: 6}}");
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(&collator);
+    expCtx->setCollator(std::move(collator));
     std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
@@ -2030,7 +2039,7 @@ TEST_F(UpdateObjectNodeTest, CollatorShouldNotAffectUpdateOrder) {
 
     mutablebson::Document doc(fromjson("{}"));
     addIndexedPath("abc");
-    auto result = root.apply(getApplyParams(doc.root()));
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
     ASSERT_BSONOBJ_EQ(fromjson("{abc: 5, cba: 6}"), doc.getObject());
@@ -2067,12 +2076,13 @@ TEST_F(UpdateObjectNodeTest, ApplyNoop) {
     addIndexedPath("a");
     addIndexedPath("b");
     addIndexedPath("c");
-    auto result = root.apply(getApplyParams(doc.root()));
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_TRUE(result.noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: 5, b: 6, c: 7}"), doc.getObject());
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_EQ(fromjson("{}"), getLogDoc().getObject());
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b, c}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplySomeChildrenNoops) {
@@ -2104,12 +2114,13 @@ TEST_F(UpdateObjectNodeTest, ApplySomeChildrenNoops) {
     addIndexedPath("a");
     addIndexedPath("b");
     addIndexedPath("c");
-    auto result = root.apply(getApplyParams(doc.root()));
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: 5, b: 6, c: 7}"), doc.getObject());
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_EQ(fromjson("{$set: {b: 6}}"), getLogDoc().getObject());
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b, c}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyBlockingElement) {
@@ -2127,7 +2138,8 @@ TEST_F(UpdateObjectNodeTest, ApplyBlockingElement) {
 
     mutablebson::Document doc(fromjson("{a: 0}"));
     addIndexedPath("a");
-    ASSERT_THROWS_CODE_AND_WHAT(root.apply(getApplyParams(doc.root())),
+    ASSERT_EQUALS(getModifiedPaths(), "{}");
+    ASSERT_THROWS_CODE_AND_WHAT(root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams()),
                                 AssertionException,
                                 ErrorCodes::PathNotViable,
                                 "Cannot create field 'b' in element {a: 0}");
@@ -2155,7 +2167,7 @@ TEST_F(UpdateObjectNodeTest, ApplyBlockingElementFromReplication) {
     mutablebson::Document doc(fromjson("{a: 0}"));
     addIndexedPath("a");
     setFromOplogApplication(true);
-    auto result = root.apply(getApplyParams(doc.root()));
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: 0, b: 6}"), doc.getObject());
@@ -2178,8 +2190,9 @@ TEST_F(UpdateObjectNodeTest, ApplyPositionalMissingMatchedField) {
 
     mutablebson::Document doc(fromjson("{}"));
     addIndexedPath("a");
+    ASSERT_EQUALS(getModifiedPaths(), "{}");
     ASSERT_THROWS_CODE_AND_WHAT(
-        root.apply(getApplyParams(doc.root())),
+        root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams()),
         AssertionException,
         ErrorCodes::BadValue,
         "The positional operator did not find the match needed from the query.");
@@ -2207,12 +2220,13 @@ TEST_F(UpdateObjectNodeTest, ApplyMergePositionalChild) {
     mutablebson::Document doc(fromjson("{a: [{b: 0, c: 0}]}"));
     setMatchedField("0");
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: [{b: 5, c: 6}]}"), doc.getObject());
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.0.b': 5, 'a.0.c': 6}}"), getLogDoc().getObject());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0.b, a.0.c}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyOrderMergedPositionalChild) {
@@ -2249,13 +2263,14 @@ TEST_F(UpdateObjectNodeTest, ApplyOrderMergedPositionalChild) {
     mutablebson::Document doc(fromjson("{}"));
     setMatchedField("1");
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: {'0': 7, '1': {b: 6, c: 8}, '2': 5}}"), doc.getObject());
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.0': 7, 'a.1.b': 6, 'a.1.c': 8, 'a.2': 5}}"),
                       getLogDoc().getObject());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0, a.1.b, a.1.c, a.2}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyMergeConflictWithPositionalChild) {
@@ -2280,7 +2295,8 @@ TEST_F(UpdateObjectNodeTest, ApplyMergeConflictWithPositionalChild) {
     mutablebson::Document doc(fromjson("{}"));
     setMatchedField("0");
     addIndexedPath("a");
-    ASSERT_THROWS_CODE_AND_WHAT(root.apply(getApplyParams(doc.root())),
+    ASSERT_EQUALS(getModifiedPaths(), "{}");
+    ASSERT_THROWS_CODE_AND_WHAT(root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams()),
                                 AssertionException,
                                 ErrorCodes::ConflictingUpdateOperators,
                                 "Update created a conflict at 'a.0'");
@@ -2314,12 +2330,13 @@ TEST_F(UpdateObjectNodeTest, ApplyDoNotMergePositionalChild) {
     mutablebson::Document doc(fromjson("{}"));
     setMatchedField("1");
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: {'0': 5, '1': 7, '2': 6}}"), doc.getObject());
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.0': 5, 'a.1': 7, 'a.2': 6}}"), getLogDoc().getObject());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0, a.1, a.2}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyPositionalChildLast) {
@@ -2350,12 +2367,13 @@ TEST_F(UpdateObjectNodeTest, ApplyPositionalChildLast) {
     mutablebson::Document doc(fromjson("{}"));
     setMatchedField("2");
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: {'0': 6, '1': 7, '2': 5}}"), doc.getObject());
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.0': 6, 'a.1': 7, 'a.2': 5}}"), getLogDoc().getObject());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0, a.1, a.2}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyUseStoredMergedPositional) {
@@ -2380,23 +2398,25 @@ TEST_F(UpdateObjectNodeTest, ApplyUseStoredMergedPositional) {
     mutablebson::Document doc(fromjson("{a: [{b: 0, c: 0}]}"));
     setMatchedField("0");
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: [{b: 5, c: 6}]}"), doc.getObject());
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.0.b': 5, 'a.0.c': 6}}"), getLogDoc().getObject());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0.b, a.0.c}");
 
     mutablebson::Document doc2(fromjson("{a: [{b: 0, c: 0}]}"));
     resetApplyParams();
     setMatchedField("0");
     addIndexedPath("a");
-    result = root.apply(getApplyParams(doc2.root()));
+    result = root.apply(getApplyParams(doc2.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: [{b: 5, c: 6}]}"), doc2.getObject());
     ASSERT_TRUE(doc2.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.0.b': 5, 'a.0.c': 6}}"), getLogDoc().getObject());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0.b, a.0.c}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyDoNotUseStoredMergedPositional) {
@@ -2427,25 +2447,27 @@ TEST_F(UpdateObjectNodeTest, ApplyDoNotUseStoredMergedPositional) {
     mutablebson::Document doc(fromjson("{a: [{b: 0, c: 0}, {c: 0, d: 0}]}"));
     setMatchedField("0");
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: [{b: 5, c: 6}, {c: 0, d: 7}]}"), doc.getObject());
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.0.b': 5, 'a.0.c': 6, 'a.1.d': 7}}"),
                       getLogDoc().getObject());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0.b, a.0.c, a.1.d}");
 
     mutablebson::Document doc2(fromjson("{a: [{b: 0, c: 0}, {c: 0, d: 0}]}"));
     resetApplyParams();
     setMatchedField("1");
     addIndexedPath("a");
-    result = root.apply(getApplyParams(doc2.root()));
+    result = root.apply(getApplyParams(doc2.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: [{b: 5, c: 0}, {c: 6, d: 7}]}"), doc2.getObject());
     ASSERT_TRUE(doc2.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.0.b': 5, 'a.1.c': 6, 'a.1.d': 7}}"),
                       getLogDoc().getObject());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0.b, a.1.c, a.1.d}");
 }
 
 /**
@@ -2468,12 +2490,13 @@ TEST_F(UpdateObjectNodeTest, ApplyToArrayByIndexWithLeadingZero) {
 
     mutablebson::Document doc(fromjson("{a: [0, 0, 0, 0, 0]}"));
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: [0, 0, 2, 0, 0]}"), doc.getObject());
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.02': 2}}"), getLogDoc().getObject());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.02}");
 }
 
 /**
@@ -2503,7 +2526,7 @@ TEST_F(UpdateObjectNodeTest, ApplyMultipleArrayUpdates) {
 
     mutablebson::Document doc(fromjson("{a: []}"));
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
     ASSERT_BSONOBJ_EQ(
@@ -2534,12 +2557,13 @@ TEST_F(UpdateObjectNodeTest, ApplyMultipleUpdatesToDocumentInArray) {
 
     mutablebson::Document doc(fromjson("{a: []}"));
     addIndexedPath("a");
-    auto result = root.apply(getApplyParams(doc.root()));
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: [null, null, {b: 1, c: 1}]}"), doc.getObject());
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.2.b': 1, 'a.2.c': 1}}"), getLogDoc().getObject());
+    ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
 TEST_F(UpdateObjectNodeTest, ApplyUpdateToNonViablePathInArray) {
@@ -2557,7 +2581,7 @@ TEST_F(UpdateObjectNodeTest, ApplyUpdateToNonViablePathInArray) {
 
     mutablebson::Document doc(fromjson("{a: [{b: 1}, {b: 2}]}"));
     addIndexedPath("a");
-    ASSERT_THROWS_CODE_AND_WHAT(root.apply(getApplyParams(doc.root())),
+    ASSERT_THROWS_CODE_AND_WHAT(root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams()),
                                 AssertionException,
                                 ErrorCodes::PathNotViable,
                                 "Cannot create field 'b' in element {a: [ { b: 1 }, { b: 2 } ]}");
@@ -2583,12 +2607,13 @@ TEST_F(UpdateObjectNodeTest, SetAndPopModifiersWithCommonPrefixApplySuccessfully
                                               foundIdentifiers));
 
     mutablebson::Document doc(fromjson("{a: {b: 3, c: [1, 2, 3, 4]}}"));
-    auto result = root.apply(getApplyParams(doc.root()));
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: {b: 5, c: [2, 3, 4]}}"), doc.getObject());
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.b': 5, 'a.c': [2, 3, 4]}}"), getLogDoc().getObject());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.b, a.c}");
 }
 
 TEST(ParseRenameTest, RenameToStringWithEmbeddedNullFails) {

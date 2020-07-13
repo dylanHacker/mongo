@@ -1,25 +1,24 @@
-// expression_array.h
-
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,6 +29,7 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
 #include <vector>
 
 #include "mongo/base/status.h"
@@ -77,20 +77,20 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<ElemMatchObjectMatchExpression> e =
-            stdx::make_unique<ElemMatchObjectMatchExpression>(path(),
-                                                              _sub->shallowClone().release());
+            std::make_unique<ElemMatchObjectMatchExpression>(path(),
+                                                             _sub->shallowClone().release());
         if (getTag()) {
             e->setTag(getTag()->clone());
         }
         return std::move(e);
     }
 
-    virtual void debugString(StringBuilder& debug, int level) const;
+    virtual void debugString(StringBuilder& debug, int indentationLevel) const;
 
-    virtual void serialize(BSONObjBuilder* out) const;
+    BSONObj getSerializedRightHandSide() const final;
 
-    std::vector<MatchExpression*>* getChildVector() final {
-        return nullptr;
+    boost::optional<std::vector<MatchExpression*>&> getChildVector() final {
+        return boost::none;
     }
 
     virtual size_t numChildren() const {
@@ -109,6 +109,14 @@ public:
         _sub = std::move(newChild);
     }
 
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
 private:
     ExpressionOptimizerFunc getOptimizer() const final;
 
@@ -118,8 +126,8 @@ private:
 class ElemMatchValueMatchExpression : public ArrayMatchingMatchExpression {
 public:
     /**
-    * This constructor takes ownership of 'sub.'
-    */
+     * This constructor takes ownership of 'sub.'
+     */
     ElemMatchValueMatchExpression(StringData path, MatchExpression* sub);
     explicit ElemMatchValueMatchExpression(StringData path);
     virtual ~ElemMatchValueMatchExpression();
@@ -130,7 +138,7 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<ElemMatchValueMatchExpression> e =
-            stdx::make_unique<ElemMatchValueMatchExpression>(path());
+            std::make_unique<ElemMatchValueMatchExpression>(path());
         for (size_t i = 0; i < _subs.size(); ++i) {
             e->add(_subs[i]->shallowClone().release());
         }
@@ -140,12 +148,12 @@ public:
         return std::move(e);
     }
 
-    virtual void debugString(StringBuilder& debug, int level) const;
+    virtual void debugString(StringBuilder& debug, int indentationLevel) const;
 
-    virtual void serialize(BSONObjBuilder* out) const;
+    BSONObj getSerializedRightHandSide() const final;
 
-    virtual std::vector<MatchExpression*>* getChildVector() {
-        return &_subs;
+    boost::optional<std::vector<MatchExpression*>&> getChildVector() final {
+        return _subs;
     }
 
     virtual size_t numChildren() const {
@@ -154,6 +162,14 @@ public:
 
     virtual MatchExpression* getChild(size_t i) const {
         return _subs[i];
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 
 private:
@@ -170,7 +186,7 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<SizeMatchExpression> e =
-            stdx::make_unique<SizeMatchExpression>(path(), _size);
+            std::make_unique<SizeMatchExpression>(path(), _size);
         if (getTag()) {
             e->setTag(getTag()->clone());
         }
@@ -185,20 +201,28 @@ public:
         return nullptr;
     }
 
-    std::vector<MatchExpression*>* getChildVector() final {
-        return nullptr;
+    boost::optional<std::vector<MatchExpression*>&> getChildVector() final {
+        return boost::none;
     }
 
     virtual bool matchesArray(const BSONObj& anArray, MatchDetails* details) const;
 
-    virtual void debugString(StringBuilder& debug, int level) const;
+    virtual void debugString(StringBuilder& debug, int indentationLevel) const;
 
-    virtual void serialize(BSONObjBuilder* out) const;
+    BSONObj getSerializedRightHandSide() const final;
 
     virtual bool equivalent(const MatchExpression* other) const;
 
     int getData() const {
         return _size;
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 
 private:
@@ -208,4 +232,4 @@ private:
 
     int _size;  // >= 0 real, < 0, nothing will match
 };
-}
+}  // namespace mongo

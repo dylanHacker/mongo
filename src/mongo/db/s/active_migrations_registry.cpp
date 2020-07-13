@@ -1,40 +1,44 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kShardingMigration
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/active_migrations_registry.h"
 
 #include "mongo/db/catalog_raii.h"
-#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/migration_session_id.h"
 #include "mongo/db/s/migration_source_manager.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
@@ -57,9 +61,40 @@ ActiveMigrationsRegistry& ActiveMigrationsRegistry::get(OperationContext* opCtx)
     return get(opCtx->getServiceContext());
 }
 
+void ActiveMigrationsRegistry::lock(OperationContext* opCtx, StringData reason) {
+    stdx::unique_lock<Latch> lock(_mutex);
+
+    // This wait is to hold back additional lock requests while there is already one in
+    // progress.
+    opCtx->waitForConditionOrInterrupt(_lockCond, lock, [this] { return !_migrationsBlocked; });
+
+    // Setting flag before condvar returns to block new migrations from starting. (Favoring writers)
+    LOGV2(4675601, "Going to start blocking migrations", "reason"_attr = reason);
+    _migrationsBlocked = true;
+
+    // Wait for any ongoing migrations to complete.
+    opCtx->waitForConditionOrInterrupt(
+        _lockCond, lock, [this] { return !(_activeMoveChunkState || _activeReceiveChunkState); });
+}
+
+void ActiveMigrationsRegistry::unlock(StringData reason) {
+    stdx::lock_guard<Latch> lock(_mutex);
+
+    LOGV2(4675602, "Going to stop blocking migrations", "reason"_attr = reason);
+    _migrationsBlocked = false;
+
+    _lockCond.notify_all();
+}
+
 StatusWith<ScopedDonateChunk> ActiveMigrationsRegistry::registerDonateChunk(
-    const MoveChunkRequest& args) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    OperationContext* opCtx, const MoveChunkRequest& args) {
+    stdx::unique_lock<Latch> lk(_mutex);
+
+    if (_migrationsBlocked) {
+        LOGV2(4675603, "Register donate chunk waiting for migrations to be unblocked");
+        opCtx->waitForConditionOrInterrupt(_lockCond, lk, [this] { return !_migrationsBlocked; });
+    }
+
     if (_activeReceiveChunkState) {
         return _activeReceiveChunkState->constructErrorStatus();
     }
@@ -78,8 +113,17 @@ StatusWith<ScopedDonateChunk> ActiveMigrationsRegistry::registerDonateChunk(
 }
 
 StatusWith<ScopedReceiveChunk> ActiveMigrationsRegistry::registerReceiveChunk(
-    const NamespaceString& nss, const ChunkRange& chunkRange, const ShardId& fromShardId) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const ChunkRange& chunkRange,
+    const ShardId& fromShardId) {
+    stdx::unique_lock<Latch> lk(_mutex);
+
+    if (_migrationsBlocked) {
+        LOGV2(4675604, "Register receive chunk waiting for migrations to be unblocked");
+        opCtx->waitForConditionOrInterrupt(_lockCond, lk, [this] { return !_migrationsBlocked; });
+    }
+
     if (_activeReceiveChunkState) {
         return _activeReceiveChunkState->constructErrorStatus();
     }
@@ -94,7 +138,7 @@ StatusWith<ScopedReceiveChunk> ActiveMigrationsRegistry::registerReceiveChunk(
 }
 
 boost::optional<NamespaceString> ActiveMigrationsRegistry::getActiveDonateChunkNss() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     if (_activeMoveChunkState) {
         return _activeMoveChunkState->args.getNss();
     }
@@ -105,7 +149,7 @@ boost::optional<NamespaceString> ActiveMigrationsRegistry::getActiveDonateChunkN
 BSONObj ActiveMigrationsRegistry::getActiveMigrationStatusReport(OperationContext* opCtx) {
     boost::optional<NamespaceString> nss;
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
 
         if (_activeMoveChunkState) {
             nss = _activeMoveChunkState->args.getNss();
@@ -119,10 +163,11 @@ BSONObj ActiveMigrationsRegistry::getActiveMigrationStatusReport(OperationContex
     if (nss) {
         // Lock the collection so nothing changes while we're getting the migration report.
         AutoGetCollection autoColl(opCtx, nss.get(), MODE_IS);
+        auto csr = CollectionShardingRuntime::get(opCtx, nss.get());
+        auto csrLock = CollectionShardingRuntime::CSRLock::lockShared(opCtx, csr);
 
-        auto css = CollectionShardingState::get(opCtx, nss.get());
-        if (css->getMigrationSourceManager()) {
-            return css->getMigrationSourceManager()->getMigrationStatusReport();
+        if (auto msm = MigrationSourceManager::get(csr, csrLock)) {
+            return msm->getMigrationStatusReport();
         }
     }
 
@@ -130,15 +175,17 @@ BSONObj ActiveMigrationsRegistry::getActiveMigrationStatusReport(OperationContex
 }
 
 void ActiveMigrationsRegistry::_clearDonateChunk() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     invariant(_activeMoveChunkState);
     _activeMoveChunkState.reset();
+    _lockCond.notify_all();
 }
 
 void ActiveMigrationsRegistry::_clearReceiveChunk() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     invariant(_activeReceiveChunkState);
     _activeReceiveChunkState.reset();
+    _lockCond.notify_all();
 }
 
 Status ActiveMigrationsRegistry::ActiveMoveChunkState::constructErrorStatus() const {
@@ -146,9 +193,7 @@ Status ActiveMigrationsRegistry::ActiveMoveChunkState::constructErrorStatus() co
             str::stream() << "Unable to start new migration because this shard is currently "
                              "donating chunk "
                           << ChunkRange(args.getMinKey(), args.getMaxKey()).toString()
-                          << " for namespace "
-                          << args.getNss().ns()
-                          << " to "
+                          << " for namespace " << args.getNss().ns() << " to "
                           << args.getToShardId()};
 }
 
@@ -156,10 +201,7 @@ Status ActiveMigrationsRegistry::ActiveReceiveChunkState::constructErrorStatus()
     return {ErrorCodes::ConflictingOperationInProgress,
             str::stream() << "Unable to start new migration because this shard is currently "
                              "receiving chunk "
-                          << range.toString()
-                          << " for namespace "
-                          << nss.ns()
-                          << " from "
+                          << range.toString() << " for namespace " << nss.ns() << " from "
                           << fromShardId};
 }
 

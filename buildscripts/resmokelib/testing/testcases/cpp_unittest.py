@@ -1,10 +1,8 @@
 """The unittest.TestCase for C++ unit tests."""
 
-from __future__ import absolute_import
-
-from . import interface
-from ... import core
-from ... import utils
+from buildscripts.resmokelib import core
+from buildscripts.resmokelib import utils
+from buildscripts.resmokelib.testing.testcases import interface
 
 
 class CPPUnitTestCase(interface.ProcessTestCase):
@@ -21,4 +19,5 @@ class CPPUnitTestCase(interface.ProcessTestCase):
         self.program_options = utils.default_if_none(program_options, {}).copy()
 
     def _make_process(self):
-        return core.process.Process(self.logger, [self.program_executable], **self.program_options)
+        return core.programs.make_process(self.logger, [self.program_executable],
+                                          **self.program_options)

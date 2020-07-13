@@ -1,29 +1,30 @@
 /**
- *    Copyright 2017 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -80,8 +81,11 @@ public:
     }
 
     /**
-     * Fails fatally if any error codes that should have parsers registered don't. Call this during
-     * startup of any shipping executable to prevent failures at runtime.
+     * Fails fatally if any error codes that should have parsers registered don't. An invariant in
+     * this function indicates that there isn't a MONGO_INIT_REGISTER_ERROR_EXTRA_INFO declaration
+     * for some error code, which requires an extra info.
+     *
+     * Call this during startup of any shipping executable to prevent failures at runtime.
      */
     static void invariantHaveAllParsers();
 
@@ -133,4 +137,70 @@ public:
 private:
     static bool isParserEnabledForTest;
 };
+
+/**
+ * This is an example ErrorExtraInfo subclass. It is used for testing the ErrorExtraInfoHandling.
+ *
+ * It is meant to be a duplicate of ErrorExtraInfoExample, except that it is optional. This will
+ * make sure we don't crash the server when an ErrorExtraInfo class is meant to be optional.
+ */
+class OptionalErrorExtraInfoExample final : public ErrorExtraInfo {
+public:
+    static constexpr auto code = ErrorCodes::ForTestingOptionalErrorExtraInfo;
+
+    void serialize(BSONObjBuilder*) const override;
+    static std::shared_ptr<const ErrorExtraInfo> parse(const BSONObj&);
+
+    // Everything else in this class is just for testing and shouldn't by copied by users.
+
+    struct EnableParserForTest {
+        EnableParserForTest() {
+            isParserEnabledForTest = true;
+        }
+        ~EnableParserForTest() {
+            isParserEnabledForTest = false;
+        }
+    };
+
+    OptionalErrorExtraInfoExample(int data) : data(data) {}
+    int data;  // This uses the fieldname "data".
+private:
+    static bool isParserEnabledForTest;
+};
+
+
+namespace nested::twice {
+
+/**
+ * This is an example ErrorExtraInfo subclass. It is used for testing the ErrorExtraInfoHandling.
+ *
+ * It is meant to be a duplicate of ErrorExtraInfoExample, except that it is within a namespace
+ * (and so exercises a different codepath in the parser).
+ */
+class NestedErrorExtraInfoExample final : public ErrorExtraInfo {
+public:
+    static constexpr auto code = ErrorCodes::ForTestingErrorExtraInfoWithExtraInfoInNamespace;
+
+    void serialize(BSONObjBuilder*) const override;
+    static std::shared_ptr<const ErrorExtraInfo> parse(const BSONObj&);
+
+    // Everything else in this class is just for testing and shouldn't by copied by users.
+
+    struct EnableParserForTest {
+        EnableParserForTest() {
+            isParserEnabledForTest = true;
+        }
+        ~EnableParserForTest() {
+            isParserEnabledForTest = false;
+        }
+    };
+
+    NestedErrorExtraInfoExample(int data) : data(data) {}
+    int data;  // This uses the fieldname "data".
+private:
+    static bool isParserEnabledForTest;
+};
+
+}  // namespace nested::twice
+
 }  // namespace mongo

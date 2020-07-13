@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -38,6 +39,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/s/catalog/config_server_version.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
@@ -48,14 +50,11 @@
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/config_server_test_fixture.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
 namespace {
 
-using std::string;
-using std::vector;
 using unittest::assertGet;
 
 /**
@@ -77,7 +76,24 @@ void assertBSONObjsSame(const std::vector<BSONObj>& expectedBSON,
     }
 }
 
-using ConfigInitializationTest = ConfigServerTestFixture;
+class ConfigInitializationTest : public ConfigServerTestFixture {
+protected:
+    /*
+     * Initializes the sharding state and locks both the config db and rstl.
+     */
+    void setUp() override {
+        // Prevent DistLockManager from writing to lockpings collection before we create the
+        // indexes.
+        _autoDb = setUpAndLockConfigDb();
+    }
+
+    void tearDown() override {
+        _autoDb = {};
+        ConfigServerTestFixture::tearDown();
+    }
+
+    std::unique_ptr<AutoGetDb> _autoDb;
+};
 
 TEST_F(ConfigInitializationTest, UpgradeNotNeeded) {
     VersionType version;
@@ -270,66 +286,38 @@ TEST_F(ConfigInitializationTest, BuildsNecessaryIndexes) {
 
     auto expectedChunksIndexes = std::vector<BSONObj>{
         BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
-                 << "_id_"
-                 << "ns"
-                 << "config.chunks"),
+                 << "_id_"),
         BSON("v" << 2 << "unique" << true << "key" << BSON("ns" << 1 << "min" << 1) << "name"
-                 << "ns_1_min_1"
-                 << "ns"
-                 << "config.chunks"),
+                 << "ns_1_min_1"),
         BSON("v" << 2 << "unique" << true << "key" << BSON("ns" << 1 << "shard" << 1 << "min" << 1)
                  << "name"
-                 << "ns_1_shard_1_min_1"
-                 << "ns"
-                 << "config.chunks"),
+                 << "ns_1_shard_1_min_1"),
         BSON("v" << 2 << "unique" << true << "key" << BSON("ns" << 1 << "lastmod" << 1) << "name"
-                 << "ns_1_lastmod_1"
-                 << "ns"
-                 << "config.chunks")};
+                 << "ns_1_lastmod_1")};
     auto expectedLockpingsIndexes =
         std::vector<BSONObj>{BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
-                                      << "_id_"
-                                      << "ns"
-                                      << "config.lockpings"),
+                                      << "_id_"),
                              BSON("v" << 2 << "key" << BSON("ping" << 1) << "name"
-                                      << "ping_1"
-                                      << "ns"
-                                      << "config.lockpings")};
+                                      << "ping_1")};
     auto expectedLocksIndexes = std::vector<BSONObj>{
         BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
-                 << "_id_"
-                 << "ns"
-                 << "config.locks"),
+                 << "_id_"),
         BSON("v" << 2 << "key" << BSON("ts" << 1) << "name"
-                 << "ts_1"
-                 << "ns"
-                 << "config.locks"),
+                 << "ts_1"),
         BSON("v" << 2 << "key" << BSON("state" << 1 << "process" << 1) << "name"
-                 << "state_1_process_1"
-                 << "ns"
-                 << "config.locks")};
+                 << "state_1_process_1")};
     auto expectedShardsIndexes = std::vector<BSONObj>{
         BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
-                 << "_id_"
-                 << "ns"
-                 << "config.shards"),
+                 << "_id_"),
         BSON("v" << 2 << "unique" << true << "key" << BSON("host" << 1) << "name"
-                 << "host_1"
-                 << "ns"
-                 << "config.shards")};
+                 << "host_1")};
     auto expectedTagsIndexes = std::vector<BSONObj>{
         BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
-                 << "_id_"
-                 << "ns"
-                 << "config.tags"),
+                 << "_id_"),
         BSON("v" << 2 << "unique" << true << "key" << BSON("ns" << 1 << "min" << 1) << "name"
-                 << "ns_1_min_1"
-                 << "ns"
-                 << "config.tags"),
+                 << "ns_1_min_1"),
         BSON("v" << 2 << "key" << BSON("ns" << 1 << "tag" << 1) << "name"
-                 << "ns_1_tag_1"
-                 << "ns"
-                 << "config.tags")};
+                 << "ns_1_tag_1")};
 
     auto foundChunksIndexes = assertGet(getIndexes(operationContext(), ChunkType::ConfigNS));
     assertBSONObjsSame(expectedChunksIndexes, foundChunksIndexes);
@@ -357,13 +345,9 @@ TEST_F(ConfigInitializationTest, CompatibleIndexAlreadyExists) {
 
     auto expectedShardsIndexes = std::vector<BSONObj>{
         BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
-                 << "_id_"
-                 << "ns"
-                 << "config.shards"),
+                 << "_id_"),
         BSON("v" << 2 << "unique" << true << "key" << BSON("host" << 1) << "name"
-                 << "host_1"
-                 << "ns"
-                 << "config.shards")};
+                 << "host_1")};
 
 
     auto foundShardsIndexes = assertGet(getIndexes(operationContext(), ShardType::ConfigNS));

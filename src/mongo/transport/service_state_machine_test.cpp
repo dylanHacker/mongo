@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,28 +27,28 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
+
+#include <memory>
 
 #include "mongo/base/checked_cast.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/dbmessage.h"
-#include "mongo/db/service_context_noop.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/op_msg.h"
 #include "mongo/transport/mock_session.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/transport/service_executor.h"
-#include "mongo/transport/service_executor_task_names.h"
 #include "mongo/transport/service_state_machine.h"
 #include "mongo/transport/transport_layer_mock.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/clock_source_mock.h"
-#include "mongo/util/log.h"
-#include "mongo/util/net/op_msg.h"
 #include "mongo/util/tick_source_mock.h"
 
 namespace mongo {
@@ -58,6 +59,12 @@ std::string stateToString(ServiceStateMachine::State state) {
     return ret;
 }
 
+Message buildOpMsg(BSONObj input) {
+    OpMsgBuilder builder;
+    builder.setBody(input);
+    return builder.finish();
+}
+
 class MockSEP : public ServiceEntryPoint {
 public:
     virtual ~MockSEP() = default;
@@ -65,32 +72,45 @@ public:
     void startSession(transport::SessionHandle session) override {}
 
     DbResponse handleRequest(OperationContext* opCtx, const Message& request) override {
-        log() << "In handleRequest";
+        LOGV2(22994, "In handleRequest");
         _ranHandler = true;
         ASSERT_TRUE(haveClient());
 
-        auto req = OpMsgRequest::parse(request);
-        ASSERT_BSONOBJ_EQ(BSON("ping" << 1), req.body);
-
-        // Build out a dummy reply
-        OpMsgBuilder builder;
-        builder.setBody(BSON("ok" << 1));
+        // Build out a dummy OK response, if no custom response message was set. Otherwise, use the
+        // custom response message.
+        Message res;
+        if (_responseMessage.empty()) {
+            res = buildOpMsg(BSON("ok" << 1));
+        } else {
+            res = _responseMessage;
+        }
 
         if (_uassertInHandler)
             uassert(40469, "Synthetic uassert failure", false);
 
-        return DbResponse{builder.finish()};
+        DbResponse dbResponse;
+        if (OpMsg::isFlagSet(request, OpMsg::kExhaustSupported)) {
+            auto reply = OpMsg::parse(res);
+            auto cursorObj = reply.body.getObjectField("cursor");
+            dbResponse.shouldRunAgainForExhaust = reply.body["ok"].trueValue() &&
+                !cursorObj.isEmpty() && (cursorObj.getField("id").numberLong() != 0);
+        }
+        dbResponse.response = res;
+
+        return dbResponse;
     }
 
     void endAllSessions(transport::Session::TagMask tags) override {}
+
+    Status start() override {
+        return Status::OK();
+    }
 
     bool shutdown(Milliseconds timeout) override {
         return true;
     }
 
-    Stats sessionStats() const override {
-        return {};
-    }
+    void appendStats(BSONObjBuilder*) const override {}
 
     size_t numOpenSessions() const override {
         return 0ULL;
@@ -98,6 +118,10 @@ public:
 
     void setUassertInHandler() {
         _uassertInHandler = true;
+    }
+
+    void setResponseMessage(Message m) {
+        _responseMessage = std::move(m);
     }
 
     bool ranHandler() {
@@ -109,6 +133,9 @@ public:
 private:
     bool _uassertInHandler = false;
     bool _ranHandler = false;
+
+    // A custom response message to return from 'handleRequest'.
+    Message _responseMessage;
 };
 
 using namespace transport;
@@ -124,7 +151,7 @@ public:
             tl->_lastTicketSource = true;
 
             tl->_ranSource = true;
-            log() << "In sourceMessage";
+            LOGV2(22995, "In sourceMessage");
 
             if (tl->_waitHook)
                 tl->_waitHook();
@@ -135,9 +162,10 @@ public:
 
             auto out = MockSession::sourceMessage();
             if (out.isOK()) {
-                OpMsgBuilder builder;
-                builder.setBody(BSON("ping" << 1));
-                out.getValue() = builder.finish();
+                // Source a dummy 'ping' request, if no custom source message was set, if specified.
+                // Otherwise use the custom source message.
+                return tl->_sourceMessage.empty() ? buildOpMsg(BSON("ping" << 1))
+                                                  : tl->_sourceMessage;
             }
             return out;
         }
@@ -147,7 +175,7 @@ public:
             ASSERT_EQ(tl->_ssm->state(), ServiceStateMachine::State::SinkWait);
             tl->_lastTicketSource = false;
 
-            log() << "In sinkMessage";
+            LOGV2(22996, "In sinkMessage");
             tl->_ranSink = true;
 
             if (tl->_waitHook)
@@ -191,8 +219,12 @@ public:
         return _ranSource;
     }
 
-    void setWaitHook(stdx::function<void()> hook) {
+    void setWaitHook(std::function<void()> hook) {
         _waitHook = std::move(hook);
+    }
+
+    void setSourceMessage(Message m) {
+        _sourceMessage = std::move(m);
     }
 
 private:
@@ -202,20 +234,17 @@ private:
     FailureMode _nextShouldFail = Nothing;
     Message _lastSunk;
     ServiceStateMachine* _ssm;
-    stdx::function<void()> _waitHook;
-};
+    std::function<void()> _waitHook;
 
-Message buildRequest(BSONObj input) {
-    OpMsgBuilder builder;
-    builder.setBody(input);
-    return builder.finish();
-}
+    // A custom message for this TransportLayer to source.
+    Message _sourceMessage;
+};
 
 class MockServiceExecutor : public ServiceExecutor {
 public:
     explicit MockServiceExecutor(ServiceContext* ctx) {}
 
-    using ScheduleHook = stdx::function<bool(Task)>;
+    using ScheduleHook = std::function<bool(Task)>;
 
     Status start() override {
         return Status::OK();
@@ -223,12 +252,13 @@ public:
     Status shutdown(Milliseconds timeout) override {
         return Status::OK();
     }
-    Status schedule(Task task, ScheduleFlags flags, ServiceExecutorTaskName taskName) override {
+    Status schedule(Task task, ScheduleFlags flags) override {
         if (!_scheduleHook) {
             return Status::OK();
         } else {
-            return _scheduleHook(std::move(task)) ? Status::OK() : Status{ErrorCodes::InternalError,
-                                                                          "Hook returned error!"};
+            return _scheduleHook(std::move(task))
+                ? Status::OK()
+                : Status{ErrorCodes::InternalError, "Hook returned error!"};
         }
     }
 
@@ -249,19 +279,19 @@ private:
 class SimpleEvent {
 public:
     void signal() {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        stdx::unique_lock<Latch> lk(_mutex);
         _signaled = true;
         _cond.notify_one();
     }
 
     void wait() {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        stdx::unique_lock<Latch> lk(_mutex);
         _cond.wait(lk, [this] { return _signaled; });
         _signaled = false;
     }
 
 private:
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("SimpleEvent::_mutex");
     stdx::condition_variable _cond;
     bool _signaled = false;
 };
@@ -272,22 +302,22 @@ class ServiceStateMachineFixture : public unittest::Test {
 protected:
     void setUp() override {
 
-        auto scOwned = stdx::make_unique<ServiceContextNoop>();
+        auto scOwned = ServiceContext::make();
         auto sc = scOwned.get();
         setGlobalServiceContext(std::move(scOwned));
 
-        sc->setTickSource(stdx::make_unique<TickSourceMock>());
-        sc->setFastClockSource(stdx::make_unique<ClockSourceMock>());
+        sc->setTickSource(std::make_unique<TickSourceMock<>>());
+        sc->setFastClockSource(std::make_unique<ClockSourceMock>());
 
-        auto sep = stdx::make_unique<MockSEP>();
+        auto sep = std::make_unique<MockSEP>();
         _sep = sep.get();
         sc->setServiceEntryPoint(std::move(sep));
 
-        auto se = stdx::make_unique<MockServiceExecutor>(sc);
+        auto se = std::make_unique<MockServiceExecutor>(sc);
         _sexec = se.get();
         sc->setServiceExecutor(std::move(se));
 
-        auto tl = stdx::make_unique<MockTL>();
+        auto tl = std::make_unique<MockTL>();
         _tl = tl.get();
         sc->setTransportLayer(std::move(tl));
         _tl->start().transitional_ignore();
@@ -304,6 +334,25 @@ protected:
     void runPingTest(State first, State second);
     void checkPingOk();
 
+    /**
+     * Source a message from the TransportLayer, process it via the ServiceEntryPoint, and sink the
+     * response back to the TransportLayer. Only call this method when SSM state is either 'Source'
+     * or 'Created'.
+     *
+     * @param afterSource the expected state of the SSM after a message has been sourced.
+     * @param afterSink the expected state of the SSM after the response has been sunk.
+     */
+    void sourceAndSink(State afterSource, State afterSink);
+
+    /**
+     * Runs a simple source-sink test. Sources a custom message, given by 'req', and receives and
+     * sinks a custom response from the database, given by 'res'. Uses the given MockTL and MockSEP,
+     * and expects the SSM to be in states 'afterSource' and 'afterSink', after sourcing and sinking
+     * the messages.
+     */
+    void runSourceAndSinkTest(
+        MockTL* tl, MockSEP* sep, Message req, Message res, State afterSource, State afterSink);
+
     MockTL* _tl;
     MockSEP* _sep;
     MockServiceExecutor* _sexec;
@@ -315,7 +364,7 @@ protected:
 void ServiceStateMachineFixture::runPingTest(State first, State second) {
     ASSERT_FALSE(haveClient());
     ASSERT_EQ(_ssm->state(), State::Created);
-    log() << "run next";
+    LOGV2(22997, "run next");
     _ssm->runNext();
 
     ASSERT_EQ(_ssm->state(), first);
@@ -328,6 +377,45 @@ void ServiceStateMachineFixture::runPingTest(State first, State second) {
     ASSERT_EQ(_ssm->state(), second);
 }
 
+void ServiceStateMachineFixture::sourceAndSink(State afterSource, State afterSink) {
+    invariant(_ssm->state() == State::Source || _ssm->state() == State::Created);
+
+    // Source a new message from the network.
+    LOGV2(22998, "(sourceAndSink) runNext to source a message");
+    _ssm->runNext();
+    ASSERT_TRUE(_tl->ranSource());
+    ASSERT_EQ(_ssm->state(), afterSource);
+    ASSERT_FALSE(_tl->ranSink());
+
+    // Let the message be processed by sending it to the database, receiving the response, and then
+    // sinking it.
+    LOGV2(22999, "(sourceAndSink) runNext to process and sink the response message");
+    _ssm->runNext();
+    ASSERT_FALSE(haveClient());
+    ASSERT_TRUE(_tl->ranSink());
+    ASSERT_EQ(_ssm->state(), afterSink);
+}
+
+void ServiceStateMachineFixture::runSourceAndSinkTest(MockTL* tl,
+                                                      MockSEP* sep,
+                                                      Message request,
+                                                      Message response,
+                                                      State afterSource,
+                                                      State afterSink) {
+
+    // Make the TransportLayer source the mock 'getMore' request, and the ServiceEntryPoint respond
+    // with a mock 'getMore' response.
+    tl->setSourceMessage(request);
+    sep->setResponseMessage(response);
+
+    ASSERT_FALSE(haveClient());
+    ASSERT_EQ(_ssm->state(), State::Created);
+
+    // Let the 'getMore' request be sourced from the network, processed in the database, and sunk to
+    // the TransportLayer.
+    sourceAndSink(afterSource, afterSink);
+}
+
 void ServiceStateMachineFixture::checkPingOk() {
     auto msg = _tl->getLastSunk();
     auto reply = OpMsg::parse(msg);
@@ -337,6 +425,66 @@ void ServiceStateMachineFixture::checkPingOk() {
 TEST_F(ServiceStateMachineFixture, TestOkaySimpleCommand) {
     runPingTest(State::Process, State::Source);
     checkPingOk();
+}
+
+Message getMoreRequestWithExhaust(const std::string& nss,
+                                  long long cursorId,
+                                  const int32_t requestId) {
+    Message getMoreMsg = buildOpMsg(BSON("getMore" << cursorId << "collection" << nss));
+    getMoreMsg.header().setId(requestId);
+    OpMsg::setFlag(&getMoreMsg, OpMsg::kExhaustSupported);
+    return getMoreMsg;
+}
+
+TEST_F(ServiceStateMachineFixture, TestGetMoreWithExhaust) {
+
+    // Construct a 'getMore' OP_MSG request with the exhaust flag set.
+    const int32_t initRequestId = 1;
+    const long long cursorId = 42;
+    const std::string nss = "test.coll";
+    Message getMoreWithExhaust = getMoreRequestWithExhaust(nss, cursorId, initRequestId);
+
+    // Construct a 'getMore' response, with a non-zero cursor id and an empty batch.
+    BSONObj getMoreResBody =
+        BSON("ok" << 1 << "cursor"
+                  << BSON("id" << cursorId << "ns" << nss << "nextBatch" << BSONArray()));
+    Message getMoreRes = buildOpMsg(getMoreResBody);
+
+    // Let the 'getMore' request be sourced from the network, processed in the database, and sunk to
+    // the TransportLayer. Because the request message should have an exhaust flag, we should end up
+    // back in the 'Process' state, rather than in 'Source' state.
+    runSourceAndSinkTest(_tl, _sep, getMoreWithExhaust, getMoreRes, State::Process, State::Process);
+
+    // Check the last sunk message.
+    auto msg = _tl->getLastSunk();
+    auto firstResponseId = msg.header().getId();
+    ASSERT(!msg.empty());
+    ASSERT_EQ(initRequestId, msg.header().getResponseToMsgId());
+    auto reply = OpMsg::parse(msg);
+    ASSERT(OpMsg::isFlagSet(msg, OpMsg::kMoreToCome));
+    ASSERT_BSONOBJ_EQ(getMoreResBody, reply.body);
+
+    // Construct a terminal 'getMore' response, indicated by a cursor id equal to zero.
+    BSONObj getMoreTerminalResBody =
+        BSON("ok" << 1 << "cursor" << BSON("id" << 0 << "ns" << nss << "nextBatch" << BSONArray()));
+    Message getMoreTerminalRes = buildOpMsg(getMoreTerminalResBody);
+
+    // Process another 'getMore' message. This time the ServiceEntryPoint should respond with a
+    // terminal getMore, indicating that the exhaust stream should be ended.
+    _sep->setResponseMessage(getMoreTerminalRes);
+
+    LOGV2(23000, "runNext to terminate the exhaust stream");
+    _ssm->runNext();
+    ASSERT_FALSE(haveClient());
+    ASSERT_EQ(_ssm->state(), State::Source);
+
+    // Check the final sunk message.
+    msg = _tl->getLastSunk();
+    ASSERT(!msg.empty());
+    reply = OpMsg::parse(msg);
+    ASSERT(!OpMsg::isFlagSet(msg, OpMsg::kMoreToCome));
+    ASSERT_BSONOBJ_EQ(getMoreTerminalResBody, reply.body);
+    ASSERT_EQ(firstResponseId, msg.header().getResponseToMsgId());
 }
 
 TEST_F(ServiceStateMachineFixture, TestThrowHandling) {
@@ -411,7 +559,7 @@ TEST_F(ServiceStateMachineFixture, TerminateWorksForAllStates) {
     SimpleEvent hookRan, okayToContinue;
 
     auto cleanupHook = [&hookRan] {
-        log() << "Cleaning up session";
+        LOGV2(23001, "Cleaning up session");
         hookRan.signal();
     };
 
@@ -420,8 +568,10 @@ TEST_F(ServiceStateMachineFixture, TerminateWorksForAllStates) {
     State waitFor = State::Created;
     SimpleEvent atDesiredState;
     auto waitForHook = [this, &waitFor, &atDesiredState, &okayToContinue]() {
-        log() << "Checking for wakeup at " << stateToString(_ssm->state()) << ". Expecting "
-              << stateToString(waitFor);
+        LOGV2(23002,
+              "Checking for wakeup at {stateToString_ssm_state}. Expecting {stateToString_waitFor}",
+              "stateToString_ssm_state"_attr = stateToString(_ssm->state()),
+              "stateToString_waitFor"_attr = stateToString(waitFor));
         if (_ssm->state() == waitFor) {
             atDesiredState.signal();
             okayToContinue.wait();
@@ -440,7 +590,9 @@ TEST_F(ServiceStateMachineFixture, TerminateWorksForAllStates) {
     // Run this same test for each state.
     auto states = {State::Source, State::SourceWait, State::Process, State::SinkWait};
     for (const auto testState : states) {
-        log() << "Testing termination during " << stateToString(testState);
+        LOGV2(23003,
+              "Testing termination during {stateToString_testState}",
+              "stateToString_testState"_attr = stateToString(testState));
 
         // Reset the _ssm to a fresh SSM and reset our tracking variables.
         _ssm = ServiceStateMachine::create(
@@ -458,7 +610,9 @@ TEST_F(ServiceStateMachineFixture, TerminateWorksForAllStates) {
 
         // Wait for the SSM to advance to the expected state
         atDesiredState.wait();
-        log() << "Terminating session at " << stateToString(_ssm->state());
+        LOGV2(23004,
+              "Terminating session at {stateToString_ssm_state}",
+              "stateToString_ssm_state"_attr = stateToString(_ssm->state()));
 
         // Terminate the SSM
         _ssm->terminate();
@@ -485,7 +639,7 @@ TEST_F(ServiceStateMachineFixture, TerminateWorksForAllStatesWithScheduleFailure
     bool scheduleFailed = false;
 
     auto cleanupHook = [&hookRan] {
-        log() << "Cleaning up session";
+        LOGV2(23005, "Cleaning up session");
         hookRan.signal();
     };
 
@@ -494,8 +648,10 @@ TEST_F(ServiceStateMachineFixture, TerminateWorksForAllStatesWithScheduleFailure
     State waitFor = State::Created;
     SimpleEvent atDesiredState;
     auto waitForHook = [this, &waitFor, &scheduleFailed, &okayToContinue, &atDesiredState]() {
-        log() << "Checking for wakeup at " << stateToString(_ssm->state()) << ". Expecting "
-              << stateToString(waitFor);
+        LOGV2(23006,
+              "Checking for wakeup at {stateToString_ssm_state}. Expecting {stateToString_waitFor}",
+              "stateToString_ssm_state"_attr = stateToString(_ssm->state()),
+              "stateToString_waitFor"_attr = stateToString(waitFor));
         if (_ssm->state() == waitFor) {
             atDesiredState.signal();
             okayToContinue.wait();
@@ -511,7 +667,9 @@ TEST_F(ServiceStateMachineFixture, TerminateWorksForAllStatesWithScheduleFailure
 
     auto states = {State::Source, State::SourceWait, State::Process, State::SinkWait};
     for (const auto testState : states) {
-        log() << "Testing termination during " << stateToString(testState);
+        LOGV2(23007,
+              "Testing termination during {stateToString_testState}",
+              "stateToString_testState"_attr = stateToString(testState));
         _ssm = ServiceStateMachine::create(
             getGlobalServiceContext(), _tl->createSession(), transport::Mode::kSynchronous);
         _tl->setSSM(_ssm.get());
@@ -520,7 +678,7 @@ TEST_F(ServiceStateMachineFixture, TerminateWorksForAllStatesWithScheduleFailure
 
         waitFor = testState;
         // This is a dummy thread that just advances the SSM while we track its state/kill it
-        stdx::thread runner([ ssm = _ssm, &scheduleFailed ] {
+        stdx::thread runner([ssm = _ssm, &scheduleFailed] {
             while (ssm->state() != State::Ended && !scheduleFailed) {
                 ssm->runNext();
             }
@@ -529,7 +687,9 @@ TEST_F(ServiceStateMachineFixture, TerminateWorksForAllStatesWithScheduleFailure
         // Wait for the SSM to advance to the expected state
         atDesiredState.wait();
         ASSERT_EQ(_ssm->state(), testState);
-        log() << "Terminating session at " << stateToString(_ssm->state());
+        LOGV2(23008,
+              "Terminating session at {stateToString_ssm_state}",
+              "stateToString_ssm_state"_attr = stateToString(_ssm->state()));
 
         // Terminate the SSM
         _ssm->terminate();
@@ -559,7 +719,9 @@ TEST_F(ServiceStateMachineFixture, SSMRunsRecursively) {
     // The scheduleHook just runs the task, effectively making this a recursive executor.
     int recursionDepth = 0;
     _sexec->setScheduleHook([&recursionDepth](auto task) {
-        log() << "running task in executor. depth: " << ++recursionDepth;
+        LOGV2(23009,
+              "running task in executor. depth: {recursionDepth}",
+              "recursionDepth"_attr = ++recursionDepth);
         task();
         return true;
     });

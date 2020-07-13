@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,10 +38,11 @@
 #include "mongo/db/kill_sessions.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/session_killer.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/platform/random.h"
 #include "mongo/s/query/cluster_client_cursor.h"
+#include "mongo/s/query/cluster_client_cursor_guard.h"
 #include "mongo/s/query/cluster_client_cursor_params.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/time_support.h"
@@ -67,13 +69,10 @@ class StatusWith;
  * with the kill*() suite of methods.
  *
  * No public methods throw exceptions, and all public methods are thread-safe.
- *
- * TODO: Add maxTimeMS support.  SERVER-19410.
- * TODO: Add method "size_t killCursorsOnNamespace(const NamespaceString& nss)" for
- *       dropCollection()?
  */
 class ClusterCursorManager {
-    MONGO_DISALLOW_COPYING(ClusterCursorManager);
+    ClusterCursorManager(const ClusterCursorManager&) = delete;
+    ClusterCursorManager& operator=(const ClusterCursorManager&) = delete;
 
 public:
     //
@@ -134,7 +133,8 @@ public:
      * current OperationContext, and return the cursor.
      */
     class PinnedCursor {
-        MONGO_DISALLOW_COPYING(PinnedCursor);
+        PinnedCursor(const PinnedCursor&) = delete;
+        PinnedCursor& operator=(const PinnedCursor&) = delete;
 
     public:
         /**
@@ -160,25 +160,13 @@ public:
         PinnedCursor& operator=(PinnedCursor&& other);
 
         /**
-         * Calls next() on the underlying cursor.  Cannot be called after returnCursor() is called.
-         * A cursor must be owned.
-         *
-         * Can block.
+         * Returns a pointer to the ClusterClientCursor that this PinnedCursor owns. A cursor must
+         * be owned.
          */
-        StatusWith<ClusterQueryResult> next(RouterExecStage::ExecContext);
-
-        /**
-         * Returns whether or not the underlying cursor is tailing a capped collection.  Cannot be
-         * called after returnCursor() is called.  A cursor must be owned.
-         */
-        bool isTailable() const;
-
-        /**
-         * Returns whether or not the underlying cursor is tailing a capped collection and was
-         * created with the 'awaitData' flag set.  Cannot be called after returnCursor() is called.
-         * A cursor must be owned.
-         */
-        bool isTailableAndAwaitData() const;
+        ClusterClientCursor* operator->() const {
+            invariant(_cursor);
+            return _cursor.get();
+        }
 
         /**
          * Transfers ownership of the underlying cursor back to the manager, and detaches it from
@@ -191,60 +179,14 @@ public:
         void returnCursor(CursorState cursorState);
 
         /**
-         * Returns the command object which originally created this cursor.
-         */
-        BSONObj getOriginatingCommand() const;
-
-        /**
-         * Returns a reference to the vector of remote hosts involved in this operation.
-         */
-        std::size_t getNumRemotes() const;
-
-        /**
          * Returns the cursor id for the underlying cursor, or zero if no cursor is owned.
          */
         CursorId getCursorId() const;
 
         /**
-         * Returns the read preference setting for this cursor.
+         * Returns a GenericCursor version of the pinned cursor.
          */
-        boost::optional<ReadPreferenceSetting> getReadPreference() const;
-
-        /**
-         * Returns the number of result documents returned so far by this cursor via the next()
-         * method.
-         */
-        long long getNumReturnedSoFar() const;
-
-        /**
-         * Stashes 'obj' to be returned later by this cursor. A cursor must be owned.
-         */
-        void queueResult(const ClusterQueryResult& result);
-
-        /**
-         * Returns whether or not all the remote cursors underlying this cursor have been
-         * exhausted. Cannot be called after returnCursor() is called. A cursor must be owned.
-         */
-        bool remotesExhausted();
-
-        /**
-         * Sets the maxTimeMS value that the cursor should forward with any internally issued
-         * getMore requests. A cursor must be owned.
-         *
-         * Returns a non-OK status if this cursor type does not support maxTimeMS on getMore (i.e.
-         * if the cursor is not tailable + awaitData).
-         */
-        Status setAwaitDataTimeout(Milliseconds awaitDataTimeout);
-
-        Microseconds getLeftoverMaxTimeMicros() const {
-            invariant(_cursor);
-            return _cursor->getLeftoverMaxTimeMicros();
-        }
-
-        void setLeftoverMaxTimeMicros(Microseconds leftoverMaxTimeMicros) {
-            invariant(_cursor);
-            _cursor->setLeftoverMaxTimeMicros(leftoverMaxTimeMicros);
-        }
+        GenericCursor toGenericCursor() const;
 
     private:
         // ClusterCursorManager is a friend so that its methods can call the PinnedCursor
@@ -257,7 +199,7 @@ public:
          * and 'cursorId' must be non-zero.
          */
         PinnedCursor(ClusterCursorManager* manager,
-                     std::unique_ptr<ClusterClientCursor> cursor,
+                     ClusterClientCursorGuard&& cursor,
                      const NamespaceString& nss,
                      CursorId cursorId);
 
@@ -330,6 +272,13 @@ public:
      * cursor. This function should check whether the current client is also authorized to use this
      * cursor, and if not, return an error status, which will cause checkOutCursor to fail.
      *
+     * If 'checkSessionAuth' is 'kCheckSession' or left unspecified, this function also checks if
+     * the current session in the specified 'opCtx' has privilege to access the cursor specified by
+     * 'id.' In this case, this function returns a 'mongo::Status' with information regarding the
+     * nature of the inaccessability when the cursor is not accessible. If 'kNoCheckSession' is
+     * passed for 'checkSessionAuth,' this function does not check if the current session is
+     * authorized to access the cursor with the given id.
+     *
      * This method updates the 'last active' time associated with the cursor to the current time.
      *
      * Does not block.
@@ -398,9 +347,10 @@ public:
     void appendActiveSessions(LogicalSessionIdSet* lsids) const;
 
     /**
-     * Returns a list of GenericCursors for all cursors in the cursor manager.
+     * Returns a list of GenericCursors for all idle (non-pinned) cursors in the cursor manager.
      */
-    std::vector<GenericCursor> getAllCursors() const;
+    std::vector<GenericCursor> getIdleCursors(
+        const OperationContext* opCtx, MongoProcessInterface::CurrentOpUserMode userMode) const;
 
     std::pair<Status, int> killCursorsWithMatchingSessions(OperationContext* opCtx,
                                                            const SessionKiller::Matcher& matcher);
@@ -409,6 +359,11 @@ public:
      * Returns a list of all open cursors for the given session.
      */
     stdx::unordered_set<CursorId> getCursorsForSession(LogicalSessionId lsid) const;
+
+    /*
+     * Returns a list of all open cursors for the given set of OperationKeys.
+     */
+    stdx::unordered_set<CursorId> getCursorsForOpKeys(std::vector<OperationKey>) const;
 
     /**
      * Returns the namespace associated with the given cursor id, by examining the 'namespace
@@ -435,8 +390,7 @@ private:
     class CursorEntry;
     struct CursorEntryContainer;
     using CursorEntryMap = stdx::unordered_map<CursorId, CursorEntry>;
-    using NssToCursorContainerMap =
-        stdx::unordered_map<NamespaceString, CursorEntryContainer, NamespaceString::Hasher>;
+    using NssToCursorContainerMap = stdx::unordered_map<NamespaceString, CursorEntryContainer>;
 
     /**
      * Transfers ownership of the given pinned cursor back to the manager, and moves the cursor to
@@ -457,7 +411,7 @@ private:
     /**
      * Will detach a cursor, release the lock and then call kill() on it.
      */
-    void detachAndKillCursor(stdx::unique_lock<stdx::mutex> lk,
+    void detachAndKillCursor(stdx::unique_lock<Latch> lk,
                              OperationContext* opCtx,
                              const NamespaceString& nss,
                              CursorId cursorId);
@@ -479,9 +433,10 @@ private:
      *
      * Not thread-safe.
      */
-    StatusWith<std::unique_ptr<ClusterClientCursor>> _detachCursor(WithLock,
-                                                                   NamespaceString const& nss,
-                                                                   CursorId cursorId);
+    StatusWith<ClusterClientCursorGuard> _detachCursor(WithLock,
+                                                       OperationContext* opCtx,
+                                                       const NamespaceString& nss,
+                                                       CursorId cursorId);
 
     /**
      * Flags the OperationContext that's using the given cursor as interrupted.
@@ -493,7 +448,7 @@ private:
      *
      * Returns the number of cursors killed.
      */
-    std::size_t killCursorsSatisfying(stdx::unique_lock<stdx::mutex> lk,
+    std::size_t killCursorsSatisfying(stdx::unique_lock<Latch> lk,
                                       OperationContext* opCtx,
                                       std::function<bool(CursorId, const CursorEntry&)> pred);
 
@@ -501,7 +456,8 @@ private:
      * CursorEntry is a moveable, non-copyable container for a single cursor.
      */
     class CursorEntry {
-        MONGO_DISALLOW_COPYING(CursorEntry);
+        CursorEntry(const CursorEntry&) = delete;
+        CursorEntry& operator=(const CursorEntry&) = delete;
 
     public:
         CursorEntry() = default;
@@ -510,12 +466,14 @@ private:
                     CursorType cursorType,
                     CursorLifetime cursorLifetime,
                     Date_t lastActive,
-                    UserNameIterator authenticatedUsersIter)
+                    UserNameIterator authenticatedUsersIter,
+                    boost::optional<OperationKey> opKey)
             : _cursor(std::move(cursor)),
               _cursorType(cursorType),
               _cursorLifetime(cursorLifetime),
               _lastActive(lastActive),
               _lsid(_cursor->getLsid()),
+              _opKey(std::move(opKey)),
               _authenticatedUsers(
                   userNameIteratorToContainer<std::vector<UserName>>(authenticatedUsersIter)) {
             invariant(_cursor);
@@ -527,8 +485,13 @@ private:
         bool isKillPending() const {
             // A cursor is kill pending if it's checked out by an OperationContext that was
             // interrupted.
-            return _operationUsingCursor &&
-                !_operationUsingCursor->checkForInterruptNoAssert().isOK();
+            if (!_operationUsingCursor) {
+                return false;
+            }
+
+            // Must hold the Client lock when calling isKillPending().
+            stdx::unique_lock<Client> lk(*_operationUsingCursor->getClient());
+            return _operationUsingCursor->isKillPending();
         }
 
         CursorType getCursorType() const {
@@ -547,18 +510,33 @@ private:
             return _lsid;
         }
 
+        boost::optional<OperationKey> getOperationKey() const {
+            return _opKey;
+        }
+
         /**
-         * Returns the cursor owned by this CursorEntry for an operation to use. Only one operation
-         * may use the cursor at a time, so callers should check that getOperationUsingCursor()
-         * returns null before using this function. Callers may pass nullptr, but only if the
-         * released cursor is going to be deleted.
+         * Returns a cursor guard holding the cursor owned by this CursorEntry for an operation to
+         * use. Only one operation may use the cursor at a time, so callers should check that
+         * getOperationUsingCursor() returns null before using this function. Callers may not pass
+         * nullptr for opCtx. Ownership of the cursor is given to the returned
+         * ClusterClientCursorGuard; callers that want to assume ownership over the cursor directly
+         * must unpack the cursor from the returned guard.
          */
-        std::unique_ptr<ClusterClientCursor> releaseCursor(OperationContext* opCtx) {
+        ClusterClientCursorGuard releaseCursor(OperationContext* opCtx) {
             invariant(!_operationUsingCursor);
             invariant(_cursor);
+            invariant(opCtx);
             _operationUsingCursor = opCtx;
-            return std::move(_cursor);
+            return ClusterClientCursorGuard(opCtx, std::move(_cursor));
         }
+
+        /**
+         * Creates a generic cursor from the cursor inside this entry. Should only be called on
+         * idle cursors. The caller must supply the cursorId and namespace because the CursorEntry
+         * does not have access to them.  Cannot be called if this CursorEntry does not own an
+         * underlying ClusterClientCursor.
+         */
+        GenericCursor cursorToGenericCursor(CursorId cursorId, const NamespaceString& ns) const;
 
         OperationContext* getOperationUsingCursor() const {
             return _operationUsingCursor;
@@ -592,6 +570,9 @@ private:
         Date_t _lastActive;
         boost::optional<LogicalSessionId> _lsid;
 
+        // The client OperationKey from the OperationContext at the time of registering a cursor.
+        boost::optional<OperationKey> _opKey;
+
         // Current operation using the cursor. Non-null if the cursor is checked out.
         OperationContext* _operationUsingCursor = nullptr;
 
@@ -604,7 +585,8 @@ private:
      * contained cursors share the same 32-bit prefix of their cursor id.
      */
     struct CursorEntryContainer {
-        MONGO_DISALLOW_COPYING(CursorEntryContainer);
+        CursorEntryContainer(const CursorEntryContainer&) = delete;
+        CursorEntryContainer& operator=(const CursorEntryContainer&) = delete;
 
         CursorEntryContainer(uint32_t containerPrefix) : containerPrefix(containerPrefix) {}
 
@@ -629,7 +611,7 @@ private:
     ClockSource* _clockSource;
 
     // Synchronizes access to all private state variables below.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("ClusterCursorManager::_mutex");
 
     bool _inShutdown{false};
 
@@ -657,4 +639,4 @@ private:
     size_t _cursorsTimedOut = 0;
 };
 
-}  // namespace
+}  // namespace mongo

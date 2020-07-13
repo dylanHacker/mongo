@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -42,7 +43,7 @@
 #include "mongo/platform/random.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace {
 
@@ -149,18 +150,19 @@ TEST(GeoHash, UnhashFastMatchesUnhashSlow) {
 
 TEST(GeoHashConvertor, EdgeLength) {
     const double kError = 10E-15;
-    GeoHashConverter::Parameters params;
+    GeoHashConverter::Parameters params{};
     params.max = 200.0;
     params.min = 100.0;
     params.bits = 32;
     double numBuckets = (1024 * 1024 * 1024 * 4.0);
     params.scaling = numBuckets / (params.max - params.min);
 
-    GeoHashConverter converter(params);
+    auto converter = GeoHashConverter::createFromParams(params);
+    ASSERT_OK(converter.getStatus());
 
-    ASSERT_APPROX_EQUAL(100.0, converter.sizeEdge(0), kError);
-    ASSERT_APPROX_EQUAL(50.0, converter.sizeEdge(1), kError);
-    ASSERT_APPROX_EQUAL(25.0, converter.sizeEdge(2), kError);
+    ASSERT_APPROX_EQUAL(100.0, converter.getValue()->sizeEdge(0), kError);
+    ASSERT_APPROX_EQUAL(50.0, converter.getValue()->sizeEdge(1), kError);
+    ASSERT_APPROX_EQUAL(25.0, converter.getValue()->sizeEdge(2), kError);
 }
 
 /**
@@ -376,7 +378,7 @@ TEST(GeoHashConvertor, EdgeLength) {
  * We can get the maximum of the error by making max very large and min = -min, x -> max
  */
 TEST(GeoHashConverter, UnhashToBoxError) {
-    GeoHashConverter::Parameters params;
+    GeoHashConverter::Parameters params{};
     // Test max from 2^-20 to 2^20
     for (int times = -20; times <= 20; times += 2) {
         // Construct parameters
@@ -386,7 +388,9 @@ TEST(GeoHashConverter, UnhashToBoxError) {
         double numBuckets = (1024 * 1024 * 1024 * 4.0);
         params.scaling = numBuckets / (params.max - params.min);
 
-        GeoHashConverter converter(params);
+        auto converter = GeoHashConverter::createFromParams(params);
+        ASSERT_OK(converter.getStatus());
+
         // Assume level == 32, so we ignore the error of  edge length here.
         double delta_box = 7.0 / 8.0 * GeoHashConverter::calcUnhashToBoxError(params);
         double cellEdge = 1 / params.scaling;
@@ -399,8 +403,8 @@ TEST(GeoHashConverter, UnhashToBoxError) {
         x = params.max;
         while (x > params.max - cellEdge) {
             x = nextafter(x, params.min);
-            double x_prime =
-                converter.convertDoubleFromHashScale(converter.convertToDoubleHashScale(x));
+            double x_prime = converter.getValue()->convertDoubleFromHashScale(
+                converter.getValue()->convertToDoubleHashScale(x));
             double delta = fabs(x - x_prime);
             ASSERT_LESS_THAN(delta, delta_box);
         }
@@ -409,8 +413,8 @@ TEST(GeoHashConverter, UnhashToBoxError) {
         x = params.min + cellEdge;
         while (x > params.min) {
             x = nextafter(x, params.min);
-            double x_prime =
-                converter.convertDoubleFromHashScale(converter.convertToDoubleHashScale(x));
+            double x_prime = converter.getValue()->convertDoubleFromHashScale(
+                converter.getValue()->convertToDoubleHashScale(x));
             double delta = fabs(x - x_prime);
             ASSERT_LESS_THAN(delta, delta_box);
         }
@@ -419,19 +423,20 @@ TEST(GeoHashConverter, UnhashToBoxError) {
 
 // SERVER-15576 Verify a point is contained by its GeoHash box.
 TEST(GeoHashConverter, GeoHashBox) {
-    GeoHashConverter::Parameters params;
+    GeoHashConverter::Parameters params{};
     params.max = 100000000.3;
     params.min = -params.max;
     params.bits = 32;
     double numBuckets = (1024 * 1024 * 1024 * 4.0);
     params.scaling = numBuckets / (params.max - params.min);
 
-    GeoHashConverter converter(params);
+    auto converter = GeoHashConverter::createFromParams(params);
+    ASSERT_OK(converter.getStatus());
 
     // Without expanding the box, the following point is not contained by its GeoHash box.
     mongo::Point p(-7201198.6497758823, -0.1);
-    mongo::GeoHash hash = converter.hash(p);
-    mongo::Box box = converter.unhashToBoxCovering(hash);
+    mongo::GeoHash hash = converter.getValue()->hash(p);
+    mongo::Box box = converter.getValue()->unhashToBoxCovering(hash);
     ASSERT(box.inside(p));
 }
 
@@ -548,4 +553,4 @@ TEST(GeoHash, ClearUnusedBitsIsNoopIfNoBitsAreUnused) {
     GeoHash other = geoHash.parent(32);
     ASSERT_EQUALS(geoHash, other);
 }
-}
+}  // namespace

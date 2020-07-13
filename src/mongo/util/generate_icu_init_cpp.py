@@ -1,34 +1,36 @@
-#!/usr/bin/env python
-
-#    Copyright 2016 MongoDB Inc.
+#!/usr/bin/env python3
 #
-#    This program is free software: you can redistribute it and/or  modify
-#    it under the terms of the GNU Affero General Public License, version 3,
-#    as published by the Free Software Foundation.
+# Copyright (C) 2018-present MongoDB, Inc.
 #
-#    This program is distributed in the hope that it will be useful,
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#    GNU Affero General Public License for more details.
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the Server Side Public License, version 1,
+# as published by MongoDB, Inc.
 #
-#    You should have received a copy of the GNU Affero General Public License
-#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# Server Side Public License for more details.
 #
-#    As a special exception, the copyright holders give permission to link the
-#    code of portions of this program with the OpenSSL library under certain
-#    conditions as described in each individual source file and distribute
-#    linked combinations including the program with the OpenSSL library. You
-#    must comply with the GNU Affero General Public License in all respects
-#    for all of the code used other than as permitted herein. If you modify
-#    file(s) with this exception, you may extend this exception to your
-#    version of the file(s), but you are not obligated to do so. If you do not
-#    wish to do so, delete this exception statement from your version. If you
-#    delete this exception statement from all source files in the program,
-#    then also delete it in the license file.
+# You should have received a copy of the Server Side Public License
+# along with this program. If not, see
+# <http://www.mongodb.com/licensing/server-side-public-license>.
+#
+# As a special exception, the copyright holders give permission to link the
+# code of portions of this program with the OpenSSL library under certain
+# conditions as described in each individual source file and distribute
+# linked combinations including the program with the OpenSSL library. You
+# must comply with the Server Side Public License in all respects for
+# all of the code used other than as permitted herein. If you modify file(s)
+# with this exception, you may extend this exception to your version of the
+# file(s), but you are not obligated to do so. If you do not wish to do so,
+# delete this exception statement from your version. If you delete this
+# exception statement from all source files in the program, then also delete
+# it in the license file.
 
 import optparse
 import os
 import sys
+
 
 def main(argv):
     parser = optparse.OptionParser()
@@ -45,35 +47,37 @@ def main(argv):
         parser.error("input ICU data file unspecified")
     generate_cpp_file(options.input_data_file, options.output_cpp_file)
 
+
 def generate_cpp_file(data_file_path, cpp_file_path):
     source_template = '''// AUTO-GENERATED FILE DO NOT EDIT
 // See generate_icu_init_cpp.py.
 /**
- *    Copyright 2016 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -99,7 +103,8 @@ alignas(16) const uint8_t kRawData[] = {%(decimal_encoded_data)s};
 
 }  // namespace
 
-MONGO_INITIALIZER(LoadICUData)(InitializerContext* context) {
+MONGO_INITIALIZER_GENERAL(LoadICUData, MONGO_NO_PREREQUISITES, ("BeginStartupOptionHandling"))(
+        InitializerContext* context) {
     UErrorCode status = U_ZERO_ERROR;
     udata_setCommonData(kRawData, &status);
     fassert(40088, U_SUCCESS(status));
@@ -110,8 +115,8 @@ MONGO_INITIALIZER(LoadICUData)(InitializerContext* context) {
 '''
     decimal_encoded_data = ''
     with open(data_file_path, 'rb') as data_file:
-        decimal_encoded_data = ','.join([str(ord(byte)) for byte in data_file.read()])
-    with open(cpp_file_path, 'wb') as cpp_file:
+        decimal_encoded_data = ','.join([str(byte) for byte in data_file.read()])
+    with open(cpp_file_path, 'w') as cpp_file:
         cpp_file.write(source_template % dict(decimal_encoded_data=decimal_encoded_data))
 
 if __name__ == '__main__':

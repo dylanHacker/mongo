@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,21 +30,21 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
+#include <memory>
 
 #include "mongo/base/status.h"
 #include "mongo/config.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/transport/message_compressor_base.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/transport/service_executor.h"
-#include "mongo/transport/service_executor_task_names.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_mode.h"
+#include "mongo/util/net/ssl_manager.h"
 
 namespace mongo {
 
@@ -126,6 +127,12 @@ public:
     void start(Ownership ownershipModel);
 
     /*
+     * Set the executor to be used for the next call to runNext(). This allows switching between
+     * thread models after the SSM has started.
+     */
+    void setServiceExecutor(transport::ServiceExecutor* executor);
+
+    /*
      * Gets the current state of connection for testing/diagnostic purposes.
      */
     State state();
@@ -149,7 +156,7 @@ public:
     /*
      * Sets a function to be called after the session is ended
      */
-    void setCleanupHook(stdx::function<void()> hook);
+    void setCleanupHook(std::function<void()> hook);
 
 private:
     /*
@@ -173,7 +180,6 @@ private:
      */
     void _scheduleNextWithGuard(ThreadGuard guard,
                                 transport::ServiceExecutor::ScheduleFlags flags,
-                                transport::ServiceExecutorTaskName taskName,
                                 Ownership ownershipModel = Ownership::kOwned);
 
     /*
@@ -213,22 +219,32 @@ private:
      */
     void _cleanupSession(ThreadGuard guard);
 
+    /*
+     * Releases all the resources associated with the exhaust request.
+     */
+    void _cleanupExhaustResources() noexcept;
+
     AtomicWord<State> _state{State::Created};
 
     ServiceEntryPoint* _sep;
     transport::Mode _transportMode;
 
     ServiceContext* const _serviceContext;
+    transport::ServiceExecutor* _serviceExecutor;
 
     transport::SessionHandle _sessionHandle;
     const std::string _threadName;
     ServiceContext::UniqueClient _dbClient;
     const Client* _dbClientPtr;
-    stdx::function<void()> _cleanupHook;
+    std::function<void()> _cleanupHook;
 
     bool _inExhaust = false;
     boost::optional<MessageCompressorId> _compressorId;
     Message _inMessage;
+
+    // Allows delegating destruction of opCtx to another function to potentially remove its cost
+    // from the critical path. This is currently only used in `_processMessage()`.
+    ServiceContext::UniqueOperationContext _killedOpCtx;
 
     AtomicWord<Ownership> _owned{Ownership::kUnowned};
 #if MONGO_CONFIG_DEBUG_BUILD

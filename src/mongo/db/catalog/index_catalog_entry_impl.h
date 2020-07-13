@@ -1,30 +1,31 @@
 /**
-*    Copyright (C) 2013 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
@@ -40,38 +41,35 @@
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 
 class CollatorInterface;
-class CollectionCatalogEntry;
-class CollectionInfoCache;
-class HeadManager;
+class CollectionQueryInfo;
 class IndexAccessMethod;
 class IndexDescriptor;
 class MatchExpression;
 class OperationContext;
+class ExpressionContext;
 
-class IndexCatalogEntryImpl : public IndexCatalogEntry::Impl {
-    MONGO_DISALLOW_COPYING(IndexCatalogEntryImpl);
+class IndexCatalogEntryImpl : public IndexCatalogEntry {
+    IndexCatalogEntryImpl(const IndexCatalogEntryImpl&) = delete;
+    IndexCatalogEntryImpl& operator=(const IndexCatalogEntryImpl&) = delete;
 
 public:
-    explicit IndexCatalogEntryImpl(
-        IndexCatalogEntry* this_,
-        OperationContext* opCtx,
-        StringData ns,
-        CollectionCatalogEntry* collection,           // not owned
-        std::unique_ptr<IndexDescriptor> descriptor,  // ownership passes to me
-        CollectionInfoCache* infoCache);              // not owned, optional
-
-    ~IndexCatalogEntryImpl() final;
-
-    const std::string& ns() const final {
-        return _ns;
-    }
+    IndexCatalogEntryImpl(OperationContext* opCtx,
+                          RecordId catalogId,
+                          const std::string& ident,
+                          std::unique_ptr<IndexDescriptor> descriptor,  // ownership passes to me
+                          CollectionQueryInfo* queryInfo,               // not owned, optional
+                          bool isFrozen);
 
     void init(std::unique_ptr<IndexAccessMethod> accessMethod) final;
+
+    const std::string& getIdent() const final {
+        return _ident;
+    }
 
     IndexDescriptor* descriptor() final {
         return _descriptor.get();
@@ -87,6 +85,22 @@ public:
         return _accessMethod.get();
     }
 
+    bool isHybridBuilding() const final {
+        return _indexBuildInterceptor != nullptr;
+    }
+
+    IndexBuildInterceptor* indexBuildInterceptor() final {
+        return _indexBuildInterceptor;
+    }
+
+    const IndexBuildInterceptor* indexBuildInterceptor() const final {
+        return _indexBuildInterceptor;
+    }
+
+    void setIndexBuildInterceptor(IndexBuildInterceptor* interceptor) final {
+        _indexBuildInterceptor = interceptor;
+    }
+
     const Ordering& ordering() const final {
         return _ordering;
     }
@@ -99,16 +113,18 @@ public:
         return _collator.get();
     }
 
+    NamespaceString getNSSFromCatalog(OperationContext* opCtx) const final;
+
     /// ---------------------
-
-    const RecordId& head(OperationContext* opCtx) const final;
-
-    void setHead(OperationContext* opCtx, RecordId newHead) final;
 
     void setIsReady(bool newIsReady) final;
 
-    HeadManager* headManager() const final {
-        return _headManager.get();
+    void setDropped() final {
+        _isDropped.store(true);
+    }
+
+    bool isDropped() const final {
+        return _isDropped.load();
     }
 
     // --
@@ -144,10 +160,14 @@ public:
      * namespace, index name, and multikey paths on the OperationContext rather than set the index
      * as multikey here.
      */
-    void setMultikey(OperationContext* opCtx, const MultikeyPaths& multikeyPaths) final;
+    void setMultikey(OperationContext* opCtx,
+                     const Collection* coll,
+                     const MultikeyPaths& multikeyPaths) final;
 
     // if this ready is ready for queries
     bool isReady(OperationContext* opCtx) const final;
+
+    bool isFrozen() const final;
 
     KVPrefix getPrefix() const final {
         return _prefix;
@@ -161,16 +181,23 @@ public:
         return _minVisibleSnapshot;
     }
 
-    void setMinimumVisibleSnapshot(Timestamp name) final {
-        _minVisibleSnapshot = name;
-    }
+    /**
+     * Updates the minimum visible snapshot. The 'newMinimumVisibleSnapshot' is ignored if it would
+     * set the minimum visible snapshot backwards in time.
+     */
+    void setMinimumVisibleSnapshot(Timestamp newMinimumVisibleSnapshot) final;
 
 private:
-    class SetMultikeyChange;
-    class SetHeadChange;
+    /**
+     * Sets this index to be multikey when we are running inside a multi-document transaction.
+     * Used by setMultikey() only.
+     */
+    Status _setMultikeyInMultiDocumentTransaction(OperationContext* opCtx,
+                                                  const Collection* collection,
+                                                  const MultikeyPaths& multikeyPaths);
 
     bool _catalogIsReady(OperationContext* opCtx) const;
-    RecordId _catalogHead(OperationContext* opCtx) const;
+    bool _catalogIsPresent(OperationContext* opCtx) const;
 
     /**
      * Retrieves the multikey information associated with this index from '_collection',
@@ -179,44 +206,58 @@ private:
      */
     bool _catalogIsMultikey(OperationContext* opCtx, MultikeyPaths* multikeyPaths) const;
 
+    /**
+     * Sets on-disk multikey flag for this index.
+     */
+    void _catalogSetMultikey(OperationContext* opCtx,
+                             const Collection* collection,
+                             const MultikeyPaths& multikeyPaths);
+
     KVPrefix _catalogGetPrefix(OperationContext* opCtx) const;
 
     // -----
 
-    std::string _ns;
-
-    CollectionCatalogEntry* _collection;  // not owned here
+    const std::string _ident;
 
     std::unique_ptr<IndexDescriptor> _descriptor;  // owned here
 
-    CollectionInfoCache* _infoCache;  // not owned here
+    CollectionQueryInfo* _queryInfo;  // not owned here
 
     std::unique_ptr<IndexAccessMethod> _accessMethod;
 
-    // Owned here.
-    std::unique_ptr<HeadManager> _headManager;
+    IndexBuildInterceptor* _indexBuildInterceptor = nullptr;  // not owned here
+
     std::unique_ptr<CollatorInterface> _collator;
     std::unique_ptr<MatchExpression> _filterExpression;
+    // Special ExpressionContext used to evaluate the partial filter expression.
+    boost::intrusive_ptr<ExpressionContext> _expCtxForFilter;
 
     // cached stuff
 
-    Ordering _ordering;  // TODO: this might be b-tree specific
-    bool _isReady;       // cache of NamespaceDetails info
-    RecordId _head;      // cache of IndexDetails
+    const RecordId _catalogId;  // Location in the durable catalog of the collection entry
+                                // containing this index entry.
+    Ordering _ordering;         // TODO: this might be b-tree specific
+    bool _isReady;              // cache of NamespaceDetails info
+    bool _isFrozen;
+    AtomicWord<bool> _isDropped;  // Whether the index drop is committed.
 
     // Set to true if this index supports path-level multikey tracking.
     // '_indexTracksPathLevelMultikeyInfo' is effectively const after IndexCatalogEntry::init() is
     // called.
     bool _indexTracksPathLevelMultikeyInfo = false;
 
-    // Set to true if this index is multikey. '_isMultikey' serves as a cache of the information
-    // stored in the NamespaceDetails or KVCatalog.
-    AtomicWord<bool> _isMultikey;
+    // Set to true if this index may contain multikey data.
+    AtomicWord<bool> _isMultikeyForRead;
+
+    // Set to true after a transaction commit successfully updates multikey on the catalog data. At
+    // this point, future writers do not need to update the catalog.
+    AtomicWord<bool> _isMultikeyForWrite;
 
     // Controls concurrent access to '_indexMultikeyPaths'. We acquire this mutex rather than the
     // RESOURCE_METADATA lock as a performance optimization so that it is cheaper to detect whether
     // there is actually any path-level multikey information to update or not.
-    mutable stdx::mutex _indexMultikeyPathsMutex;
+    mutable Mutex _indexMultikeyPathsMutex =
+        MONGO_MAKE_LATCH("IndexCatalogEntryImpl::_indexMultikeyPathsMutex");
 
     // Non-empty only if '_indexTracksPathLevelMultikeyInfo' is true.
     //

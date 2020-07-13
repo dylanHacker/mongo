@@ -1,20 +1,17 @@
 """Standalone mongod fixture for executing JSTests against."""
 
-from __future__ import absolute_import
-
 import os
 import os.path
-import shutil
 import time
 
 import pymongo
 import pymongo.errors
 
-from . import interface
-from ... import config
-from ... import core
-from ... import errors
-from ... import utils
+from buildscripts.resmokelib import config
+from buildscripts.resmokelib import core
+from buildscripts.resmokelib import errors
+from buildscripts.resmokelib import utils
+from buildscripts.resmokelib.testing.fixtures import interface
 
 
 class MongoDFixture(interface.Fixture):
@@ -27,16 +24,16 @@ class MongoDFixture(interface.Fixture):
             preserve_dbpath=False):
         """Initialize MongoDFixture with different options for the mongod process."""
 
+        self.mongod_options = utils.default_if_none(mongod_options, {})
         interface.Fixture.__init__(self, logger, job_num, dbpath_prefix=dbpath_prefix)
 
-        if "dbpath" in mongod_options and dbpath_prefix is not None:
+        if "dbpath" in self.mongod_options and dbpath_prefix is not None:
             raise ValueError("Cannot specify both mongod_options.dbpath and dbpath_prefix")
 
-        # Command line options override the YAML configuration.
-        self.mongod_executable = utils.default_if_none(config.MONGOD_EXECUTABLE, mongod_executable)
+        # Default to command line options if the YAML configuration is not passed in.
+        self.mongod_executable = utils.default_if_none(mongod_executable, config.MONGOD_EXECUTABLE)
 
         self.mongod_options = utils.default_if_none(mongod_options, {}).copy()
-        self.preserve_dbpath = preserve_dbpath
 
         # The dbpath in mongod_options takes precedence over other settings to make it easier for
         # users to specify a dbpath containing data to test against.
@@ -44,13 +41,20 @@ class MongoDFixture(interface.Fixture):
             self.mongod_options["dbpath"] = os.path.join(self._dbpath_prefix, config.FIXTURE_SUBDIR)
         self._dbpath = self.mongod_options["dbpath"]
 
+        if config.ALWAYS_USE_LOG_FILES:
+            self.mongod_options["logpath"] = self._dbpath + "/mongod.log"
+            self.mongod_options["logappend"] = ""
+            self.preserve_dbpath = True
+        else:
+            self.preserve_dbpath = preserve_dbpath
+
         self.mongod = None
         self.port = None
 
     def setup(self):
         """Set up the mongod."""
-        if not self.preserve_dbpath:
-            shutil.rmtree(self._dbpath, ignore_errors=True)
+        if not self.preserve_dbpath and os.path.lexists(self._dbpath):
+            utils.rmtree(self._dbpath, ignore_errors=False)
 
         try:
             os.makedirs(self._dbpath)
@@ -74,6 +78,13 @@ class MongoDFixture(interface.Fixture):
             raise errors.ServerFailure(msg)
 
         self.mongod = mongod
+
+    def pids(self):
+        """:return: pids owned by this fixture if any."""
+        out = [x.pid for x in [self.mongod] if x is not None]
+        if not out:
+            self.logger.debug('Mongod not running when gathering standalone fixture pid.')
+        return out
 
     def await_ready(self):
         """Block until the fixture can be used for testing."""
@@ -107,12 +118,18 @@ class MongoDFixture(interface.Fixture):
 
         self.logger.info("Successfully contacted the mongod on port %d.", self.port)
 
-    def _do_teardown(self):
+    def _do_teardown(self, mode=None):
         if self.mongod is None:
             self.logger.warning("The mongod fixture has not been set up yet.")
             return  # Still a success even if nothing is running.
 
-        self.logger.info("Stopping mongod on port %d with pid %d...", self.port, self.mongod.pid)
+        if mode == interface.TeardownMode.ABORT:
+            self.logger.info(
+                "Attempting to send SIGABRT from resmoke to mongod on port %d with pid %d...",
+                self.port, self.mongod.pid)
+        else:
+            self.logger.info("Stopping mongod on port %d with pid %d...", self.port,
+                             self.mongod.pid)
         if not self.is_running():
             exit_code = self.mongod.poll()
             msg = ("mongod on port {:d} was expected to be running, but wasn't. "
@@ -120,10 +137,12 @@ class MongoDFixture(interface.Fixture):
             self.logger.warning(msg)
             raise errors.ServerFailure(msg)
 
-        self.mongod.stop()
+        self.mongod.stop(mode)
         exit_code = self.mongod.wait()
 
-        if exit_code == 0:
+        # Python's subprocess module returns negative versions of system calls.
+        # pylint: disable=invalid-unary-operand-type
+        if exit_code == 0 or (mode is not None and exit_code == -(mode.value)):
             self.logger.info("Successfully stopped the mongod on port {:d}.".format(self.port))
         else:
             self.logger.warning("Stopped the mongod on port {:d}. "

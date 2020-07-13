@@ -1,23 +1,24 @@
-/*
- *    Copyright (C) 2016 MongoDB Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,9 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
+
+#include <memory>
 
 #include "mongo/client/native_sasl_client_session.h"
 #include "mongo/client/scram_client_cache.h"
@@ -36,16 +39,17 @@
 #include "mongo/crypto/sha1_block.h"
 #include "mongo/crypto/sha256_block.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_manager_impl.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/authorization_session_impl.h"
 #include "mongo/db/auth/authz_manager_external_state_mock.h"
 #include "mongo/db/auth/authz_session_external_state_mock.h"
 #include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/db/auth/sasl_scram_server_conversation.h"
-#include "mongo/db/service_context_noop.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/base64.h"
-#include "mongo/util/log.h"
 #include "mongo/util/password_digest.h"
 
 namespace mongo {
@@ -59,16 +63,10 @@ BSONObj generateSCRAMUserDocument(StringData username, StringData password) {
     const auto sha256Cred =
         scram::Secrets<SHA256Block>::generateCredentials(password.toString(), 15000);
     return BSON("_id" << (str::stream() << database << "." << username).operator StringData()
-                      << AuthorizationManager::USER_NAME_FIELD_NAME
-                      << username
-                      << AuthorizationManager::USER_DB_FIELD_NAME
-                      << database
-                      << "credentials"
-                      << BSON("SCRAM-SHA-1" << sha1Cred << "SCRAM-SHA-256" << sha256Cred)
-                      << "roles"
-                      << BSONArray()
-                      << "privileges"
-                      << BSONArray());
+                      << AuthorizationManager::USER_NAME_FIELD_NAME << username
+                      << AuthorizationManager::USER_DB_FIELD_NAME << database << "credentials"
+                      << BSON("SCRAM-SHA-1" << sha1Cred << "SCRAM-SHA-256" << sha256Cred) << "roles"
+                      << BSONArray() << "privileges" << BSONArray());
 }
 
 std::string corruptEncodedPayload(const std::string& message,
@@ -136,7 +134,7 @@ class SCRAMMutators {
 public:
     SCRAMMutators() {}
 
-    void setMutator(SaslTestState state, stdx::function<void(std::string&)> fun) {
+    void setMutator(SaslTestState state, std::function<void(std::string&)> fun) {
         mutators.insert(std::make_pair(state, fun));
     }
 
@@ -148,7 +146,7 @@ public:
     }
 
 private:
-    std::map<SaslTestState, stdx::function<void(std::string&)>> mutators;
+    std::map<SaslTestState, std::function<void(std::string&)>> mutators;
 };
 
 struct SCRAMStepsResult {
@@ -172,9 +170,9 @@ protected:
     const SCRAMStepsResult goalState =
         SCRAMStepsResult(SaslTestState(SaslTestState::kClient, 4), Status::OK());
 
-    std::unique_ptr<ServiceContextNoop> serviceContext;
-    ServiceContextNoop::UniqueClient client;
-    ServiceContextNoop::UniqueOperationContext opCtx;
+    ServiceContext* serviceContext;
+    ServiceContext::UniqueClient client;
+    ServiceContext::UniqueOperationContext opCtx;
 
     AuthzManagerExternalStateMock* authzManagerExternalState;
     AuthorizationManager* authzManager;
@@ -184,20 +182,24 @@ protected:
     std::unique_ptr<NativeSaslClientSession> saslClientSession;
 
     void setUp() final {
-        serviceContext = stdx::make_unique<ServiceContextNoop>();
+        auto serviceContextHolder = ServiceContext::make();
+        serviceContext = serviceContextHolder.get();
+        setGlobalServiceContext(std::move(serviceContextHolder));
         client = serviceContext->makeClient("test");
         opCtx = serviceContext->makeOperationContext(client.get());
 
         auto uniqueAuthzManagerExternalStateMock =
-            stdx::make_unique<AuthzManagerExternalStateMock>();
+            std::make_unique<AuthzManagerExternalStateMock>();
         authzManagerExternalState = uniqueAuthzManagerExternalStateMock.get();
-        authzManager = new AuthorizationManager(std::move(uniqueAuthzManagerExternalStateMock));
-        authzSession = stdx::make_unique<AuthorizationSession>(
-            stdx::make_unique<AuthzSessionExternalStateMock>(authzManager));
-        AuthorizationManager::set(serviceContext.get(),
-                                  std::unique_ptr<AuthorizationManager>(authzManager));
+        auto newManager = std::make_unique<AuthorizationManagerImpl>(
+            serviceContext, std::move(uniqueAuthzManagerExternalStateMock));
+        authzSession = std::make_unique<AuthorizationSessionImpl>(
+            std::make_unique<AuthzSessionExternalStateMock>(newManager.get()),
+            AuthorizationSessionImpl::InstallMockForTestingOrAuthImpl{});
+        authzManager = newManager.get();
+        AuthorizationManager::set(serviceContext, std::move(newManager));
 
-        saslClientSession = stdx::make_unique<NativeSaslClientSession>();
+        saslClientSession = std::make_unique<NativeSaslClientSession>();
         saslClientSession->setParameter(NativeSaslClientSession::parameterMechanism,
                                         saslServerSession->mechanismName());
         saslClientSession->setParameter(NativeSaslClientSession::parameterServiceName, "mongodb");
@@ -210,7 +212,8 @@ protected:
     void tearDown() final {
         opCtx.reset();
         client.reset();
-        serviceContext.reset();
+        setGlobalServiceContext(nullptr);
+        serviceContext = nullptr;
 
         saslClientSession.reset();
         saslServerSession.reset();
@@ -233,8 +236,8 @@ protected:
         std::string serverOutput = "";
 
         for (size_t step = 1; step <= 3; step++) {
-            ASSERT_FALSE(saslClientSession->isDone());
-            ASSERT_FALSE(saslServerSession->isDone());
+            ASSERT_FALSE(saslClientSession->isSuccess());
+            ASSERT_FALSE(saslServerSession->isSuccess());
 
             // Client step
             result.status = saslClientSession->step(serverOutput, &clientOutput);
@@ -258,8 +261,8 @@ protected:
             std::cout << result.outcome.toString() << ": " << serverOutput << std::endl;
             result.outcome.next();
         }
-        ASSERT_TRUE(saslClientSession->isDone());
-        ASSERT_TRUE(saslServerSession->isDone());
+        ASSERT_TRUE(saslClientSession->isSuccess());
+        ASSERT_TRUE(saslServerSession->isSuccess());
 
         return result;
     }
@@ -269,12 +272,12 @@ protected:
 
 public:
     void run() {
-        log() << "SCRAM-SHA-1 variant";
+        LOGV2(20252, "SCRAM-SHA-1 variant");
         saslServerSession = std::make_unique<SaslSCRAMSHA1ServerMechanism>("test");
         _digestPassword = true;
         Test::run();
 
-        log() << "SCRAM-SHA-256 variant";
+        LOGV2(20253, "SCRAM-SHA-256 variant");
         saslServerSession = std::make_unique<SaslSCRAMSHA256ServerMechanism>("test");
         _digestPassword = false;
         Test::run();
@@ -296,7 +299,6 @@ TEST_F(SCRAMFixture, testServerStep1DoesNotIncludeNonceFromClientStep1) {
         std::string::iterator nonceBegin = serverMessage.begin() + serverMessage.find("r=");
         std::string::iterator nonceEnd = std::find(nonceBegin, serverMessage.end(), ',');
         serverMessage = serverMessage.replace(nonceBegin, nonceEnd, "r=");
-
     });
     ASSERT_EQ(
         SCRAMStepsResult(SaslTestState(SaslTestState::kClient, 2),
@@ -342,7 +344,6 @@ TEST_F(SCRAMFixture, testClientStep2GivesBadProof) {
         std::string::iterator proofEnd = std::find(proofBegin, clientMessage.end(), ',');
         clientMessage = clientMessage.replace(
             proofBegin, proofEnd, corruptEncodedPayload(clientMessage, proofBegin, proofEnd));
-
     });
 
     ASSERT_EQ(SCRAMStepsResult(SaslTestState(SaslTestState::kServer, 2),
@@ -372,7 +373,6 @@ TEST_F(SCRAMFixture, testServerStep2GivesBadVerifier) {
             encodedVerifier = corruptEncodedPayload(serverMessage, verifierBegin, verifierEnd);
 
             serverMessage = serverMessage.replace(verifierBegin, verifierEnd, encodedVerifier);
-
         });
 
     auto result = runSteps(mutator);
@@ -494,7 +494,8 @@ TEST_F(SCRAMFixture, testIncorrectUser) {
     ASSERT_OK(saslClientSession->initialize());
 
     ASSERT_EQ(SCRAMStepsResult(SaslTestState(SaslTestState::kServer, 1),
-                               Status(ErrorCodes::UserNotFound, "Could not find user sajack@test")),
+                               Status(ErrorCodes::UserNotFound,
+                                      "Could not find user \"sajack\" for db \"test\"")),
               runSteps());
 }
 

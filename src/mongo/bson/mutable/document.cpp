@@ -1,28 +1,30 @@
-/* Copyright 2013 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -36,7 +38,6 @@
 #include <vector>
 
 #include "mongo/base/static_assert.h"
-#include "mongo/bson/inline_decls.h"
 #include "mongo/bson/mutable/damage_vector.h"
 #include "mongo/util/debug_util.h"
 
@@ -557,7 +558,7 @@ bool canAttach(const Element::RepIdx id, const ElementRep& rep) {
 
 // Returns a Status describing why 'canAttach' returned false. This function should not
 // be inlined since it just makes the callers larger for no real gain.
-NOINLINE_DECL Status getAttachmentError(const ElementRep& rep);
+MONGO_COMPILER_NOINLINE Status getAttachmentError(const ElementRep& rep);
 Status getAttachmentError(const ElementRep& rep) {
     if (rep.sibling.left != Element::kInvalidRepIdx)
         return Status(ErrorCodes::IllegalOperation, "dangling left sibling");
@@ -589,7 +590,8 @@ const bool paranoid = false;
  *  Document.
  */
 class Document::Impl {
-    MONGO_DISALLOW_COPYING(Impl);
+    Impl(const Impl&) = delete;
+    Impl& operator=(const Impl&) = delete;
 
 public:
     Impl(Document::InPlaceMode inPlaceMode)
@@ -941,7 +943,11 @@ public:
 
     inline bool doesNotAlias(StringData s) const {
         // StringData may come from either the field name heap or the leaf builder.
-        return doesNotAliasLeafBuilder(s) && !inFieldNameHeap(s.rawData());
+        return doesNotAliasLeafBuilder(s) && doesNotAliasFieldNameHeap(s);
+    }
+
+    inline bool doesNotAliasFieldNameHeap(StringData s) const {
+        return !inFieldNameHeap(s.rawData());
     }
 
     inline bool doesNotAliasLeafBuilder(StringData s) const {
@@ -990,7 +996,7 @@ public:
         // inform upstream that we are not returning in-place result data.
         if (_inPlaceMode == Document::kInPlaceDisabled) {
             damages->clear();
-            *source = NULL;
+            *source = nullptr;
             if (size)
                 *size = 0;
             return false;
@@ -1070,7 +1076,7 @@ public:
     template <typename Builder>
     void writeElement(Element::RepIdx repIdx,
                       Builder* builder,
-                      const StringData* fieldName = NULL) const;
+                      const StringData* fieldName = nullptr) const;
 
     template <typename Builder>
     void writeChildren(Element::RepIdx repIdx, Builder* builder) const;
@@ -2295,7 +2301,7 @@ Document::InPlaceMode Document::getCurrentInPlaceMode() const {
 
 Element Document::makeElementDouble(StringData fieldName, const double value) {
     Impl& impl = getImpl();
-    dassert(impl.doesNotAlias(fieldName));
+    dassert(impl.doesNotAliasLeafBuilder(fieldName));
 
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
@@ -2306,8 +2312,8 @@ Element Document::makeElementDouble(StringData fieldName, const double value) {
 
 Element Document::makeElementString(StringData fieldName, StringData value) {
     Impl& impl = getImpl();
-    dassert(impl.doesNotAlias(fieldName));
-    dassert(impl.doesNotAlias(value));
+    dassert(impl.doesNotAliasLeafBuilder(fieldName));
+    dassert(impl.doesNotAliasLeafBuilder(value));
 
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
@@ -2318,7 +2324,7 @@ Element Document::makeElementString(StringData fieldName, StringData value) {
 
 Element Document::makeElementObject(StringData fieldName) {
     Impl& impl = getImpl();
-    dassert(impl.doesNotAlias(fieldName));
+    dassert(impl.doesNotAliasFieldNameHeap(fieldName));
 
     Element::RepIdx newEltIdx;
     ElementRep& newElt = impl.makeNewRep(&newEltIdx);
@@ -2347,7 +2353,7 @@ Element Document::makeElementObject(StringData fieldName, const BSONObj& value) 
 
 Element Document::makeElementArray(StringData fieldName) {
     Impl& impl = getImpl();
-    dassert(impl.doesNotAlias(fieldName));
+    dassert(impl.doesNotAliasFieldNameHeap(fieldName));
 
     Element::RepIdx newEltIdx;
     ElementRep& newElt = impl.makeNewRep(&newEltIdx);
@@ -2378,7 +2384,7 @@ Element Document::makeElementBinary(StringData fieldName,
                                     const mongo::BinDataType binType,
                                     const void* const data) {
     Impl& impl = getImpl();
-    dassert(impl.doesNotAlias(fieldName));
+    dassert(impl.doesNotAliasLeafBuilder(fieldName));
     // TODO: Alias check 'data'?
 
     BSONObjBuilder& builder = impl.leafBuilder();
@@ -2390,7 +2396,7 @@ Element Document::makeElementBinary(StringData fieldName,
 
 Element Document::makeElementUndefined(StringData fieldName) {
     Impl& impl = getImpl();
-    dassert(impl.doesNotAlias(fieldName));
+    dassert(impl.doesNotAliasLeafBuilder(fieldName));
 
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
@@ -2407,7 +2413,7 @@ Element Document::makeElementNewOID(StringData fieldName) {
 
 Element Document::makeElementOID(StringData fieldName, const OID value) {
     Impl& impl = getImpl();
-    dassert(impl.doesNotAlias(fieldName));
+    dassert(impl.doesNotAliasLeafBuilder(fieldName));
 
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
@@ -2418,7 +2424,7 @@ Element Document::makeElementOID(StringData fieldName, const OID value) {
 
 Element Document::makeElementBool(StringData fieldName, const bool value) {
     Impl& impl = getImpl();
-    dassert(impl.doesNotAlias(fieldName));
+    dassert(impl.doesNotAliasLeafBuilder(fieldName));
 
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
@@ -2429,7 +2435,7 @@ Element Document::makeElementBool(StringData fieldName, const bool value) {
 
 Element Document::makeElementDate(StringData fieldName, const Date_t value) {
     Impl& impl = getImpl();
-    dassert(impl.doesNotAlias(fieldName));
+    dassert(impl.doesNotAliasLeafBuilder(fieldName));
 
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
@@ -2440,7 +2446,7 @@ Element Document::makeElementDate(StringData fieldName, const Date_t value) {
 
 Element Document::makeElementNull(StringData fieldName) {
     Impl& impl = getImpl();
-    dassert(impl.doesNotAlias(fieldName));
+    dassert(impl.doesNotAliasLeafBuilder(fieldName));
 
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
@@ -2451,9 +2457,9 @@ Element Document::makeElementNull(StringData fieldName) {
 
 Element Document::makeElementRegex(StringData fieldName, StringData re, StringData flags) {
     Impl& impl = getImpl();
-    dassert(impl.doesNotAlias(fieldName));
-    dassert(impl.doesNotAlias(re));
-    dassert(impl.doesNotAlias(flags));
+    dassert(impl.doesNotAliasLeafBuilder(fieldName));
+    dassert(impl.doesNotAliasLeafBuilder(re));
+    dassert(impl.doesNotAliasLeafBuilder(flags));
 
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
@@ -2464,7 +2470,8 @@ Element Document::makeElementRegex(StringData fieldName, StringData re, StringDa
 
 Element Document::makeElementDBRef(StringData fieldName, StringData ns, const OID value) {
     Impl& impl = getImpl();
-    dassert(impl.doesNotAlias(fieldName));
+    dassert(impl.doesNotAliasLeafBuilder(fieldName));
+    dassert(impl.doesNotAliasLeafBuilder(ns));
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
     builder.appendDBRef(fieldName, ns, value);
@@ -2474,8 +2481,8 @@ Element Document::makeElementDBRef(StringData fieldName, StringData ns, const OI
 
 Element Document::makeElementCode(StringData fieldName, StringData value) {
     Impl& impl = getImpl();
-    dassert(impl.doesNotAlias(fieldName));
-    dassert(impl.doesNotAlias(value));
+    dassert(impl.doesNotAliasLeafBuilder(fieldName));
+    dassert(impl.doesNotAliasLeafBuilder(value));
 
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
@@ -2486,8 +2493,8 @@ Element Document::makeElementCode(StringData fieldName, StringData value) {
 
 Element Document::makeElementSymbol(StringData fieldName, StringData value) {
     Impl& impl = getImpl();
-    dassert(impl.doesNotAlias(fieldName));
-    dassert(impl.doesNotAlias(value));
+    dassert(impl.doesNotAliasLeafBuilder(fieldName));
+    dassert(impl.doesNotAliasLeafBuilder(value));
 
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
@@ -2500,8 +2507,8 @@ Element Document::makeElementCodeWithScope(StringData fieldName,
                                            StringData code,
                                            const BSONObj& scope) {
     Impl& impl = getImpl();
-    dassert(impl.doesNotAlias(fieldName));
-    dassert(impl.doesNotAlias(code));
+    dassert(impl.doesNotAliasLeafBuilder(fieldName));
+    dassert(impl.doesNotAliasLeafBuilder(code));
     dassert(impl.doesNotAlias(scope));
 
     BSONObjBuilder& builder = impl.leafBuilder();
@@ -2513,7 +2520,7 @@ Element Document::makeElementCodeWithScope(StringData fieldName,
 
 Element Document::makeElementInt(StringData fieldName, const int32_t value) {
     Impl& impl = getImpl();
-    dassert(impl.doesNotAlias(fieldName));
+    dassert(impl.doesNotAliasLeafBuilder(fieldName));
 
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
@@ -2524,7 +2531,7 @@ Element Document::makeElementInt(StringData fieldName, const int32_t value) {
 
 Element Document::makeElementTimestamp(StringData fieldName, const Timestamp value) {
     Impl& impl = getImpl();
-    dassert(impl.doesNotAlias(fieldName));
+    dassert(impl.doesNotAliasLeafBuilder(fieldName));
 
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
@@ -2535,7 +2542,7 @@ Element Document::makeElementTimestamp(StringData fieldName, const Timestamp val
 
 Element Document::makeElementLong(StringData fieldName, const int64_t value) {
     Impl& impl = getImpl();
-    dassert(impl.doesNotAlias(fieldName));
+    dassert(impl.doesNotAliasLeafBuilder(fieldName));
 
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
@@ -2546,7 +2553,7 @@ Element Document::makeElementLong(StringData fieldName, const int64_t value) {
 
 Element Document::makeElementDecimal(StringData fieldName, const Decimal128 value) {
     Impl& impl = getImpl();
-    dassert(impl.doesNotAlias(fieldName));
+    dassert(impl.doesNotAliasLeafBuilder(fieldName));
 
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
@@ -2557,7 +2564,7 @@ Element Document::makeElementDecimal(StringData fieldName, const Decimal128 valu
 
 Element Document::makeElementMinKey(StringData fieldName) {
     Impl& impl = getImpl();
-    dassert(impl.doesNotAlias(fieldName));
+    dassert(impl.doesNotAliasLeafBuilder(fieldName));
 
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
@@ -2568,7 +2575,7 @@ Element Document::makeElementMinKey(StringData fieldName) {
 
 Element Document::makeElementMaxKey(StringData fieldName) {
     Impl& impl = getImpl();
-    dassert(impl.doesNotAlias(fieldName));
+    dassert(impl.doesNotAliasLeafBuilder(fieldName));
 
     BSONObjBuilder& builder = impl.leafBuilder();
     const int leafRef = builder.len();
@@ -2621,7 +2628,7 @@ Element Document::makeElementWithNewFieldName(StringData fieldName, const BSONEl
 }
 
 Element Document::makeElementSafeNum(StringData fieldName, SafeNum value) {
-    dassert(getImpl().doesNotAlias(fieldName));
+    dassert(getImpl().doesNotAliasLeafBuilder(fieldName));
 
     switch (value.type()) {
         case mongo::NumberInt:
@@ -2639,7 +2646,7 @@ Element Document::makeElementSafeNum(StringData fieldName, SafeNum value) {
 }
 
 Element Document::makeElement(ConstElement element) {
-    return makeElement(element, NULL);
+    return makeElement(element, nullptr);
 }
 
 Element Document::makeElementWithNewFieldName(StringData fieldName, ConstElement element) {

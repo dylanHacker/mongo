@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -33,6 +34,7 @@
 #include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/bson/mutable/element.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/restriction_set.h"
 #include "mongo/db/auth/role_name.h"
@@ -71,12 +73,6 @@ public:
      */
     static bool addPrivilegesForBuiltinRole(const RoleName& role, PrivilegeVector* privileges);
 
-    // Built-in roles for backwards compatibility with 2.2 and prior
-    static const std::string BUILTIN_ROLE_V0_READ;
-    static const std::string BUILTIN_ROLE_V0_READ_WRITE;
-    static const std::string BUILTIN_ROLE_V0_ADMIN_READ;
-    static const std::string BUILTIN_ROLE_V0_ADMIN_READ_WRITE;
-
     // Swaps the contents of this RoleGraph with those of "other"
     void swap(RoleGraph& other);
 
@@ -84,6 +80,19 @@ public:
      * Adds to "privileges" the necessary privileges to do absolutely anything on the system.
      */
     static void generateUniversalPrivileges(PrivilegeVector* privileges);
+
+    /**
+     * Takes a role name and a role graph and fills the output param "result" with a BSON
+     * representation of the role object.
+     * This function does no locking - it is up to the caller to synchronize access to the
+     * role graph.
+     * Note: The passed in RoleGraph can't be marked const because some of its accessors can
+     * actually modify it internally (to set up built-in roles).
+     */
+    static Status getBSONForRole(/*const*/ RoleGraph* graph,
+                                 const RoleName& roleName,
+                                 mutablebson::Element result);
+
 
     /**
      * Returns an iterator over the RoleNames of the "members" of the given role.
@@ -112,7 +121,7 @@ public:
      * Returns an iterator that can be used to get a full list of roles (in lexicographical
      * order) that are defined on the given database.
      */
-    RoleNameIterator getRolesForDatabase(const std::string& dbname);
+    RoleNameIterator getRolesForDatabase(StringData dbname);
 
     /**
      * Returns a vector of the privileges that the given role has been directly granted.
@@ -307,7 +316,7 @@ private:
      * Adds the built-in roles for the given database name to the role graph if they aren't
      * already present.
      */
-    void _createBuiltinRolesForDBIfNeeded(const std::string& dbname);
+    void _createBuiltinRolesForDBIfNeeded(StringData dbname);
 
     /**
      * Returns whether or not the given role exists strictly within the role graph.

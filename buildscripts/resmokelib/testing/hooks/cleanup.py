@@ -1,10 +1,8 @@
 """Test hook for cleaning up data files created by the fixture."""
 
-from __future__ import absolute_import
-
 import os
 
-from . import interface
+from buildscripts.resmokelib.testing.hooks import interface
 
 
 class CleanEveryN(interface.Hook):
@@ -22,8 +20,9 @@ class CleanEveryN(interface.Hook):
 
         # Try to isolate what test triggers the leak by restarting the fixture each time.
         if "detect_leaks=1" in os.getenv("ASAN_OPTIONS", ""):
-            self.logger.info("ASAN_OPTIONS environment variable set to detect leaks, so restarting"
-                             " the fixture after each test instead of after every %d.", n)
+            self.logger.info(
+                "ASAN_OPTIONS environment variable set to detect leaks, so restarting"
+                " the fixture after each test instead of after every %d.", n)
             n = 1
 
         self.n = n  # pylint: disable=invalid-name
@@ -35,8 +34,7 @@ class CleanEveryN(interface.Hook):
         if self.tests_run < self.n:
             return
 
-        hook_test_case = CleanEveryNTestCase.create_after_test(self.logger.test_case_logger, test,
-                                                               self)
+        hook_test_case = CleanEveryNTestCase.create_after_test(self.logger, test, self)
         hook_test_case.configure(self.fixture)
         hook_test_case.run_dynamic_test(test_report)
 

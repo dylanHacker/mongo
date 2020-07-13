@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -35,12 +36,15 @@
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/parsed_distinct.h"
 #include "mongo/db/query/view_response_formatter.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/commands/cluster_aggregate.h"
-#include "mongo/s/commands/cluster_commands_helpers.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/query/cluster_aggregate.h"
+#include "mongo/s/transaction_router.h"
+#include "mongo/util/decimal_counter.h"
 
 namespace mongo {
 namespace {
@@ -61,12 +65,21 @@ public:
         return AllowedOnSecondary::kAlways;
     }
 
+    bool maintenanceOk() const override {
+        return false;
+    }
+
     bool adminOnly() const override {
         return false;
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
+    }
+
+    ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
+                                                 repl::ReadConcernLevel level) const final {
+        return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
     }
 
     void addRequiredPrivileges(const std::string& dbname,
@@ -80,7 +93,7 @@ public:
     Status explain(OperationContext* opCtx,
                    const OpMsgRequest& opMsgRequest,
                    ExplainOptions::Verbosity verbosity,
-                   BSONObjBuilder* out) const override {
+                   rpc::ReplyBuilderInterface* result) const override {
         std::string dbname = opMsgRequest.getDatabase().toString();
         const BSONObj& cmdObj = opMsgRequest.body;
         const NamespaceString nss(parseNs(dbname, cmdObj));
@@ -125,15 +138,15 @@ public:
                 return aggRequestOnView.getStatus();
             }
 
-            auto resolvedAggRequest = ex->asExpandedViewAggregation(aggRequestOnView.getValue());
-            auto resolvedAggCmd = resolvedAggRequest.serializeToCommandObj().toBson();
-
-            ClusterAggregate::Namespaces nsStruct;
-            nsStruct.requestedNss = nss;
-            nsStruct.executionNss = resolvedAggRequest.getNamespaceString();
-
-            return ClusterAggregate::runAggregate(
-                opCtx, nsStruct, resolvedAggRequest, resolvedAggCmd, out);
+            auto bodyBuilder = result->getBodyBuilder();
+            // An empty PrivilegeVector is acceptable because these privileges are only checked on
+            // getMore and explain will not open a cursor.
+            return ClusterAggregate::retryOnViewError(opCtx,
+                                                      aggRequestOnView.getValue(),
+                                                      *ex.extraInfo<ResolvedView>(),
+                                                      nss,
+                                                      PrivilegeVector(),
+                                                      &bodyBuilder);
         }
 
         long long millisElapsed = timer.millis();
@@ -141,18 +154,16 @@ public:
         const char* mongosStageName =
             ClusterExplain::getStageNameForReadOp(shardResponses.size(), cmdObj);
 
+        auto bodyBuilder = result->getBodyBuilder();
         return ClusterExplain::buildExplainResult(
-            opCtx,
-            ClusterExplain::downconvert(opCtx, shardResponses),
-            mongosStageName,
-            millisElapsed,
-            out);
+            opCtx, shardResponses, mongosStageName, millisElapsed, &bodyBuilder);
     }
 
     bool run(OperationContext* opCtx,
              const std::string& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
+        CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
         const NamespaceString nss(parseNs(dbName, cmdObj));
 
         auto query = extractQuery(cmdObj);
@@ -165,8 +176,14 @@ public:
                 CollatorFactoryInterface::get(opCtx->getServiceContext())->makeFromBSON(collation));
         }
 
-        const auto routingInfo =
-            uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
+        const auto routingInfo = uassertStatusOK(getCollectionRoutingInfoForTxnCmd(opCtx, nss));
+        if (repl::ReadConcernArgs::get(opCtx).getLevel() ==
+                repl::ReadConcernLevel::kSnapshotReadConcern &&
+            !opCtx->inMultiDocumentTransaction() && routingInfo.cm()) {
+            uasserted(ErrorCodes::InvalidOptions,
+                      "readConcern level \"snapshot\" prohibited for \"distinct\" command on"
+                      " sharded collection");
+        }
 
         std::vector<AsyncRequestsSender::Response> shardResponses;
         try {
@@ -175,7 +192,8 @@ public:
                 nss.db(),
                 nss,
                 routingInfo,
-                CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
+                applyReadWriteConcern(
+                    opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
                 ReadPreferenceSetting::get(opCtx),
                 Shard::RetryPolicy::kIdempotent,
                 query,
@@ -183,31 +201,28 @@ public:
         } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& ex) {
             auto parsedDistinct = ParsedDistinct::parse(
                 opCtx, ex->getNamespace(), cmdObj, ExtensionsCallbackNoop(), true);
-            if (!parsedDistinct.isOK()) {
-                return CommandHelpers::appendCommandStatus(result, parsedDistinct.getStatus());
-            }
+            uassertStatusOK(parsedDistinct.getStatus());
 
             auto aggCmdOnView = parsedDistinct.getValue().asAggregationCommand();
-            if (!aggCmdOnView.isOK()) {
-                return CommandHelpers::appendCommandStatus(result, aggCmdOnView.getStatus());
-            }
+            uassertStatusOK(aggCmdOnView.getStatus());
 
             auto aggRequestOnView = AggregationRequest::parseFromBSON(nss, aggCmdOnView.getValue());
-            if (!aggRequestOnView.isOK()) {
-                return CommandHelpers::appendCommandStatus(result, aggRequestOnView.getStatus());
-            }
+            uassertStatusOK(aggRequestOnView.getStatus());
 
             auto resolvedAggRequest = ex->asExpandedViewAggregation(aggRequestOnView.getValue());
             auto resolvedAggCmd = resolvedAggRequest.serializeToCommandObj().toBson();
+
+            if (auto txnRouter = TransactionRouter::get(opCtx)) {
+                txnRouter.onViewResolutionError(opCtx, nss);
+            }
 
             BSONObj aggResult = CommandHelpers::runCommandDirectly(
                 opCtx, OpMsgRequest::fromDBAndBody(dbName, std::move(resolvedAggCmd)));
 
             ViewResponseFormatter formatter(aggResult);
             auto formatStatus = formatter.appendAsDistinctResponse(&result);
-            if (!formatStatus.isOK()) {
-                return CommandHelpers::appendCommandStatus(result, formatStatus);
-            }
+            uassertStatusOK(formatStatus);
+
             return true;
         }
 
@@ -236,12 +251,19 @@ public:
         }
 
         BSONObjBuilder b(32);
-        int n = 0;
+        DecimalCounter<unsigned> n;
         for (auto&& obj : all) {
-            b.appendAs(obj.firstElement(), b.numStr(n++));
+            b.appendAs(obj.firstElement(), StringData{n});
+            ++n;
         }
 
         result.appendArray("values", b.obj());
+        // If mongos selected atClusterTime or received it from client, transmit it back.
+        if (!opCtx->inMultiDocumentTransaction() &&
+            repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime()) {
+            result.append("atClusterTime"_sd,
+                          repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime()->asTimestamp());
+        }
         return true;
     }
 

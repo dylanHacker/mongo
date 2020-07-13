@@ -1,15 +1,13 @@
 """Helper functions."""
 
-from __future__ import absolute_import
-from __future__ import print_function
-
 import contextlib
 import os.path
+import shutil
 import sys
 
 import yaml
 
-from . import archival
+from buildscripts.resmokelib.utils import archival
 
 
 @contextlib.contextmanager
@@ -38,14 +36,32 @@ def default_if_none(value, default):
     return value if value is not None else default
 
 
+def rmtree(path, **kwargs):
+    """Wrap shutil.rmtree."""
+    shutil.rmtree(path, **kwargs)
+
+
+def is_windows():
+    """Return True if Windows."""
+    return sys.platform.startswith("win32") or sys.platform.startswith("cygwin")
+
+
+def remove_if_exists(path):
+    """Remove path if it exists."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def is_string_list(lst):
     """Return true if 'lst' is a list of strings, and false otherwise."""
-    return isinstance(lst, list) and all(isinstance(x, basestring) for x in lst)
+    return isinstance(lst, list) and all(isinstance(x, str) for x in lst)
 
 
 def is_string_set(value):
     """Return true if 'value' is a set of strings, and false otherwise."""
-    return isinstance(value, set) and all(isinstance(x, basestring) for x in value)
+    return isinstance(value, set) and all(isinstance(x, str) for x in value)
 
 
 def is_js_file(filename):
@@ -65,6 +81,15 @@ def load_yaml_file(filename):
             return yaml.safe_load(fp)
     except yaml.YAMLError as err:
         raise ValueError("File '%s' contained invalid YAML: %s" % (filename, err))
+
+
+def dump_yaml_file(value, filename):
+    """Attempt to write YAML object to filename."""
+    try:
+        with open(filename, "w") as fp:
+            return yaml.safe_dump(value, fp)
+    except yaml.YAMLError as err:
+        raise ValueError("Could not write YAML to file '%s': %s" % (filename, err))
 
 
 def dump_yaml(value):

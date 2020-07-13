@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -35,12 +36,14 @@
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/client/read_preference.h"
+#include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/cursor_id.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/tailable_mode.h"
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/query/async_results_merger_params_gen.h"
 #include "mongo/util/net/hostandport.h"
@@ -53,6 +56,8 @@ class TaskExecutor;
 class OperationContext;
 class RouterExecStage;
 
+using repl::ReadConcernArgs;
+
 /**
  * The resulting ClusterClientCursor will take ownership of the existing remote cursor, generating
  * results based on the cursor's current state.
@@ -63,10 +68,14 @@ class RouterExecStage;
  */
 struct ClusterClientCursorParams {
     ClusterClientCursorParams(NamespaceString nss,
-                              boost::optional<ReadPreferenceSetting> readPref = boost::none)
+                              boost::optional<ReadPreferenceSetting> readPref = boost::none,
+                              boost::optional<ReadConcernArgs> readConcernArgs = boost::none)
         : nsString(std::move(nss)) {
         if (readPref) {
             readPreference = std::move(readPref.get());
+        }
+        if (readConcernArgs) {
+            readConcern = std::move(readConcernArgs.get());
         }
     }
 
@@ -76,15 +85,29 @@ struct ClusterClientCursorParams {
      */
     AsyncResultsMergerParams extractARMParams() {
         AsyncResultsMergerParams armParams;
-        if (!sort.isEmpty()) {
-            armParams.setSort(sort);
+        if (!sortToApplyOnRouter.isEmpty()) {
+            armParams.setSort(sortToApplyOnRouter);
         }
-        armParams.setCompareWholeSortKey(compareWholeSortKey);
+        armParams.setCompareWholeSortKey(compareWholeSortKeyOnRouter);
         armParams.setRemotes(std::move(remotes));
         armParams.setTailableMode(tailableMode);
         armParams.setBatchSize(batchSize);
         armParams.setNss(nsString);
         armParams.setAllowPartialResults(isAllowPartialResults);
+
+        OperationSessionInfoFromClient sessionInfo;
+        boost::optional<LogicalSessionFromClient> lsidFromClient;
+
+        if (lsid) {
+            lsidFromClient.emplace(lsid->getId());
+            lsidFromClient->setUid(lsid->getUid());
+        }
+
+        sessionInfo.setSessionId(lsidFromClient);
+        sessionInfo.setTxnNumber(txnNumber);
+        sessionInfo.setAutocommit(isAutoCommit);
+        armParams.setOperationSessionInfo(sessionInfo);
+
         return armParams;
     }
 
@@ -94,20 +117,23 @@ struct ClusterClientCursorParams {
     // The original command object which generated this cursor. Must either be empty or owned.
     BSONObj originatingCommandObj;
 
+    // The privileges required for the originatingCommand.
+    PrivilegeVector originatingPrivileges;
+
     // Per-remote node data.
     std::vector<RemoteCursor> remotes;
 
-    // The sort specification. Leave empty if there is no sort.
-    BSONObj sort;
+    // The sort specification to be applied on router. Leave empty if there is no sort.
+    BSONObj sortToApplyOnRouter;
 
-    // When 'compareWholeSortKey' is true, $sortKey is a scalar value, rather than an object. We
-    // extract the sort key {$sortKey: <value>}. The sort key pattern is verified to be {$sortKey:
-    // 1}.
-    bool compareWholeSortKey = false;
+    // When 'compareWholeSortKeyOnRouter' is true, $sortKey is a scalar value, rather than an
+    // object. We extract the sort key {$sortKey: <value>}. The sort key pattern is verified to be
+    // {$sortKey: 1}.
+    bool compareWholeSortKeyOnRouter = false;
 
-    // The number of results to skip. Optional. Should not be forwarded to the remote hosts in
-    // 'cmdObj'.
-    boost::optional<long long> skip;
+    // The number of results to skip on the router. Optional. Should not be forwarded to the remote
+    // hosts in 'cmdObj'.
+    boost::optional<long long> skipToApplyOnRouter;
 
     // The number of results per batch. Optional. If specified, will be specified as the batch for
     // each getMore.
@@ -117,9 +143,6 @@ struct ClusterClientCursorParams {
     // Should be forwarded to the remote hosts in 'cmdObj'.
     boost::optional<long long> limit;
 
-    // If set, we use this pipeline to merge the output of aggregations on each remote.
-    std::unique_ptr<Pipeline, PipelineDeleter> mergePipeline;
-
     // Whether this cursor is tailing a capped collection, and whether it has the awaitData option
     // set.
     TailableModeEnum tailableMode = TailableModeEnum::kNormal;
@@ -127,15 +150,21 @@ struct ClusterClientCursorParams {
     // Set if a readPreference must be respected throughout the lifetime of the cursor.
     boost::optional<ReadPreferenceSetting> readPreference;
 
-    // If valid, is called to return the RouterExecStage which becomes the initial source in this
-    // cursor's execution plan. Otherwise, a RouterStageMerge is used.
-    stdx::function<std::unique_ptr<RouterExecStage>(
-        OperationContext*, executor::TaskExecutor*, ClusterClientCursorParams*)>
-        createCustomCursorSource;
+    // Set if a readConcern must be respected throughout the lifetime of the cursor.
+    boost::optional<ReadConcernArgs> readConcern;
 
     // Whether the client indicated that it is willing to receive partial results in the case of an
     // unreachable host.
     bool isAllowPartialResults = false;
+
+    // The logical session id of the command that created the cursor.
+    boost::optional<LogicalSessionId> lsid;
+
+    // The transaction number of the command that created the cursor.
+    boost::optional<TxnNumber> txnNumber;
+
+    // Set to false for multi statement transactions.
+    boost::optional<bool> isAutoCommit;
 };
 
-}  // mongo
+}  // namespace mongo

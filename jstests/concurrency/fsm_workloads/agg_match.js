@@ -9,7 +9,6 @@ load('jstests/concurrency/fsm_libs/extend_workload.js');  // for extendWorkload
 load('jstests/concurrency/fsm_workloads/agg_base.js');    // for $config
 
 var $config = extendWorkload($config, function($config, $super) {
-
     $config.data.getOutCollName = function getOutCollName(collName) {
         return collName + '_out_agg_match';
     };
@@ -32,12 +31,6 @@ var $config = extendWorkload($config, function($config, $super) {
         // doesn't exist, only one $out can create it, and the others will see their target has been
         // changed, and throw an error.
         assertWhenOwnColl.commandWorked(db.runCommand({create: this.getOutCollName(collName)}));
-    };
-
-    $config.teardown = function teardown(db, collName, cluster) {
-        $super.teardown.apply(this, arguments);
-
-        assertWhenOwnColl(db[this.getOutCollName(collName)].drop());
     };
 
     return $config;

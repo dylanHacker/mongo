@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,7 +33,8 @@
 
 #include "mongo/db/keys_collection_client.h"
 #include "mongo/db/keys_collection_document.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -45,7 +47,7 @@ StatusWith<KeysCollectionDocument> KeysCollectionCache::refresh(OperationContext
     decltype(_cache)::size_type originalSize = 0;
 
     {
-        stdx::lock_guard<stdx::mutex> lk(_cacheMutex);
+        stdx::lock_guard<Latch> lk(_cacheMutex);
         auto iter = _cache.crbegin();
         if (iter != _cache.crend()) {
             newerThanThis = iter->second.getExpiresAt();
@@ -54,7 +56,16 @@ StatusWith<KeysCollectionDocument> KeysCollectionCache::refresh(OperationContext
         originalSize = _cache.size();
     }
 
-    auto refreshStatus = _client->getNewKeys(opCtx, _purpose, newerThanThis);
+    // Don't allow this to read during initial sync because it will read at the initialDataTimestamp
+    // and that could conflict with reconstructing prepared transactions using the
+    // initialDataTimestamp as the prepareTimestamp.
+    if (repl::ReplicationCoordinator::get(opCtx) &&
+        repl::ReplicationCoordinator::get(opCtx)->getMemberState().startup2()) {
+        return {ErrorCodes::InitialSyncActive,
+                "Cannot refresh keys collection cache during initial sync"};
+    }
+
+    auto refreshStatus = _client->getNewKeys(opCtx, _purpose, newerThanThis, true);
 
     if (!refreshStatus.isOK()) {
         return refreshStatus.getStatus();
@@ -62,7 +73,7 @@ StatusWith<KeysCollectionDocument> KeysCollectionCache::refresh(OperationContext
 
     auto& newKeys = refreshStatus.getValue();
 
-    stdx::lock_guard<stdx::mutex> lk(_cacheMutex);
+    stdx::lock_guard<Latch> lk(_cacheMutex);
     if (originalSize > _cache.size()) {
         // _cache cleared while we getting the new keys, just return the newest key without
         // touching the _cache so the next refresh will populate it properly.
@@ -85,7 +96,7 @@ StatusWith<KeysCollectionDocument> KeysCollectionCache::refresh(OperationContext
 
 StatusWith<KeysCollectionDocument> KeysCollectionCache::getKeyById(long long keyId,
                                                                    const LogicalTime& forThisTime) {
-    stdx::lock_guard<stdx::mutex> lk(_cacheMutex);
+    stdx::lock_guard<Latch> lk(_cacheMutex);
 
     for (auto iter = _cache.lower_bound(forThisTime); iter != _cache.cend(); ++iter) {
         if (iter->second.getKeyId() == keyId) {
@@ -95,14 +106,12 @@ StatusWith<KeysCollectionDocument> KeysCollectionCache::getKeyById(long long key
 
     return {ErrorCodes::KeyNotFound,
             str::stream() << "Cache Reader No keys found for " << _purpose
-                          << " that is valid for time: "
-                          << forThisTime.toString()
-                          << " with id: "
-                          << keyId};
+                          << " that is valid for time: " << forThisTime.toString()
+                          << " with id: " << keyId};
 }
 
 StatusWith<KeysCollectionDocument> KeysCollectionCache::getKey(const LogicalTime& forThisTime) {
-    stdx::lock_guard<stdx::mutex> lk(_cacheMutex);
+    stdx::lock_guard<Latch> lk(_cacheMutex);
 
     auto iter = _cache.upper_bound(forThisTime);
 
@@ -117,7 +126,7 @@ StatusWith<KeysCollectionDocument> KeysCollectionCache::getKey(const LogicalTime
 void KeysCollectionCache::resetCache() {
     // keys that read with non majority readConcern level can be rolled back.
     if (!_client->supportsMajorityReads()) {
-        stdx::lock_guard<stdx::mutex> lk(_cacheMutex);
+        stdx::lock_guard<Latch> lk(_cacheMutex);
         _cache.clear();
     }
 }

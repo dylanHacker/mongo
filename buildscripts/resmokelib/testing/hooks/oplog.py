@@ -1,10 +1,8 @@
 """Test hook for verifying members of a replica set have matching oplogs."""
 
-from __future__ import absolute_import
-
 import os.path
 
-from . import jsfile
+from buildscripts.resmokelib.testing.hooks import jsfile
 
 
 class CheckReplOplogs(jsfile.DataConsistencyHook):  # pylint: disable=non-parent-init-called,super-init-not-called

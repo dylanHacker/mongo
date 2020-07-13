@@ -133,6 +133,25 @@
         assert.eq(true, called, 'called should not have been udpated');
     });
 
+    tests.push(function assertShouldAcceptObjectAsMsg() {
+        const objMsg = {someMessage: 1};
+        const err = assert.throws(() => {
+            assert(false, objMsg);
+        });
+
+        assert.neq(-1,
+                   err.message.indexOf(tojson(objMsg)),
+                   'Error message should have included ' + tojson(objMsg));
+    });
+
+    tests.push(function assertShouldNotAcceptNonObjStringFunctionAsMsg() {
+        const err = assert.throws(() => {
+            assert(true, 1234);
+        });
+
+        assert.neq(-1, err.message.indexOf("msg parameter must be a "));
+    });
+
     /* assert.automsg tests */
 
     tests.push(function automsgShouldPassToAssert() {
@@ -289,7 +308,7 @@
         assert.throws(() => {
             assert.soon(() => {
                 return false;
-            }, 'assert message', kSmallTimeoutMS, kSmallRetryIntervalMS);
+            }, 'assert message', kSmallTimeoutMS, kSmallRetryIntervalMS, {runHangAnalyzer: false});
         });
     });
 
@@ -323,7 +342,7 @@
         assert.throws(() => {
             assert.soonNoExcept(() => {
                 throw new Error('failed');
-            }, 'assert message', kSmallTimeoutMS, kSmallRetryIntervalMS);
+            }, 'assert message', kSmallTimeoutMS, kSmallRetryIntervalMS, {runHangAnalyzer: false});
         });
     });
 
@@ -344,7 +363,9 @@
         assert.throws(() => {
             assert.retry(() => {
                 return false;
-            }, 'assert message', kDefaultRetryAttempts, kSmallRetryIntervalMS);
+            }, 'assert message', kDefaultRetryAttempts, kSmallRetryIntervalMS, {
+                runHangAnalyzer: false
+            });
         });
     });
 
@@ -368,7 +389,9 @@
         assert.throws(() => {
             assert.retryNoExcept(() => {
                 throw new Error('failed');
-            }, 'assert message', kDefaultRetryAttempts, kSmallRetryIntervalMS);
+            }, 'assert message', kDefaultRetryAttempts, kSmallRetryIntervalMS, {
+                runHangAnalyzer: false
+            });
         });
     });
 
@@ -386,7 +409,7 @@
         assert.throws(() => {
             assert.time(() => {
                 return true;
-            }, 'assert message', -5 * 60 * 1000);
+            }, 'assert message', -5 * 60 * 1000, {runHangAnalyzer: false});
         });
     });
 
@@ -570,6 +593,157 @@
         assert.throws(() => {
             assert.betweenEx(3, 5, 5);
         });
+    });
+
+    /* assert.sameMembers tests */
+
+    tests.push(function sameMembersFailsWithInvalidArguments() {
+        assert.throws(() => assert.sameMembers());
+        assert.throws(() => assert.sameMembers([]));
+        assert.throws(() => assert.sameMembers({}, {}));
+        assert.throws(() => assert.sameMembers(1, 1));
+    });
+
+    tests.push(function sameMembersFailsWhenLengthsDifferent() {
+        assert.throws(() => assert.sameMembers([], [1]));
+        assert.throws(() => assert.sameMembers([], [1]));
+        assert.throws(() => assert.sameMembers([1, 2], [1]));
+        assert.throws(() => assert.sameMembers([1], [1, 2]));
+    });
+
+    tests.push(function sameMembersFailsWhenCountsOfDuplicatesDifferent() {
+        assert.throws(() => assert.sameMembers([1, 1], [1, 2]));
+        assert.throws(() => assert.sameMembers([1, 2], [1, 1]));
+    });
+
+    tests.push(function sameMembersFailsWithDifferentObjects() {
+        assert.throws(() => assert.sameMembers([{_id: 0, a: 0}], [{_id: 0, a: 1}]));
+        assert.throws(() => assert.sameMembers([{_id: 1, a: 0}], [{_id: 0, a: 0}]));
+        assert.throws(() => {
+            assert.sameMembers([{a: [{b: 0, c: 0}], _id: 0}], [{_id: 0, a: [{c: 0, b: 1}]}]);
+        });
+    });
+
+    tests.push(function sameMembersFailsWithDifferentBSONTypes() {
+        assert.throws(() => {
+            assert.sameMembers([new BinData(0, "JANgqwetkqwklEWRbWERKKJREtbq")],
+                               [new BinData(0, "xxxgqwetkqwklEWRbWERKKJREtbq")]);
+        });
+        assert.throws(() => assert.sameMembers([new Timestamp(0, 1)], [new Timestamp(0, 2)]));
+    });
+
+    tests.push(function sameMembersFailsWithCustomCompareFn() {
+        const compareBinaryEqual = (a, b) => bsonBinaryEqual(a, b);
+        assert.throws(() => {
+            assert.sameMembers([NumberLong(1)], [1], undefined /*msg*/, compareBinaryEqual);
+        });
+        assert.throws(() => {
+            assert.sameMembers([NumberLong(1), NumberInt(2)],
+                               [2, NumberLong(1)],
+                               undefined /*msg*/,
+                               compareBinaryEqual);
+        });
+    });
+
+    tests.push(function sameMembersDoesNotSortNestedArrays() {
+        assert.throws(() => assert.sameMembers([[1, 2]], [[2, 1]]));
+        assert.throws(() => {
+            assert.sameMembers([{a: [{b: 0}, {b: 1, c: 0}], _id: 0}],
+                               [{_id: 0, a: [{c: 0, b: 1}, {b: 0}]}]);
+        });
+    });
+
+    tests.push(function sameMembersPassesWithEmptyArrays() {
+        assert.sameMembers([], []);
+    });
+
+    tests.push(function sameMembersPassesSingleElement() {
+        assert.sameMembers([1], [1]);
+    });
+
+    tests.push(function sameMembersPassesWithSameOrder() {
+        assert.sameMembers([1, 2], [1, 2]);
+        assert.sameMembers([1, 2, 3], [1, 2, 3]);
+    });
+
+    tests.push(function sameMembersPassesWithDifferentOrder() {
+        assert.sameMembers([2, 1], [1, 2]);
+        assert.sameMembers([1, 2, 3], [3, 1, 2]);
+    });
+
+    tests.push(function sameMembersPassesWithDuplicates() {
+        assert.sameMembers([1, 1, 2], [1, 1, 2]);
+        assert.sameMembers([1, 1, 2], [1, 2, 1]);
+        assert.sameMembers([2, 1, 1], [1, 1, 2]);
+    });
+
+    tests.push(function sameMembersPassesWithSortedNestedArrays() {
+        assert.sameMembers([[1, 2]], [[1, 2]]);
+        assert.sameMembers([{a: [{b: 0}, {b: 1, c: 0}], _id: 0}],
+                           [{_id: 0, a: [{b: 0}, {c: 0, b: 1}]}]);
+    });
+
+    tests.push(function sameMembersPassesWithObjects() {
+        assert.sameMembers([{_id: 0, a: 0}], [{_id: 0, a: 0}]);
+        assert.sameMembers([{_id: 0, a: 0}, {_id: 1}], [{_id: 0, a: 0}, {_id: 1}]);
+        assert.sameMembers([{_id: 0, a: 0}, {_id: 1}], [{_id: 1}, {_id: 0, a: 0}]);
+    });
+
+    tests.push(function sameMembersPassesWithUnsortedObjects() {
+        assert.sameMembers([{a: 0, _id: 1}], [{_id: 1, a: 0}]);
+        assert.sameMembers([{a: [{b: 1, c: 0}], _id: 0}], [{_id: 0, a: [{c: 0, b: 1}]}]);
+    });
+
+    tests.push(function sameMembersPassesWithBSONTypes() {
+        assert.sameMembers([new BinData(0, "JANgqwetkqwklEWRbWERKKJREtbq")],
+                           [new BinData(0, "JANgqwetkqwklEWRbWERKKJREtbq")]);
+        assert.sameMembers([new Timestamp(0, 1)], [new Timestamp(0, 1)]);
+    });
+
+    tests.push(function sameMembersPassesWithOtherTypes() {
+        assert.sameMembers([null], [null]);
+        assert.sameMembers([undefined], [undefined]);
+        assert.sameMembers(["a"], ["a"]);
+        assert.sameMembers([null, undefined, "a"], [undefined, "a", null]);
+    });
+
+    tests.push(function sameMembersDefaultCompareIsFriendly() {
+        assert.sameMembers([NumberLong(1), NumberInt(2)], [2, 1]);
+    });
+
+    tests.push(function sameMembersPassesWithCustomCompareFn() {
+        const compareBinaryEqual = (a, b) => bsonBinaryEqual(a, b);
+        assert.sameMembers([[1, 2]], [[1, 2]], undefined /*msg*/, compareBinaryEqual);
+        assert.sameMembers([NumberLong(1), NumberInt(2)],
+                           [NumberInt(2), NumberLong(1)],
+                           undefined /*msg*/,
+                           compareBinaryEqual);
+    });
+
+    tests.push(function assertCallsHangAnalyzer() {
+        function runAssertTest(f) {
+            const oldMongoRunner = MongoRunner;
+            let runs = 0;
+            try {
+                MongoRunner.runHangAnalyzer = function() {
+                    ++runs;
+                };
+                f();
+                assert(false);
+            } catch (e) {
+                assert.eq(runs, 1);
+            } finally {
+                MongoRunner = oldMongoRunner;
+            }
+        }
+        runAssertTest(() => assert.soon(
+                          () => false, 'assert message', kSmallTimeoutMS, kSmallRetryIntervalMS));
+        runAssertTest(
+            () => assert.retry(
+                () => false, 'assert message', kDefaultRetryAttempts, kSmallRetryIntervalMS));
+        runAssertTest(() => assert.time(() => sleep(5),
+                                        'assert message',
+                                        1 /* we certainly take less than this */));
     });
 
     /* main */

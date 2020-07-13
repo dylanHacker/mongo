@@ -1,58 +1,66 @@
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
 #include "repair_database_and_check_version.h"
 
+#include <functional>
+
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog/database.h"
-#include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/multi_index_block.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/commands/feature_compatibility_version_documentation.h"
 #include "mongo/db/commands/feature_compatibility_version_parser.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
+#include "mongo/db/index_builds_coordinator.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/query/internal_plans.h"
+#include "mongo/db/rebuild_indexes.h"
 #include "mongo/db/repair_database.h"
-#include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_process.h"
+#include "mongo/db/repl_set_member_in_standalone_mode.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
-#include "mongo/util/log.h"
+#include "mongo/db/storage/durable_catalog.h"
+#include "mongo/db/storage/storage_repair_observer.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/exit.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/quick_exit.h"
-#include "mongo/util/version.h"
 
 #if !defined(_WIN32)
 #include <sys/file.h>
@@ -60,14 +68,16 @@
 
 namespace mongo {
 
-using logger::LogComponent;
-using std::endl;
+// Exit after repair has started, but before data is repaired.
+MONGO_FAIL_POINT_DEFINE(exitBeforeDataRepair);
+// Exit after repairing data, but before the replica set configuration is invalidated.
+MONGO_FAIL_POINT_DEFINE(exitBeforeRepairInvalidatesConfig);
 
 namespace {
 
 const std::string mustDowngradeErrorMsg = str::stream()
-    << "UPGRADE PROBLEM: The data files need to be fully upgraded to version 3.6 before attempting "
-       "an upgrade to 4.0; see "
+    << "UPGRADE PROBLEM: The data files need to be fully upgraded to version 4.4 before attempting "
+       "an upgrade to 4.5.1; see "
     << feature_compatibility_version_documentation::kUpgradeLink << " for more details.";
 
 Status restoreMissingFeatureCompatibilityVersionDocument(OperationContext* opCtx,
@@ -76,23 +86,27 @@ Status restoreMissingFeatureCompatibilityVersionDocument(OperationContext* opCtx
 
     // If the admin database, which contains the server configuration collection with the
     // featureCompatibilityVersion document, does not exist, create it.
-    Database* db = dbHolder().get(opCtx, fcvNss.db());
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+    auto db = databaseHolder->getDb(opCtx, fcvNss.db());
     if (!db) {
-        log() << "Re-creating admin database that was dropped.";
+        LOGV2(20998, "Re-creating admin database that was dropped.");
     }
-    db = dbHolder().openDb(opCtx, fcvNss.db());
+    db = databaseHolder->openDb(opCtx, fcvNss.db());
     invariant(db);
 
     // If the server configuration collection, which contains the FCV document, does not exist, then
     // create it.
-    if (!db->getCollection(opCtx, NamespaceString::kServerConfigurationNamespace)) {
-        log() << "Re-creating the server configuration collection (admin.system.version) that was "
-                 "dropped.";
+    if (!CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+            opCtx, NamespaceString::kServerConfigurationNamespace)) {
+        LOGV2(20999,
+              "Re-creating the server configuration collection (admin.system.version) that was "
+              "dropped.");
         uassertStatusOK(
             createCollection(opCtx, fcvNss.db().toString(), BSON("create" << fcvNss.coll())));
     }
 
-    Collection* fcvColl = db->getCollection(opCtx, NamespaceString::kServerConfigurationNamespace);
+    Collection* fcvColl = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+        opCtx, NamespaceString::kServerConfigurationNamespace);
     invariant(fcvColl);
 
     // Restore the featureCompatibilityVersion document if it is missing.
@@ -101,12 +115,16 @@ Status restoreMissingFeatureCompatibilityVersionDocument(OperationContext* opCtx
                           fcvColl,
                           BSON("_id" << FeatureCompatibilityVersionParser::kParameterName),
                           featureCompatibilityVersion)) {
-        log() << "Re-creating featureCompatibilityVersion document that was deleted with version "
-              << FeatureCompatibilityVersionParser::kVersion36 << ".";
+        LOGV2(21000,
+              "Re-creating featureCompatibilityVersion document that was deleted. Creating new "
+              "document with version "
+              "{FeatureCompatibilityVersionParser_kVersion44}.",
+              "Re-creating featureCompatibilityVersion document that was deleted",
+              "version"_attr = FeatureCompatibilityVersionParser::kVersion44);
 
         BSONObj fcvObj = BSON("_id" << FeatureCompatibilityVersionParser::kParameterName
                                     << FeatureCompatibilityVersionParser::kVersionField
-                                    << FeatureCompatibilityVersionParser::kVersion36);
+                                    << FeatureCompatibilityVersionParser::kVersion44);
 
         writeConflictRetry(opCtx, "insertFCVDocument", fcvNss.ns(), [&] {
             WriteUnitOfWork wunit(opCtx);
@@ -126,201 +144,350 @@ Status restoreMissingFeatureCompatibilityVersionDocument(OperationContext* opCtx
 }
 
 /**
- * Checks that all replicated collections in the given list of 'dbNames' have UUIDs. Returns a
- * MustDowngrade error status if any do not.
- *
- * Additionally assigns UUIDs to any non-replicated collections that are missing UUIDs.
+ * Returns true if the collection associated with the given CollectionCatalogEntry has an index on
+ * the _id field
  */
-Status ensureAllCollectionsHaveUUIDs(OperationContext* opCtx,
-                                     const std::vector<std::string>& dbNames) {
-    bool isMmapV1 = opCtx->getServiceContext()->getGlobalStorageEngine()->isMmapV1();
-    std::vector<NamespaceString> nonReplicatedCollNSSsWithoutUUIDs;
+bool checkIdIndexExists(OperationContext* opCtx, RecordId catalogId) {
+    auto durableCatalog = DurableCatalog::get(opCtx);
+    auto indexCount = durableCatalog->getTotalIndexCount(opCtx, catalogId);
+    auto indexNames = std::vector<std::string>(indexCount);
+    durableCatalog->getAllIndexes(opCtx, catalogId, &indexNames);
+
+    for (auto name : indexNames) {
+        if (name == "_id_") {
+            return true;
+        }
+    }
+    return false;
+}
+
+Status buildMissingIdIndex(OperationContext* opCtx, Collection* collection) {
+    MultiIndexBlock indexer;
+    auto abortOnExit = makeGuard(
+        [&] { indexer.abortIndexBuild(opCtx, collection, MultiIndexBlock::kNoopOnCleanUpFn); });
+
+    const auto indexCatalog = collection->getIndexCatalog();
+    const auto idIndexSpec = indexCatalog->getDefaultIdIndexSpec();
+
+    auto swSpecs = indexer.init(opCtx, collection, idIndexSpec, MultiIndexBlock::kNoopOnInitFn);
+    if (!swSpecs.isOK()) {
+        return swSpecs.getStatus();
+    }
+
+    auto status = indexer.insertAllDocumentsInCollection(opCtx, collection);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    status = indexer.checkConstraints(opCtx);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    WriteUnitOfWork wuow(opCtx);
+    status = indexer.commit(
+        opCtx, collection, MultiIndexBlock::kNoopOnCreateEachFn, MultiIndexBlock::kNoopOnCommitFn);
+    wuow.commit();
+    abortOnExit.dismiss();
+    return status;
+}
+
+
+/**
+ * Checks that all collections in the given list of 'dbNames' have valid properties for this version
+ * of MongoDB.
+ *
+ * This validates that all collections have UUIDs and an _id index. If a collection is missing an
+ * _id index, this function will build it.
+ *
+ * Returns a MustDowngrade error if any collections are missing UUIDs.
+ * Returns a MustDowngrade error if any index builds on the required _id field fail.
+ */
+Status ensureCollectionProperties(OperationContext* opCtx,
+                                  const std::vector<std::string>& dbNames) {
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+    auto downgradeError = Status{ErrorCodes::MustDowngrade, mustDowngradeErrorMsg};
+    invariant(opCtx->lockState()->isW());
+
     for (const auto& dbName : dbNames) {
-        Database* db = dbHolder().openDb(opCtx, dbName);
+        auto db = databaseHolder->openDb(opCtx, dbName);
         invariant(db);
-        for (auto collectionIt = db->begin(); collectionIt != db->end(); ++collectionIt) {
-            Collection* coll = *collectionIt;
-            if (!coll->uuid()) {
-                // system.indexes and system.namespaces don't currently have UUIDs in MMAP.
-                // SERVER-29926 and SERVER-30095 will address this problem.
-                if (isMmapV1 && (coll->ns().coll() == "system.indexes" ||
-                                 coll->ns().coll() == "system.namespaces")) {
-                    continue;
-                }
 
-                if (!coll->ns().isReplicated()) {
-                    nonReplicatedCollNSSsWithoutUUIDs.push_back(coll->ns());
-                    continue;
-                }
+        for (auto collIt = db->begin(opCtx); collIt != db->end(opCtx); ++collIt) {
+            auto coll = *collIt;
+            if (!coll) {
+                break;
+            }
 
-                // We expect all collections to have UUIDs starting in FCV 3.6, so if we are missing
-                // a UUID then the user never upgraded to FCV 3.6 and this startup attempt is
-                // illegal.
-                return {ErrorCodes::MustDowngrade, mustDowngradeErrorMsg};
+            // All user-created replicated collections created since MongoDB 4.0 have _id indexes.
+            auto requiresIndex = coll->requiresIdIndex() && coll->ns().isReplicated();
+            auto collOptions =
+                DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, coll->getCatalogId());
+            auto hasAutoIndexIdField = collOptions.autoIndexId == CollectionOptions::YES;
+
+            // Even if the autoIndexId field is not YES, the collection may still have an _id index
+            // that was created manually by the user. Check the list of indexes to confirm index
+            // does not exist before attempting to build it or returning an error.
+            if (requiresIndex && !hasAutoIndexIdField &&
+                !checkIdIndexExists(opCtx, coll->getCatalogId())) {
+                LOGV2(21001,
+                      "collection {coll_ns} is missing an _id index; building it now",
+                      "Collection is missing an _id index; building it now",
+                      logAttrs(*coll));
+                auto status = buildMissingIdIndex(opCtx, coll);
+                if (!status.isOK()) {
+                    LOGV2_ERROR(21021,
+                                "could not build an _id index on collection {coll_ns}: {error}",
+                                "Could not build an _id index on collection",
+                                logAttrs(*coll),
+                                "error"_attr = status);
+                    return downgradeError;
+                }
             }
         }
     }
-
-    // Non-replicated collections are very easy to fix since they don't require a replication or
-    // sharding solution. So, regardless of what the cause might have been, we go ahead and add
-    // UUIDs to them to ensure UUID dependent code works.
-    //
-    // Note: v3.6 arbiters do not have UUIDs, so this code is necessary to add them on upgrade to
-    // v4.0.
-    for (const auto& collNSS : nonReplicatedCollNSSsWithoutUUIDs) {
-        uassertStatusOK(
-            collModForUUIDUpgrade(opCtx, collNSS, BSON("collMod" << collNSS.coll()), UUID::gen()));
-    }
-
     return Status::OK();
 }
 
 const NamespaceString startupLogCollectionName("local.startup_log");
-const NamespaceString kSystemReplSetCollection("local.system.replset");
 
 /**
- * Checks if this server was started without --replset but has a config in local.system.replset
- * (meaning that this is probably a replica set member started in stand-alone mode).
- *
- * @returns the number of documents in local.system.replset or 0 if this was started with
- *          --replset.
+ * Returns 'true' if this server has a configuration document in local.system.replset.
  */
-unsigned long long checkIfReplMissingFromCommandLine(OperationContext* opCtx) {
-    // This is helpful for the query below to work as you can't open files when readlocked
+bool hasReplSetConfigDoc(OperationContext* opCtx) {
     Lock::GlobalWrite lk(opCtx);
-    if (!repl::ReplicationCoordinator::get(getGlobalServiceContext())
-             ->getSettings()
-             .usingReplSets()) {
-        DBDirectClient c(opCtx);
-        return c.count(kSystemReplSetCollection.ns());
-    }
-    return 0;
+    BSONObj config;
+    return Helpers::getSingleton(
+        opCtx, NamespaceString::kSystemReplSetNamespace.ns().c_str(), config);
 }
 
 /**
-* Check that the oplog is capped, and abort the process if it is not.
-* Caller must lock DB before calling this function.
-*/
+ * Check that the oplog is capped, and abort the process if it is not.
+ * Caller must lock DB before calling this function.
+ */
 void checkForCappedOplog(OperationContext* opCtx, Database* db) {
     const NamespaceString oplogNss(NamespaceString::kRsOplogNamespace);
     invariant(opCtx->lockState()->isDbLockedForMode(oplogNss.db(), MODE_IS));
-    Collection* oplogCollection = db->getCollection(opCtx, oplogNss);
+    Collection* oplogCollection =
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, oplogNss);
     if (oplogCollection && !oplogCollection->isCapped()) {
-        severe() << "The oplog collection " << oplogNss
-                 << " is not capped; a capped oplog is a requirement for replication to function.";
-        fassertFailedNoTrace(40115);
+        LOGV2_FATAL_NOTRACE(
+            40115,
+            "The oplog collection {oplogNamespace} is not capped; a capped oplog is a "
+            "requirement for replication to function.",
+            "The oplog collection is not capped; a capped oplog is a "
+            "requirement for replication to function.",
+            "oplogNamespace"_attr = oplogNss);
     }
 }
+
+void rebuildIndexes(OperationContext* opCtx, StorageEngine* storageEngine) {
+    auto reconcileResult = fassert(40593, storageEngine->reconcileCatalogAndIdents(opCtx));
+
+    // Determine which indexes need to be rebuilt. rebuildIndexesOnCollection() requires that all
+    // indexes on that collection are done at once, so we use a map to group them together.
+    StringMap<IndexNameObjs> nsToIndexNameObjMap;
+    for (auto&& idxIdentifier : reconcileResult.indexesToRebuild) {
+        NamespaceString collNss = idxIdentifier.nss;
+        const std::string& indexName = idxIdentifier.indexName;
+        auto swIndexSpecs =
+            getIndexNameObjs(opCtx, idxIdentifier.catalogId, [&indexName](const std::string& name) {
+                return name == indexName;
+            });
+        if (!swIndexSpecs.isOK() || swIndexSpecs.getValue().first.empty()) {
+            fassert(40590,
+                    {ErrorCodes::InternalError,
+                     str::stream() << "failed to get index spec for index " << indexName
+                                   << " in collection " << collNss.toString()});
+        }
+
+        auto& indexesToRebuild = swIndexSpecs.getValue();
+        invariant(indexesToRebuild.first.size() == 1 && indexesToRebuild.second.size() == 1,
+                  str::stream() << "Num Index Names: " << indexesToRebuild.first.size()
+                                << " Num Index Objects: " << indexesToRebuild.second.size());
+        auto& ino = nsToIndexNameObjMap[collNss.ns()];
+        ino.first.emplace_back(std::move(indexesToRebuild.first.back()));
+        ino.second.emplace_back(std::move(indexesToRebuild.second.back()));
+    }
+
+    for (const auto& entry : nsToIndexNameObjMap) {
+        NamespaceString collNss(entry.first);
+
+        auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, collNss);
+        for (const auto& indexName : entry.second.first) {
+            LOGV2(21004,
+                  "Rebuilding index. Collection: {collNss} Index: {indexName}",
+                  "Rebuilding index",
+                  "namespace"_attr = collNss,
+                  "index"_attr = indexName);
+        }
+
+        std::vector<BSONObj> indexSpecs = entry.second.second;
+        fassert(40592, rebuildIndexesOnCollection(opCtx, collection, indexSpecs, RepairData::kNo));
+    }
+
+
+    // Two-phase index builds depend on a replicated 'commitIndexBuild' oplog entry to commit.
+    // Therefore, when a replica set member is started in standalone mode, we cannot restart the
+    // index build.
+    if (getReplSetMemberInStandaloneMode(opCtx->getServiceContext())) {
+        LOGV2(21005, "Not restarting unfinished index builds because we are in standalone mode");
+        return;
+    }
+
+    // Once all unfinished indexes have been rebuilt, restart any unfinished index builds. This will
+    // not build any indexes to completion, but rather start the background thread to build the
+    // index, and wait for a replicated commit or abort oplog entry.
+    IndexBuildsCoordinator::get(opCtx)->restartIndexBuildsForRecovery(
+        opCtx, reconcileResult.indexBuildsToRestart);
+}
+
+/**
+ * Sets the appropriate flag on the service context decorable 'replSetMemberInStandaloneMode' to
+ * 'true' if this is a replica set node running in standalone mode, otherwise 'false'.
+ */
+void setReplSetMemberInStandaloneMode(OperationContext* opCtx) {
+    const repl::ReplSettings& replSettings =
+        repl::ReplicationCoordinator::get(opCtx)->getSettings();
+
+    if (replSettings.usingReplSets()) {
+        // Not in standalone mode.
+        setReplSetMemberInStandaloneMode(opCtx->getServiceContext(), false);
+        return;
+    }
+
+    invariant(opCtx->lockState()->isW());
+    Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+        opCtx, NamespaceString::kSystemReplSetNamespace);
+    if (collection && collection->numRecords(opCtx) > 0) {
+        setReplSetMemberInStandaloneMode(opCtx->getServiceContext(), true);
+        return;
+    }
+
+    setReplSetMemberInStandaloneMode(opCtx->getServiceContext(), false);
+}
+
 }  // namespace
 
 /**
-* Return an error status if the wrong mongod version was used for these datafiles. The boolean
-* represents whether there are non-local databases.
-*/
-StatusWith<bool> repairDatabasesAndCheckVersion(OperationContext* opCtx) {
-    LOG(1) << "enter repairDatabases (to check pdfile version #)";
-
-    auto const storageEngine = opCtx->getServiceContext()->getGlobalStorageEngine();
-
+ * Return whether there are non-local databases. If there was an error becauses the wrong mongod
+ * version was used for these datafiles, a DBException with status ErrorCodes::MustDowngrade is
+ * thrown.
+ */
+bool repairDatabasesAndCheckVersion(OperationContext* opCtx) {
+    auto const storageEngine = opCtx->getServiceContext()->getStorageEngine();
     Lock::GlobalWrite lk(opCtx);
 
-    std::vector<std::string> dbNames;
-    storageEngine->listDatabases(&dbNames);
+    std::vector<std::string> dbNames = storageEngine->listDatabases();
 
-    // Rebuilding indexes must be done before a database can be opened.
-    if (!storageGlobalParams.readOnly) {
-        StatusWith<std::vector<StorageEngine::CollectionIndexNamePair>> swIndexesToRebuild =
-            storageEngine->reconcileCatalogAndIdents(opCtx);
-        fassert(40593, swIndexesToRebuild);
-
-        if (!swIndexesToRebuild.getValue().empty() && serverGlobalParams.indexBuildRetry) {
-            log() << "note: restart the server with --noIndexBuildRetry "
-                  << "to skip index rebuilds";
-        }
-
-        if (!serverGlobalParams.indexBuildRetry) {
-            log() << "  not rebuilding interrupted indexes";
-            swIndexesToRebuild.getValue().clear();
-        }
-
-        for (auto&& collIndexPair : swIndexesToRebuild.getValue()) {
-            const std::string& coll = collIndexPair.first;
-            const std::string& indexName = collIndexPair.second;
-            DatabaseCatalogEntry* dbce =
-                storageEngine->getDatabaseCatalogEntry(opCtx, NamespaceString(coll).db());
-            invariant(dbce);
-            CollectionCatalogEntry* cce = dbce->getCollectionCatalogEntry(coll);
-            invariant(cce);
-
-            StatusWith<IndexNameObjs> swIndexToRebuild(
-                getIndexNameObjs(opCtx, dbce, cce, [&indexName](const std::string& str) {
-                    return str == indexName;
-                }));
-            if (!swIndexToRebuild.isOK() || swIndexToRebuild.getValue().first.empty()) {
-                severe() << "Unable to get indexes for collection. Collection: " << coll;
-                fassertFailedNoTrace(40590);
-            }
-
-            invariant(swIndexToRebuild.getValue().first.size() == 1 &&
-                      swIndexToRebuild.getValue().second.size() == 1);
-            fassert(40592,
-                    rebuildIndexesOnCollection(opCtx, dbce, cce, swIndexToRebuild.getValue()));
-        }
+    // Rebuilding indexes must be done before a database can be opened, except when using repair,
+    // which rebuilds all indexes when it is done.
+    if (!storageGlobalParams.readOnly && !storageGlobalParams.repair) {
+        // Determine whether this is a replica set node running in standalone mode. If we're in
+        // repair mode, we cannot set the flag yet as it needs to open a database and look through a
+        // collection. Rebuild the necessary indexes after setting the flag.
+        setReplSetMemberInStandaloneMode(opCtx);
+        rebuildIndexes(opCtx, storageEngine);
     }
 
-    bool repairVerifiedAllCollectionsHaveUUIDs = false;
+    bool ensuredCollectionProperties = false;
 
     // Repair all databases first, so that we do not try to open them if they are in bad shape
+    auto databaseHolder = DatabaseHolder::get(opCtx);
     if (storageGlobalParams.repair) {
         invariant(!storageGlobalParams.readOnly);
+
+        if (MONGO_unlikely(exitBeforeDataRepair.shouldFail())) {
+            LOGV2(21006, "Exiting because 'exitBeforeDataRepair' fail point was set.");
+            quickExit(EXIT_ABRUPT);
+        }
+
+        // Ensure that the local database is repaired first, if it exists, so that we can open it
+        // before any other database to be able to determine if this is a replica set node running
+        // in standalone mode before rebuilding any indexes.
+        auto dbNamesIt = std::find(dbNames.begin(), dbNames.end(), NamespaceString::kLocalDb);
+        if (dbNamesIt != dbNames.end()) {
+            std::swap(dbNames.front(), *dbNamesIt);
+            invariant(dbNames.front() == NamespaceString::kLocalDb);
+        }
+
         for (const auto& dbName : dbNames) {
-            LOG(1) << "    Repairing database: " << dbName;
-            fassert(18506, repairDatabase(opCtx, storageEngine, dbName));
+            LOGV2_DEBUG(21007, 1, "    Repairing database: {dbName}", "dbName"_attr = dbName);
+            fassertNoTrace(18506, repairDatabase(opCtx, storageEngine, dbName));
+
+            if (dbName == NamespaceString::kLocalDb) {
+                setReplSetMemberInStandaloneMode(opCtx);
+            }
         }
 
         // All collections must have UUIDs before restoring the FCV document to a version that
         // requires UUIDs.
-        Status uuidsStatus = ensureAllCollectionsHaveUUIDs(opCtx, dbNames);
-        if (!uuidsStatus.isOK()) {
-            return uuidsStatus;
-        }
-        repairVerifiedAllCollectionsHaveUUIDs = true;
+        uassertStatusOK(ensureCollectionProperties(opCtx, dbNames));
+        ensuredCollectionProperties = true;
 
         // Attempt to restore the featureCompatibilityVersion document if it is missing.
         NamespaceString fcvNSS(NamespaceString::kServerConfigurationNamespace);
 
-        Database* db = dbHolder().get(opCtx, fcvNSS.db());
+        auto db = databaseHolder->getDb(opCtx, fcvNSS.db());
         Collection* versionColl;
         BSONObj featureCompatibilityVersion;
-        if (!db || !(versionColl = db->getCollection(opCtx, fcvNSS)) ||
+        if (!db ||
+            !(versionColl =
+                  CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, fcvNSS)) ||
             !Helpers::findOne(opCtx,
                               versionColl,
                               BSON("_id" << FeatureCompatibilityVersionParser::kParameterName),
                               featureCompatibilityVersion)) {
-            auto status = restoreMissingFeatureCompatibilityVersionDocument(opCtx, dbNames);
-            if (!status.isOK()) {
-                return status;
-            }
+            uassertStatusOK(restoreMissingFeatureCompatibilityVersionDocument(opCtx, dbNames));
         }
     }
 
-    // All collections must have UUIDs.
-    if (!repairVerifiedAllCollectionsHaveUUIDs) {
-        Status uuidsStatus = ensureAllCollectionsHaveUUIDs(opCtx, dbNames);
-        if (!uuidsStatus.isOK()) {
-            return uuidsStatus;
-        }
+    if (!ensuredCollectionProperties) {
+        uassertStatusOK(ensureCollectionProperties(opCtx, dbNames));
     }
 
     if (!storageGlobalParams.readOnly) {
-        // We open the "local" database before calling checkIfReplMissingFromCommandLine() to
-        // ensure the in-memory catalog entries for the 'kSystemReplSetCollection' collection have
-        // been populated if the collection exists. If the "local" database didn't exist at this
-        // point yet, then it will be created. If the mongod is running in a read-only mode, then
-        // it is fine to not open the "local" database and populate the catalog entries because we
-        // won't attempt to drop the temporary collections anyway.
-        Lock::DBLock dbLock(opCtx, kSystemReplSetCollection.db(), MODE_X);
-        dbHolder().openDb(opCtx, kSystemReplSetCollection.db());
+        // We open the "local" database before calling hasReplSetConfigDoc() to ensure the in-memory
+        // catalog entries for the 'kSystemReplSetNamespace' collection have been populated if the
+        // collection exists. If the "local" database didn't exist at this point yet, then it will
+        // be created. If the mongod is running in a read-only mode, then it is fine to not open the
+        // "local" database and populate the catalog entries because we won't attempt to drop the
+        // temporary collections anyway.
+        Lock::DBLock dbLock(opCtx, NamespaceString::kSystemReplSetNamespace.db(), MODE_X);
+        databaseHolder->openDb(opCtx, NamespaceString::kSystemReplSetNamespace.db());
+    }
+
+    if (storageGlobalParams.repair) {
+        if (MONGO_unlikely(exitBeforeRepairInvalidatesConfig.shouldFail())) {
+            LOGV2(21008, "Exiting because 'exitBeforeRepairInvalidatesConfig' fail point was set.");
+            quickExit(EXIT_ABRUPT);
+        }
+        // This must be done after opening the "local" database as it modifies the replica set
+        // config.
+        auto repairObserver = StorageRepairObserver::get(opCtx->getServiceContext());
+        repairObserver->onRepairDone(opCtx);
+        if (repairObserver->getModifications().size() > 0) {
+            const auto& mods = repairObserver->getModifications();
+            for (const auto& mod : mods) {
+                LOGV2_WARNING(
+                    21019, "repairModification", "description"_attr = mod.getDescription());
+            }
+        }
+        if (repairObserver->isDataInvalidated()) {
+            if (hasReplSetConfigDoc(opCtx)) {
+                LOGV2_WARNING(
+                    21020,
+                    "WARNING: Repair may have modified replicated data. This node will no "
+                    "longer be able to join a replica set without a full re-sync");
+            }
+        }
+
+        // There were modifications, but only benign ones.
+        if (repairObserver->getModifications().size() > 0 && !repairObserver->isDataInvalidated()) {
+            LOGV2(21009,
+                  "Repair has made modifications to unreplicated data. The data is healthy and "
+                  "the node is eligible to be returned to the replica set.");
+        }
     }
 
     const repl::ReplSettings& replSettings =
@@ -331,7 +498,7 @@ StatusWith<bool> repairDatabasesAndCheckVersion(OperationContext* opCtx) {
     // to. The local DB is special because it is not replicated.  See SERVER-10927 for more
     // details.
     const bool shouldClearNonLocalTmpCollections =
-        !(checkIfReplMissingFromCommandLine(opCtx) || replSettings.usingReplSets());
+        !(hasReplSetConfigDoc(opCtx) || replSettings.usingReplSets());
 
     // To check whether a featureCompatibilityVersion document exists.
     bool fcvDocumentExists = false;
@@ -340,20 +507,26 @@ StatusWith<bool> repairDatabasesAndCheckVersion(OperationContext* opCtx) {
     bool nonLocalDatabases = false;
 
     // Refresh list of database names to include newly-created admin, if it exists.
-    dbNames.clear();
-    storageEngine->listDatabases(&dbNames);
+    dbNames = storageEngine->listDatabases();
+
+    // We want to recover the admin database first so we can load the FCV early since
+    // some collection validation may depend on the FCV being set.
+    if (auto it = std::find(dbNames.begin(), dbNames.end(), "admin"); it != dbNames.end()) {
+        std::swap(*it, dbNames.front());
+    }
+
     for (const auto& dbName : dbNames) {
         if (dbName != "local") {
             nonLocalDatabases = true;
         }
-        LOG(1) << "    Recovering database: " << dbName;
+        LOGV2_DEBUG(21010, 1, "    Recovering database: {dbName}", "dbName"_attr = dbName);
 
-        Database* db = dbHolder().openDb(opCtx, dbName);
+        auto db = databaseHolder->openDb(opCtx, dbName);
         invariant(db);
 
         // First thing after opening the database is to check for file compatibility,
         // otherwise we might crash if this is a deprecated format.
-        auto status = db->getDatabaseCatalogEntry()->currentFilesCompatible(opCtx);
+        auto status = storageEngine->currentFilesCompatible(opCtx);
         if (!status.isOK()) {
             if (status.code() == ErrorCodes::CanRepairToDowngrade) {
                 // Convert CanRepairToDowngrade statuses to MustUpgrade statuses to avoid logging a
@@ -363,11 +536,15 @@ StatusWith<bool> repairDatabasesAndCheckVersion(OperationContext* opCtx) {
                 // current version of mongod with --repair and then proceed with normal startup.
                 status = {ErrorCodes::MustUpgrade, status.reason()};
             }
-            severe() << "Unable to start mongod due to an incompatibility with the data files and"
-                        " this version of mongod: "
-                     << redact(status);
-            severe() << "Please consult our documentation when trying to downgrade to a previous"
-                        " major release";
+            LOGV2_FATAL_CONTINUE(
+                21023,
+                "Unable to start mongod due to an incompatibility with the data files and"
+                " this version of mongod: {error}. Please consult our documentation when trying "
+                "to downgrade to a previous major release",
+                "Unable to start mongod due to an incompatibility with the data files and"
+                " this version of mongod. Please consult our documentation when trying "
+                "to downgrade to a previous major release",
+                "error"_attr = redact(status));
             quickExit(EXIT_NEED_UPGRADE);
             MONGO_UNREACHABLE;
         }
@@ -376,8 +553,8 @@ StatusWith<bool> repairDatabasesAndCheckVersion(OperationContext* opCtx) {
         // If the server configuration collection already contains a valid
         // featureCompatibilityVersion document, cache it in-memory as a server parameter.
         if (dbName == "admin") {
-            if (Collection* versionColl =
-                    db->getCollection(opCtx, NamespaceString::kServerConfigurationNamespace)) {
+            if (Collection* versionColl = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+                    opCtx, NamespaceString::kServerConfigurationNamespace)) {
                 BSONObj featureCompatibilityVersion;
                 if (Helpers::findOne(
                         opCtx,
@@ -386,91 +563,64 @@ StatusWith<bool> repairDatabasesAndCheckVersion(OperationContext* opCtx) {
                         featureCompatibilityVersion)) {
                     auto swVersion =
                         FeatureCompatibilityVersionParser::parse(featureCompatibilityVersion);
-                    if (!swVersion.isOK()) {
-                        severe() << swVersion.getStatus();
-                        // Note this error path captures all cases of an FCV document existing,
-                        // but with any value other than "3.6" or "4.0". This includes unexpected
-                        // cases with no path forward such as the FCV value not being a string.
-                        return {ErrorCodes::MustDowngrade,
-                                str::stream()
-                                    << "UPGRADE PROBLEM: Unable to parse the "
-                                       "featureCompatibilityVersion document. The data files need "
-                                       "to be fully upgraded to version 3.6 before attempting an "
-                                       "upgrade to 4.0. If you are upgrading to 4.0, see "
-                                    << feature_compatibility_version_documentation::kUpgradeLink
-                                    << "."};
-                    }
+                    // Note this error path captures all cases of an FCV document existing,
+                    // but with any value other than "4.4" or "4.6". This includes unexpected
+                    // cases with no path forward such as the FCV value not being a string.
+                    uassert(ErrorCodes::MustDowngrade,
+                            str::stream()
+                                << "UPGRADE PROBLEM: Found an invalid "
+                                   "featureCompatibilityVersion document (ERROR: "
+                                << swVersion.getStatus()
+                                << "). If the current featureCompatibilityVersion is below "
+                                   "4.4, see the documentation on upgrading at "
+                                << feature_compatibility_version_documentation::kUpgradeLink << ".",
+                            swVersion.isOK());
+
                     fcvDocumentExists = true;
                     auto version = swVersion.getValue();
                     serverGlobalParams.featureCompatibility.setVersion(version);
                     FeatureCompatibilityVersion::updateMinWireVersion();
 
-                    // On startup, if the version is in an upgrading or downrading state, print a
+                    // On startup, if the version is in an upgrading or downgrading state, print a
                     // warning.
                     if (version ==
-                        ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo40) {
-                        log() << "** WARNING: A featureCompatibilityVersion upgrade did not "
-                              << "complete. " << startupWarningsLog;
-                        log() << "**          The current featureCompatibilityVersion is "
-                              << FeatureCompatibilityVersionParser::toString(version) << "."
-                              << startupWarningsLog;
-                        log() << "**          To fix this, use the setFeatureCompatibilityVersion "
-                              << "command to resume upgrade to 4.0." << startupWarningsLog;
-                    } else if (version == ServerGlobalParams::FeatureCompatibility::Version::
-                                              kDowngradingTo36) {
-                        log() << "** WARNING: A featureCompatibilityVersion downgrade did not "
-                              << "complete. " << startupWarningsLog;
-                        log() << "**          The current featureCompatibilityVersion is "
-                              << FeatureCompatibilityVersionParser::toString(version) << "."
-                              << startupWarningsLog;
-                        log() << "**          To fix this, use the setFeatureCompatibilityVersion "
-                              << "command to resume downgrade to 3.6." << startupWarningsLog;
+                        ServerGlobalParams::FeatureCompatibility::Version::kUpgradingFrom44To451) {
+                        LOGV2_WARNING_OPTIONS(
+                            21011,
+                            {logv2::LogTag::kStartupWarnings},
+                            "A featureCompatibilityVersion upgrade did not complete. The current "
+                            "featureCompatibilityVersion is "
+                            "{currentfeatureCompatibilityVersion}. To fix this, use the "
+                            "setFeatureCompatibilityVersion command to resume upgrade to 4.5.1.",
+                            "A featureCompatibilityVersion upgrade did not complete. To fix this, "
+                            "use the "
+                            "setFeatureCompatibilityVersion command to resume upgrade to 4.5.1",
+                            "currentfeatureCompatibilityVersion"_attr =
+                                FeatureCompatibilityVersionParser::toString(version));
+                    } else if (version ==
+                               ServerGlobalParams::FeatureCompatibility::Version::
+                                   kDowngradingFrom451To44) {
+                        LOGV2_WARNING_OPTIONS(
+                            21014,
+                            {logv2::LogTag::kStartupWarnings},
+                            "A featureCompatibilityVersion downgrade did not complete. The current "
+                            "featureCompatibilityVersion is "
+                            "{currentfeatureCompatibilityVersion}. To fix this, use the "
+                            "setFeatureCompatibilityVersion command to resume downgrade to 4.4.",
+                            "A featureCompatibilityVersion downgrade did not complete. To fix "
+                            "this, use the setFeatureCompatibilityVersion command to resume "
+                            "downgrade to 4.4",
+                            "currentfeatureCompatibilityVersion"_attr =
+                                FeatureCompatibilityVersionParser::toString(version));
                     }
                 }
             }
         }
 
-        // Major versions match, check indexes
-        const NamespaceString systemIndexes(db->name(), "system.indexes");
-
-        Collection* coll = db->getCollection(opCtx, systemIndexes);
-        auto exec = InternalPlanner::collectionScan(
-            opCtx, systemIndexes.ns(), coll, PlanExecutor::NO_YIELD);
-
-        BSONObj index;
-        PlanExecutor::ExecState state;
-        while (PlanExecutor::ADVANCED == (state = exec->getNext(&index, NULL))) {
-            const BSONObj key = index.getObjectField("key");
-            const auto plugin = IndexNames::findPluginName(key);
-
-            if (db->getDatabaseCatalogEntry()->isOlderThan24(opCtx)) {
-                if (IndexNames::existedBefore24(plugin)) {
-                    continue;
-                }
-
-                log() << "Index " << index << " claims to be of type '" << plugin << "', "
-                      << "which is either invalid or did not exist before v2.4. "
-                      << "See the upgrade section: "
-                      << "http://dochub.mongodb.org/core/upgrade-2.4" << startupWarningsLog;
-            }
-
-            if (index["v"].isNumber() && index["v"].numberInt() == 0) {
-                log() << "WARNING: The index: " << index << " was created with the deprecated"
-                      << " v:0 format.  This format will not be supported in a future release."
-                      << startupWarningsLog;
-                log() << "\t To fix this, you need to rebuild this index."
-                      << " For instructions, see http://dochub.mongodb.org/core/rebuild-v0-indexes"
-                      << startupWarningsLog;
-            }
-        }
-
-        // Non-yielding collection scans from InternalPlanner will never error.
-        invariant(PlanExecutor::IS_EOF == state);
-
         if (replSettings.usingReplSets()) {
             // We only care about _id indexes and drop-pending collections if we are in a replset.
-            checkForIdIndexesAndDropPendingCollections(opCtx, db);
-            // Ensure oplog is capped (mmap does not guarantee order of inserts on noncapped
+            db->checkForIdIndexesAndDropPendingCollections(opCtx);
+            // Ensure oplog is capped (mongodb does not guarantee order of inserts on noncapped
             // collections)
             if (db->name() == "local") {
                 checkForCappedOplog(opCtx, db);
@@ -483,66 +633,23 @@ StatusWith<bool> repairDatabasesAndCheckVersion(OperationContext* opCtx) {
         }
     }
 
+    auto replProcess = repl::ReplicationProcess::get(opCtx);
+    auto needInitialSync = false;
+    if (auto initialSyncFlag = false; replProcess) {
+        initialSyncFlag = replProcess->getConsistencyMarkers()->getInitialSyncFlag(opCtx);
+        // The node did not complete the last initial sync. We should attempt initial sync again.
+        needInitialSync = initialSyncFlag && replSettings.usingReplSets();
+    }
     // Fail to start up if there is no featureCompatibilityVersion document and there are non-local
-    // databases present.
-    if (!fcvDocumentExists && nonLocalDatabases) {
-        severe()
-            << "Unable to start up mongod due to missing featureCompatibilityVersion document.";
-        if (opCtx->getServiceContext()->getGlobalStorageEngine()->isMmapV1()) {
-            severe() << "Please run with --journalOptions "
-                     << static_cast<int>(MMAPV1Options::JournalRecoverOnly)
-                     << " to recover the journal. Then run with --repair to restore the document.";
-        } else {
-            severe() << "Please run with --repair to restore the document.";
-        }
-        fassertFailedNoTrace(40652);
+    // databases present and we do not need to start up via initial sync.
+    if (!fcvDocumentExists && nonLocalDatabases && !needInitialSync) {
+        LOGV2_FATAL_NOTRACE(40652,
+                            "Unable to start up mongod due to missing featureCompatibilityVersion "
+                            "document. Please run with --repair to restore the document.");
     }
 
-    LOG(1) << "done repairDatabases";
+    LOGV2_DEBUG(21017, 1, "done repairDatabases");
     return nonLocalDatabases;
-}
-
-/**
- * If we are in a replset, every replicated collection must have an _id index.
- * As we scan each database, we also gather a list of drop-pending collection namespaces for
- * the DropPendingCollectionReaper to clean up eventually.
- */
-void checkForIdIndexesAndDropPendingCollections(OperationContext* opCtx, Database* db) {
-    if (db->name() == "local") {
-        // Collections in the local database are not replicated, so we do not need an _id index on
-        // any collection. For the same reason, it is not possible for the local database to contain
-        // any drop-pending collections (drops are effective immediately).
-        return;
-    }
-
-    std::list<std::string> collectionNames;
-    db->getDatabaseCatalogEntry()->getCollectionNamespaces(&collectionNames);
-
-    for (const auto& collectionName : collectionNames) {
-        const NamespaceString ns(collectionName);
-
-        if (ns.isDropPendingNamespace()) {
-            auto dropOpTime = fassert(40459, ns.getDropPendingNamespaceOpTime());
-            log() << "Found drop-pending namespace " << ns << " with drop optime " << dropOpTime;
-            repl::DropPendingCollectionReaper::get(opCtx)->addDropPendingNamespace(dropOpTime, ns);
-        }
-
-        if (ns.isSystem())
-            continue;
-
-        Collection* coll = db->getCollection(opCtx, collectionName);
-        if (!coll)
-            continue;
-
-        if (coll->getIndexCatalog()->findIdIndex(opCtx))
-            continue;
-
-        log() << "WARNING: the collection '" << collectionName << "' lacks a unique index on _id."
-              << " This index is needed for replication to function properly" << startupWarningsLog;
-        log() << "\t To fix this, you need to create a unique index on _id."
-              << " See http://dochub.mongodb.org/core/build-replica-set-indexes"
-              << startupWarningsLog;
-    }
 }
 
 }  // namespace mongo

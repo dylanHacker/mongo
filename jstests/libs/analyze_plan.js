@@ -26,13 +26,21 @@ function getPlanStages(root, stage) {
         }
     }
 
+    if ("queryPlanner" in root) {
+        results = results.concat(getPlanStages(root.queryPlanner.winningPlan, stage));
+    }
+
     if ("shards" in root) {
-        for (var i = 0; i < root.shards.length; i++) {
-            if ("winningPlan" in root.shards[i]) {
-                results = results.concat(getPlanStages(root.shards[i].winningPlan, stage));
-            } else {
-                results = results.concat(getPlanStages(root.shards[i].executionStages, stage));
-            }
+        if (Array.isArray(root.shards)) {
+            results = root.shards.reduce(
+                (res, shard) => res.concat(getPlanStages(
+                    shard.hasOwnProperty("winningPlan") ? shard.winningPlan : shard.executionStages,
+                    stage)),
+                results);
+        } else {
+            const shards = Object.keys(root.shards);
+            results = shards.reduce(
+                (res, shard) => res.concat(getPlanStages(root.shards[shard], stage)), results);
         }
     }
 
@@ -58,6 +66,22 @@ function getPlanStage(root, stage) {
 }
 
 /**
+ * Returns the set of rejected plans from the given replset or sharded explain output.
+ */
+function getRejectedPlans(root) {
+    if (root.queryPlanner.winningPlan.hasOwnProperty("shards")) {
+        const rejectedPlans = [];
+        for (let shard of root.queryPlanner.winningPlan.shards) {
+            for (let rejectedPlan of shard.rejectedPlans) {
+                rejectedPlans.push(Object.assign({shardName: shard.shardName}, rejectedPlan));
+            }
+        }
+        return rejectedPlans;
+    }
+    return root.queryPlanner.rejectedPlans;
+}
+
+/**
  * Given the root stage of explain's JSON representation of a query plan ('root'), returns true if
  * the query planner reports at least one rejected alternative plan, and false otherwise.
  */
@@ -74,11 +98,13 @@ function hasRejectedPlans(root) {
     }
 
     if (root.hasOwnProperty("shards")) {
-        // This is a sharded agg explain.
-        const cursorStages = getAggPlanStages(root, "$cursor");
-        assert(cursorStages.length !== 0, "Did not find any $cursor stages in sharded agg explain");
-        return cursorStages.find((cursorStage) => cursorStageHasRejectedPlans(cursorStage)) !==
-            undefined;
+        // This is a sharded agg explain. Recursively check whether any of the shards has rejected
+        // plans.
+        const shardExplains = [];
+        for (const shard in root.shards) {
+            shardExplains.push(root.shards[shard]);
+        }
+        return shardExplains.some(hasRejectedPlans);
     } else if (root.hasOwnProperty("stages")) {
         // This is an agg explain.
         const cursorStages = getAggPlanStages(root, "$cursor");
@@ -100,6 +126,22 @@ function hasRejectedPlans(root) {
 }
 
 /**
+ * Returns an array of execution stages from the given replset or sharded explain output.
+ */
+function getExecutionStages(root) {
+    if (root.executionStats.executionStages.hasOwnProperty("shards")) {
+        const executionStages = [];
+        for (let shard of root.executionStats.executionStages.shards) {
+            executionStages.push(Object.assign(
+                {shardName: shard.shardName, executionSuccess: shard.executionSuccess},
+                shard.executionStages));
+        }
+        return executionStages;
+    }
+    return [root.executionStats.executionStages];
+}
+
+/**
  * Given the root stage of agg explain's JSON representation of a query plan ('root'), returns all
  * subdocuments whose stage is 'stage'. This can either be an agg stage name like "$cursor" or
  * "$sort", or a query stage name like "IXSCAN" or "SORT".
@@ -114,11 +156,30 @@ function getAggPlanStages(root, stage) {
         let results = [];
         for (let i = 0; i < docSourceArray.length; i++) {
             let properties = Object.getOwnPropertyNames(docSourceArray[i]);
-            assert.eq(1, properties.length);
             if (properties[0] === stage) {
                 results.push(docSourceArray[i]);
             }
         }
+        return results;
+    }
+
+    function getStagesFromQueryLayerOutput(queryLayerOutput) {
+        let results = [];
+
+        assert(queryLayerOutput.hasOwnProperty("queryPlanner"));
+        assert(queryLayerOutput.queryPlanner.hasOwnProperty("winningPlan"));
+
+        // If execution stats are available, then use the execution stats tree. Otherwise use the
+        // plan info from the "queryPlanner" section.
+        if (queryLayerOutput.hasOwnProperty("executionStats")) {
+            assert(queryLayerOutput.executionStats.hasOwnProperty("executionStages"));
+            results = results.concat(
+                getPlanStages(queryLayerOutput.executionStats.executionStages, stage));
+        } else {
+            results =
+                results.concat(getPlanStages(queryLayerOutput.queryPlanner.winningPlan, stage));
+        }
+
         return results;
     }
 
@@ -127,25 +188,47 @@ function getAggPlanStages(root, stage) {
 
         results = results.concat(getDocumentSources(root.stages));
 
-        assert(root.stages[0].hasOwnProperty("$cursor"));
-        assert(root.stages[0].$cursor.hasOwnProperty("queryPlanner"));
-        assert(root.stages[0].$cursor.queryPlanner.hasOwnProperty("winningPlan"));
-        results =
-            results.concat(getPlanStages(root.stages[0].$cursor.queryPlanner.winningPlan, stage));
+        if (root.stages[0].hasOwnProperty("$cursor")) {
+            results = results.concat(getStagesFromQueryLayerOutput(root.stages[0].$cursor));
+        } else if (root.stages[0].hasOwnProperty("$geoNearCursor")) {
+            results = results.concat(getStagesFromQueryLayerOutput(root.stages[0].$geoNearCursor));
+        }
     }
 
     if (root.hasOwnProperty("shards")) {
         for (let elem in root.shards) {
+            if (root.shards[elem].hasOwnProperty("queryPlanner")) {
+                // The shard was able to optimize away the pipeline, which means that the format of
+                // the explain output doesn't have the "stages" array.
+                assert.eq(true, root.shards[elem].queryPlanner.optimizedPipeline);
+                results = results.concat(getStagesFromQueryLayerOutput(root.shards[elem]));
+
+                // Move onto the next shard.
+                continue;
+            }
+
+            if (!root.shards[elem].hasOwnProperty("stages")) {
+                continue;
+            }
+
             assert(root.shards[elem].stages.constructor === Array);
 
             results = results.concat(getDocumentSources(root.shards[elem].stages));
 
-            assert(root.shards[elem].stages[0].hasOwnProperty("$cursor"));
-            assert(root.shards[elem].stages[0].$cursor.hasOwnProperty("queryPlanner"));
-            assert(root.shards[elem].stages[0].$cursor.queryPlanner.hasOwnProperty("winningPlan"));
-            results = results.concat(
-                getPlanStages(root.shards[elem].stages[0].$cursor.queryPlanner.winningPlan, stage));
+            const firstStage = root.shards[elem].stages[0];
+            if (firstStage.hasOwnProperty("$cursor")) {
+                results = results.concat(getStagesFromQueryLayerOutput(firstStage.$cursor));
+            } else if (firstStage.hasOwnProperty("$geoNearCursor")) {
+                results = results.concat(getStagesFromQueryLayerOutput(firstStage.$geoNearCursor));
+            }
         }
+    }
+
+    // If the agg pipeline was completely optimized away, then the agg explain output will be
+    // formatted like the explain output for a find command.
+    if (root.hasOwnProperty("queryPlanner")) {
+        assert.eq(true, root.queryPlanner.optimizedPipeline);
+        results = results.concat(getStagesFromQueryLayerOutput(root));
     }
 
     return results;
@@ -231,6 +314,34 @@ function isCollscan(db, root) {
 }
 
 /**
+ * Returns true if the BSON representation of a plan rooted at 'root' is using the aggregation
+ * framework, and false otherwise.
+ */
+function isAggregationPlan(root) {
+    if (root.hasOwnProperty("shards")) {
+        const shards = Object.keys(root.shards);
+        return shards.reduce(
+                   (res, shard) => res + root.shards[shard].hasOwnProperty("stages") ? 1 : 0, 0) >
+            0;
+    }
+    return root.hasOwnProperty("stages");
+}
+
+/**
+ * Returns true if the BSON representation of a plan rooted at 'root' is using just the query layer,
+ * and false otherwise.
+ */
+function isQueryPlan(root) {
+    if (root.hasOwnProperty("shards")) {
+        const shards = Object.keys(root.shards);
+        return shards.reduce(
+                   (res, shard) => res + root.shards[shard].hasOwnProperty("queryPlanner") ? 1 : 0,
+                   0) > 0;
+    }
+    return root.hasOwnProperty("queryPlanner");
+}
+
+/**
  * Get the number of chunk skips for the BSON exec stats tree rooted at 'root'.
  */
 function getChunkSkips(root) {
@@ -250,8 +361,8 @@ function getChunkSkips(root) {
 }
 
 /**
- * Given explain output at executionStats level verbosity, confirms that the root stage is COUNT and
- * that the result of the count is equal to 'expectedCount'.
+ * Given explain output at executionStats level verbosity, confirms that the root stage is COUNT or
+ * RECORD_STORE_FAST_COUNT and that the result of the count is equal to 'expectedCount'.
  */
 function assertExplainCount({explainResults, expectedCount}) {
     const execStages = explainResults.executionStats.executionStages;
@@ -263,12 +374,14 @@ function assertExplainCount({explainResults, expectedCount}) {
         let totalCounted = 0;
         for (let shardExplain of execStages.shards) {
             const countStage = shardExplain.executionStages;
-            assert.eq(countStage.stage, "COUNT", "root stage on shard is not COUNT");
+            assert(countStage.stage === "COUNT" || countStage.stage === "RECORD_STORE_FAST_COUNT",
+                   "root stage on shard is not COUNT or RECORD_STORE_FAST_COUNT");
             totalCounted += countStage.nCounted;
         }
         assert.eq(totalCounted, expectedCount, "wrong count result");
     } else {
-        assert.eq(execStages.stage, "COUNT", "root stage is not COUNT");
+        assert(execStages.stage === "COUNT" || execStages.stage === "RECORD_STORE_FAST_COUNT",
+               "root stage on shard is not COUNT or RECORD_STORE_FAST_COUNT");
         assert.eq(execStages.nCounted, expectedCount, "wrong count result");
     }
 }
@@ -286,4 +399,23 @@ function assertCoveredQueryAndCount({collection, query, project, count}) {
     assert(isIndexOnly(db, explain.queryPlanner.winningPlan),
            "Winning plan for count was not covered: " + tojson(explain.queryPlanner.winningPlan));
     assertExplainCount({explainResults: explain, expectedCount: count});
+}
+
+/**
+ * Runs explain() operation on 'cmdObj' and verifies that all the stages in 'expectedStages' are
+ * present exactly once in the plan returned. When 'stagesNotExpected' array is passed, also
+ * verifies that none of those stages are present in the explain() plan.
+ */
+function assertStagesForExplainOfCommand({coll, cmdObj, expectedStages, stagesNotExpected}) {
+    const plan = assert.commandWorked(coll.runCommand({explain: cmdObj}));
+    const winningPlan = plan.queryPlanner.winningPlan;
+    for (let expectedStage of expectedStages) {
+        assert(planHasStage(coll.getDB(), winningPlan, expectedStage),
+               "Could not find stage " + expectedStage + ". Plan: " + tojson(plan));
+    }
+    for (let stage of (stagesNotExpected || [])) {
+        assert(!planHasStage(coll.getDB(), winningPlan, stage),
+               "Found stage " + stage + " when not expected. Plan: " + tojson(plan));
+    }
+    return plan;
 }

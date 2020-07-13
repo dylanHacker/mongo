@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,6 +31,8 @@
 
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sbe/stages/plan_stats.h"
+#include "mongo/db/exec/sbe/stages/stages.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/explain_options.h"
 #include "mongo/db/query/plan_executor.h"
@@ -57,6 +60,8 @@ public:
      *
      * The explain information is generated with the level of detail specified by 'verbosity'.
      *
+     * The 'extraInfo' parameter specifies additional information to include into the output.
+     *
      * Does not take ownership of its arguments.
      *
      * The caller should hold at least an IS lock on the collection the that the query runs on,
@@ -68,6 +73,7 @@ public:
     static void explainStages(PlanExecutor* exec,
                               const Collection* collection,
                               ExplainOptions::Verbosity verbosity,
+                              BSONObj extraInfo,
                               BSONObjBuilder* out);
     /**
      * Adds "queryPlanner" and "executionStats" (if requested in verbosity) fields to 'out'. Unlike
@@ -77,6 +83,7 @@ public:
      * - 'collection' is the relevant collection. The caller should hold at least an IS lock on the
      * collection which the query ran on, even 'collection' is nullptr.
      * - 'verbosity' is the verbosity level of the explain.
+     * - 'extraInfo' specifies additional information to include into the output.
      * - 'executePlanStatus' is the status returned after executing the query (Status::OK if the
      * query wasn't executed).
      * - 'winningPlanTrialStats' is the stats of the winning plan during the trial period. May be
@@ -88,6 +95,7 @@ public:
                               ExplainOptions::Verbosity verbosity,
                               Status executePlanStatus,
                               PlanStageStats* winningPlanTrialStats,
+                              BSONObj extraInfo,
                               BSONObjBuilder* out);
 
     /**
@@ -122,6 +130,9 @@ public:
     static BSONObj statsToBSON(
         const PlanStageStats& stats,
         ExplainOptions::Verbosity verbosity = ExplainOptions::Verbosity::kExecStats);
+    static BSONObj statsToBSON(
+        const sbe::PlanStageStats& stats,
+        ExplainOptions::Verbosity verbosity = ExplainOptions::Verbosity::kExecStats);
 
     /**
      * This version of stats tree to BSON conversion returns the result through the
@@ -140,6 +151,7 @@ public:
      */
     static std::string getPlanSummary(const PlanExecutor* exec);
     static std::string getPlanSummary(const PlanStage* root);
+    static std::string getPlanSummary(const sbe::PlanStage* root);
 
     /**
      * Fills out 'statsOut' with summary stats using the execution tree contained
@@ -164,6 +176,29 @@ public:
      **/
     static std::unique_ptr<PlanStageStats> getWinningPlanTrialStats(PlanExecutor* exec);
 
+    /**
+     * Generates the execution stats section for the stats tree 'stats', adding the resulting BSON
+     * to 'out'.
+     *
+     * The 'totalTimeMillis' value passed here will be added to the top level of the execution stats
+     * section, but will not affect the reporting of timing for individual stages. If
+     * 'totalTimeMillis' is not set, we use the approximate timing information collected by the
+     * stages.
+     *
+     * Stats are generated at the verbosity specified by 'verbosity'.
+     **/
+    static void generateSinglePlanExecutionInfo(const PlanStageStats* stats,
+                                                ExplainOptions::Verbosity verbosity,
+                                                boost::optional<long long> totalTimeMillis,
+                                                BSONObjBuilder* out);
+
+    /**
+     * Serializes a PlanCacheEntry to the provided BSON object builder. The output format is
+     * intended to be human readable, and useful for debugging query performance problems related to
+     * the plan cache.
+     */
+    static void planCacheEntryToBSON(const PlanCacheEntry& entry, BSONObjBuilder* out);
+
 private:
     /**
      * Adds the 'queryPlanner' explain section to the BSON object being built
@@ -174,10 +209,12 @@ private:
      * - 'exec' is the stage tree for the operation being explained.
      * - 'collection' is the collection used in the operation. The caller should hold an IS lock on
      * the collection which the query is for, even if 'collection' is nullptr.
+     * - 'extraInfo' specifies additional information to include into the output.
      * - 'out' is a builder for the explain output.
      */
     static void generatePlannerInfo(PlanExecutor* exec,
                                     const Collection* collection,
+                                    BSONObj extraInfo,
                                     BSONObjBuilder* out);
 
     /**
@@ -205,32 +242,6 @@ private:
                                       Status executePlanStatus,
                                       PlanStageStats* winningPlanTrialStats,
                                       BSONObjBuilder* out);
-
-    /**
-     * Generates the execution stats section for the stats tree 'stats',
-     * adding the resulting BSON to 'out'.
-     *
-     * The 'totalTimeMillis' value passed here will be added to the top level of
-     * the execution stats section, but will not affect the reporting of timing for
-     * individual stages. If 'totalTimeMillis' is not set, we use the approximate timing
-     * information collected by the stages.
-     *
-     * Stats are generated at the verbosity specified by 'verbosity'.
-     *
-     * This is a helper for generating explain BSON. It is used by generateExecutionInfo().
-     */
-    static void generateSinglePlanExecutionInfo(const PlanStageStats* stats,
-                                                ExplainOptions::Verbosity verbosity,
-                                                boost::optional<long long> totalTimeMillis,
-                                                BSONObjBuilder* out);
-
-    /**
-     * Adds the 'serverInfo' explain section to the BSON object being build
-     * by 'out'.
-     *
-     * This is a helper for generating explain BSON. It is used by explainStages(...).
-     */
-    static void generateServerInfo(BSONObjBuilder* out);
 };
 
-}  // namespace
+}  // namespace mongo

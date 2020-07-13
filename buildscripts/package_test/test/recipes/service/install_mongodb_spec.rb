@@ -15,7 +15,7 @@ describe command("#{service} mongod start") do
   its('exit_status') { should eq 0 }
 end
 
-# Inspec treats all amazon linux as upstart, we explicitly make it use 
+# Inspec treats all amazon linux as upstart, we explicitly make it use
 # systemd_service https://github.com/chef/inspec/issues/2639
 if (os[:name] == 'amazon' and os[:release] == '2.0')
   describe systemd_service('mongod') do
@@ -55,10 +55,9 @@ else
   end
 end
 
-if os[:arch] == 'x86_64' and
-  (os[:name] == 'ubuntu' and
-   (os[:release][0...5] == '14.04' or os[:release][0...5] == '16.04')) or
-  (os[:family] == 'redhat' and os[:release][0] == '7')
+if os[:arch] == 'x86_64' and os[:name] != 'amazon' and
+  ((os[:name] == 'ubuntu' and os[:release].split('.')[0].to_i > 12) or 
+    (os[:family] == 'redhat' and os[:release].split('.')[0].to_i >= 7))
   describe command("install_compass") do
     its('exit_status') { should eq 0 }
   end
@@ -148,7 +147,17 @@ if deb
   describe user('mongodb') do
     it { should exist }
     its('groups') { should include 'mongodb' }
-    its('shell') { should eq '/bin/false' }
+    # All versions of Debian 10 will use /usr/sbin/nologin for service
+    # account shells
+    its('shell') {
+      if ((os[:name] == 'debian' and os[:release].split('.')[0] == '10') or
+          (os[:name] == 'ubuntu' and os[:release] == '18.04') or
+          (os[:name] == 'ubuntu' and os[:release] == '20.04'))
+        should eq '/usr/sbin/nologin'
+      else
+        should eq '/bin/false'
+      end
+    }
   end
 end
 
